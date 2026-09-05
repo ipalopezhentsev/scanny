@@ -1,0 +1,25 @@
+[project]
+name = "scanny"
+version = "0.1.0"
+description = "Tethered control and live view for Nikon DSLRs on Windows"
+readme = "README.md"
+authors = [
+    { name = "Ilya Palopezhentsev", email = "iliks@web.de" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "comtypes>=1.4.16",
+    "pyside6>=6.11.2",
+]
+
+[project.scripts]
+scanny = "scanny.app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
