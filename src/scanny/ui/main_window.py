@@ -11,27 +11,80 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
 
 from ..camera.nikon import NikonCamera, Setting
+from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES
 from .liveview import LiveViewWidget
 from .worker import CameraWorker
 
-__all__ = ["MainWindow"]
+__all__ = ["MainWindow", "WrappedLabel"]
 
 #: The slider steps through the levels the body accepts, not a raw 0-7 range,
 #: so every position is reachable.
 _ZOOM_LEVELS = NikonCamera.ZOOM_LEVELS
+
+#: How wide the controls are laid out to be. The scroll area around them is
+#: this plus a scrollbar, so they keep the same width whether it shows or not.
+_SIDEBAR_WIDTH = 310
+
+#: What the camera delivers, near enough, for working out what integrating a
+#: given number of frames will cost in frame rate before it is switched on.
+_SOURCE_FPS = 30.0
+
+
+class WrappedLabel(QLabel):
+    """A word-wrapped label that takes up exactly the height its text needs.
+
+    Wrapping makes a label's height depend on its width, and Qt has two ways
+    of dealing with that. The one a plain wrapped label asks for -- answer
+    height-for-width questions and let the layout work it out -- goes wrong in
+    a panel that is short of room: the layout is told a height measured at the
+    label's *hint* width rather than the width it will be given, hands out the
+    space it was told about, and the last line of every hint disappears. The
+    shortfall is taken out of the controls around it too, which is what
+    flattens a spin box to two thirds of its height.
+
+    So the height is resolved here instead, against the width the label
+    actually has, and fixed. The panel's minimum height then includes the room
+    the text really occupies, which is the number a scroll area around it goes
+    by when it decides how tall to make the panel.
+
+    Safe because the column is a fixed width: height follows width, and
+    nothing follows height, so there is no loop to fall into.
+    """
+
+    def __init__(self, text: str = "", parent: "QWidget | None" = None) -> None:
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(False)
+        self.setSizePolicy(policy)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt naming
+        super().setText(text)
+        self._fit()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        if self.width() > 0:
+            self.setFixedHeight(self.heightForWidth(self.width()))
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +110,7 @@ class MainWindow(QMainWindow):
     requestResetZoom = Signal()
     requestExposurePreview = Signal(bool)
     requestPan = Signal(int, int)
+    requestIntegration = Signal(bool, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -67,6 +121,7 @@ class MainWindow(QMainWindow):
         self._level_shown = 0.0
         self._updating_settings = False
         self._live = False
+        self._fps_shown = (0.0, 0, 0)
 
         self._build_ui()
         self._start_worker()
@@ -89,7 +144,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
         layout.addWidget(self.view, 1)
-        layout.addWidget(self._build_sidebar(), 0)
+        layout.addWidget(self._build_sidebar_scroller(), 0)
         self.setCentralWidget(central)
 
         # Buttons, checkboxes and the slider are all operated by pointer, so
@@ -111,14 +166,41 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.fps_label)
         self._build_menu()
 
+    def _build_sidebar_scroller(self) -> QScrollArea:
+        """The sidebar, free to be as tall as its contents ask to be.
+
+        A connected camera fills the exposure form with eight rows, and by then
+        the panel wants more height than the window has. A plain layout answers
+        that by squeezing every widget below its size hint -- which flattens the
+        spin boxes to two thirds of their height and cuts the last line off the
+        wrapped hints, both of which read as controls that have been damaged
+        rather than a panel that is too long. Scrolling gives each control the
+        size it asked for and puts the shortfall somewhere the user can see and
+        act on.
+        """
+        scroller = QScrollArea()
+        scroller.setWidget(self._build_sidebar())
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Room for the scrollbar on top of the controls' own width, so they do
+        # not shuffle sideways when it appears.
+        scroller.setFixedWidth(
+            _SIDEBAR_WIDTH
+            + scroller.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        )
+        # Like every other pointer-operated control here, it must not take the
+        # keyboard away from the image.
+        scroller.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        return scroller
+
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
-        sidebar.setFixedWidth(310)
+        sidebar.setMinimumWidth(_SIDEBAR_WIDTH)
         column = QVBoxLayout(sidebar)
         column.setContentsMargins(0, 0, 0, 0)
 
-        self.camera_label = QLabel("Looking for a camera...")
-        self.camera_label.setWordWrap(True)
+        self.camera_label = WrappedLabel("Looking for a camera...")
         self.camera_label.setStyleSheet("color: #888;")
         column.addWidget(self.camera_label)
 
@@ -153,13 +235,12 @@ class MainWindow(QMainWindow):
         self.reset_zoom_button.clicked.connect(self.requestResetZoom)
         layout.addWidget(self.reset_zoom_button)
 
-        hint = QLabel(
+        hint = WrappedLabel(
             "Click to move the focus box, double-click to focus there. "
             "Right-click toggles full magnification. Drag a box to magnify it. "
             "Scroll to zoom, arrow keys pan, Enter focuses, Esc for the "
             "whole frame."
         )
-        hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(hint)
 
@@ -174,7 +255,93 @@ class MainWindow(QMainWindow):
         self.exposure_preview.toggled.connect(self.requestExposurePreview)
         layout.addWidget(self.exposure_preview)
 
+        layout.addWidget(self._build_integration())
         return box
+
+    def _build_integration(self) -> QWidget:
+        """The noise-integration control: a switch, a count, and what it costs.
+
+        The cost is spelled out under the controls rather than left to be
+        discovered, because it is the whole trade: every frame added to the
+        stack divides the frame rate again.
+        """
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self.integrate = QCheckBox("Integrate")
+        self.integrate.setToolTip(
+            "Average several frames into each displayed image. The noise is "
+            "different in every frame and the scene is not, so it cancels out "
+            "and the picture gets cleaner -- at the cost of frame rate."
+        )
+        row.addWidget(self.integrate)
+
+        self.integrate_frames = QSpinBox()
+        self.integrate_frames.setRange(MIN_FRAMES, MAX_FRAMES)
+        self.integrate_frames.setSuffix(" frames")
+        self.integrate_frames.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.integrate_frames.setToolTip("How many frames go into each image")
+        # A spin box has to take the keyboard to be typed into; hand it back
+        # once the value is settled, or the image's shortcuts stay dead.
+        self.integrate_frames.editingFinished.connect(self.view.setFocus)
+        row.addWidget(self.integrate_frames, 1)
+        column.addLayout(row)
+
+        self.integrate_hint = WrappedLabel()
+        self.integrate_hint.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(self.integrate_hint)
+
+        settings = QSettings()
+        self.integrate.setChecked(settings.value("liveview/integrate", False, bool))
+        self.integrate_frames.setValue(self._stored_integration_frames())
+        self._integrating = self.integrate.isChecked()
+        self._describe_integration()
+        # Connected last, so restoring the stored values does not count as the
+        # user asking for anything.
+        self.integrate.toggled.connect(self._on_integration_changed)
+        self.integrate_frames.valueChanged.connect(self._on_integration_changed)
+        return holder
+
+    def _stored_integration_frames(self) -> int:
+        try:
+            stored = int(QSettings().value("liveview/frames", DEFAULT_FRAMES))
+        except (TypeError, ValueError):
+            return DEFAULT_FRAMES
+        return stored if MIN_FRAMES <= stored <= MAX_FRAMES else DEFAULT_FRAMES
+
+    def _on_integration_changed(self) -> None:
+        settings = QSettings()
+        settings.setValue("liveview/integrate", self.integrate.isChecked())
+        settings.setValue("liveview/frames", self.integrate_frames.value())
+        self._describe_integration()
+        # Whatever rate was measured belongs to the old setting. Blank it
+        # rather than leave a stale number sitting under a new label -- unless
+        # this was only the count changing while integration is switched off,
+        # which changes nothing on screen.
+        if self.integrate.isChecked() or self._integrating:
+            self._fps_shown = (0.0, *self._fps_shown[1:])
+        self._integrating = self.integrate.isChecked()
+        self._show_fps()
+        self.requestIntegration.emit(
+            self.integrate.isChecked(), self.integrate_frames.value()
+        )
+
+    def _describe_integration(self) -> None:
+        """Spell out the trade at the number of frames currently chosen.
+
+        Averaging n frames divides random noise by the square root of n, and
+        the frame rate by n.
+        """
+        frames = self.integrate_frames.value()
+        self.integrate_frames.setEnabled(self.integrate.isChecked())
+        self.integrate_hint.setText(
+            f"About {_SOURCE_FPS / frames:.1f} fps, with roughly "
+            f"{frames ** 0.5:.1f}x less noise."
+        )
 
     def _build_focus_box(self) -> QGroupBox:
         box = QGroupBox("Focus")
@@ -186,11 +353,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.af_button)
         layout.addWidget(self._build_manual_focus())
 
-        hint = QLabel(
+        hint = WrappedLabel(
             "Manual focus: < is nearer, > is further. Set how many drive steps "
             "each increment is worth. Keys [ ] , . < > drive the first three."
         )
-        hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(hint)
         return box
@@ -300,8 +466,7 @@ class MainWindow(QMainWindow):
         self.download_after_shot.setChecked(True)
         layout.addWidget(self.download_after_shot)
 
-        self.save_dir_label = QLabel()
-        self.save_dir_label.setWordWrap(True)
+        self.save_dir_label = WrappedLabel()
         self.save_dir_label.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self.save_dir_label)
 
@@ -375,12 +540,12 @@ class MainWindow(QMainWindow):
         self.requestResetZoom.connect(self.worker.reset_zoom)
         self.requestExposurePreview.connect(self.worker.set_exposure_preview)
         self.requestPan.connect(self.worker.pan)
+        self.requestIntegration.connect(self.worker.set_integration)
         self.requestDriveFocus.connect(self.worker.drive_focus)
 
         self.worker.connected.connect(self._on_connected)
         self.worker.disconnected.connect(self._on_disconnected)
-        self.worker.frameReady.connect(self.view.set_frame)
-        self.worker.frameReady.connect(self._on_frame_level)
+        self.worker.frameReady.connect(self._on_frame)
         self.worker.settingsReady.connect(self._on_settings)
         self.worker.liveViewChanged.connect(self._on_live_view_changed)
         self.worker.zoomChanged.connect(self._on_zoom_changed)
@@ -396,6 +561,11 @@ class MainWindow(QMainWindow):
 
         self._thread.start()
         self.save_dir_label.setText(f"Saving to {self.worker.save_directory}")
+        # Tell the worker what was restored from the last run; the request is
+        # queued, so it arrives once the worker's thread is up.
+        self.requestIntegration.emit(
+            self.integrate.isChecked(), self.integrate_frames.value()
+        )
 
     # -- slots -------------------------------------------------------------
 
@@ -433,7 +603,16 @@ class MainWindow(QMainWindow):
             "Zoom: full frame" if level == 0 else f"Zoom: level {level}"
         )
 
-    @Slot(object)
+    @Slot(object, object)
+    def _on_frame(self, frame, image) -> None:
+        """A frame from the camera, and the picture that goes with it.
+
+        The picture is null while an integration stack is still filling, in
+        which case only the overlay and the level readout move.
+        """
+        self.view.show_frame(frame, image)
+        self._on_frame_level(frame)
+
     def _on_frame_level(self, frame) -> None:
         """Show the level sensor, throttled -- 30 updates a second is unreadable."""
         now = time.monotonic()
@@ -453,9 +632,21 @@ class MainWindow(QMainWindow):
 
     @Slot(float, int, int)
     def _on_fps(self, fps: float, width: int, height: int) -> None:
-        self.fps_label.setText(
-            f"{width}x{height}  -  {fps:.1f} fps" if fps > 0 else ""
+        self._fps_shown = (fps, width, height)
+        self._show_fps()
+
+    def _show_fps(self) -> None:
+        """The rate the picture actually updates at, and why it is that rate."""
+        fps, width, height = self._fps_shown
+        if fps <= 0:
+            self.fps_label.setText("")
+            return
+        integrated = (
+            f"  -  {self.integrate_frames.value()} frames integrated"
+            if self.integrate.isChecked()
+            else ""
         )
+        self.fps_label.setText(f"{width}x{height}  -  {fps:.1f} fps{integrated}")
 
     @Slot(bool)
     def _on_exposure_preview(self, enabled: bool) -> None:

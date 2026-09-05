@@ -15,9 +15,11 @@ from typing import Any
 
 import comtypes
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QImage
 
 from ..camera.nikon import CameraError, LiveViewFrame, NikonCamera
 from ..wpd.device import MtpError, WpdCommandError
+from .integration import FrameIntegrator
 
 __all__ = ["CameraWorker"]
 
@@ -39,7 +41,11 @@ class CameraWorker(QObject):
 
     connected = Signal(str)
     disconnected = Signal()
-    frameReady = Signal(object)  # LiveViewFrame
+    #: A live-view frame, and the picture to show with it. The picture is a
+    #: null QImage when this frame only moves the overlay -- which is what the
+    #: frames in the middle of an integration stack do, since their pixels are
+    #: still being added up.
+    frameReady = Signal(object, object)  # LiveViewFrame, QImage
     settingsReady = Signal(object)  # list[Setting]
     liveViewChanged = Signal(bool)
     zoomChanged = Signal(int)
@@ -63,6 +69,9 @@ class CameraWorker(QObject):
         # on a D750 and corrected from live frames as levels are used, so
         # region zoom follows the body rather than a fitted curve.
         self._zoom_magnification: "dict[int, float]" = dict(_MEASURED_MAGNIFICATION)
+        # Noise averaging. Off by default: it costs frame rate, so it is the
+        # user's to ask for.
+        self._integrator = FrameIntegrator()
         self._save_dir = Path.home() / "Pictures" / "scanny"
 
     # -- thread lifecycle --------------------------------------------------
@@ -140,6 +149,7 @@ class CameraWorker(QObject):
             return
         self._grab_errors = 0
         self._frame_times.clear()
+        self._integrator.reset()
         self._zoom_level = camera.zoom_level()
         self.exposurePreviewChanged.emit(camera.exposure_preview)
         self.liveViewChanged.emit(True)
@@ -153,6 +163,7 @@ class CameraWorker(QObject):
         if self._camera is not None:
             self._camera.stop_live_view()
         self._frame_times.clear()
+        self._integrator.reset()
         self._last_frame = None
         self.fpsChanged.emit(0.0, 0, 0)
         self.liveViewChanged.emit(False)
@@ -190,15 +201,24 @@ class CameraWorker(QObject):
         self._grab_errors = 0
         self._last_frame = frame
         self._note_magnification(frame)
-        self._note_frame_rate(frame)
-        self.frameReady.emit(frame)
+        # Every frame is published, so the focus box and the level readout stay
+        # as responsive as the camera is; only the picture waits for its stack.
+        image = self._integrator.add(frame)
+        if image is not None:
+            self._note_frame_rate(frame)
+        self.frameReady.emit(frame, image if image is not None else QImage())
 
     def _note_magnification(self, frame: LiveViewFrame) -> None:
         if frame.crop_width:
             self._zoom_magnification[self._zoom_level] = frame.magnification
 
     def _note_frame_rate(self, frame: LiveViewFrame) -> None:
-        """Publish the rate measured over the last second of frames."""
+        """Publish the rate measured over the last second of displayed images.
+
+        Displayed, not grabbed: while frames are being integrated the camera
+        still sends thirty a second, but the picture only changes when a stack
+        completes, and that is the number worth showing.
+        """
         now = time.monotonic()
         self._frame_times.append(now)
         while len(self._frame_times) > 2 and now - self._frame_times[0] > 1.0:
@@ -395,6 +415,22 @@ class CameraWorker(QObject):
             "Live view shows the actual exposure"
             if enabled
             else "Live view brightness normalised by the camera"
+        )
+
+    # -- noise integration -------------------------------------------------
+
+    @Slot(bool, int)
+    def set_integration(self, enabled: bool, frames: int) -> None:
+        """Average *frames* live-view frames into each displayed image."""
+        if not self._integrator.configure(enabled, frames):
+            return
+        # The rate is about to change, so the last second of it is no longer
+        # anything worth averaging into the readout.
+        self._frame_times.clear()
+        self.status.emit(
+            f"Integrating {self._integrator.frames} frames into each image"
+            if self._integrator.enabled
+            else "Showing every frame as it arrives"
         )
 
     # -- settings ----------------------------------------------------------

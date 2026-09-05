@@ -54,6 +54,7 @@ second**, so the camera, not the plumbing, is the limit.
 | `camera/nikon.py` | Live view, focus, zoom, exposure, capture |
 | `camera/values.py` | Raw PTP integers to labels a photographer recognises |
 | `ui/` | Qt window, live-view canvas, and the camera worker thread |
+| `ui/integration.py` | Averaging consecutive frames to cancel sensor noise |
 
 ## The live-view header
 
@@ -125,6 +126,56 @@ camera therefore remembers the wanted state and applies it each time live view
 starts. It is on by default, which does mean a badly set manual exposure shows
 up as a very dark or very bright image; that is the point of it, and the
 checkbox turns it off.
+
+## Integrating frames to cancel noise
+
+Live view is 640 pixels across and the camera renders it fast rather than
+well, so at anything above base ISO the picture is grainy -- and the grain is
+different in every frame while the scene is not. Averaging N frames therefore
+keeps the picture and divides the noise by roughly the square root of N. There
+is no exposure control to reach for here: the camera sends what it sends, about
+thirty frames a second, so the only currency is frame rate. **Integrate**, in
+the Live view panel, spends it: the mean of each N frames, arriving 30/N times
+a second.
+
+Measured against synthetic frames with a known amount of noise on them, sixteen
+frames behave exactly as the arithmetic says, and cost about a tenth of the
+frame interval to compute:
+
+| | one frame | 16 frames |
+| --- | --- | --- |
+| Noise, levels RMS | 8.68 | 2.19 |
+| Mean brightness | 126.78 | 126.81 |
+| Cost per frame | -- | 2.75 ms, against 33 ms between grabs |
+
+The brightness row is the point of the second design decision below: the
+picture gets cleaner without getting lighter or darker.
+
+Four things it does deliberately:
+
+- **Every frame is still published, only the picture waits.** The focus box and
+  the level readout come from the frame header, not the JPEG, so they keep
+  following the camera at its full rate while a stack fills. Only the image
+  underneath them updates at 30/N.
+- **A frame that does not belong to the stack is shown at once**, and starts a
+  new one. Magnifying, panning or switching the body between its photo and
+  movie positions all change what the camera is rendering, and waiting out the
+  rest of a stack before showing the new view would make every pan feel like it
+  had frozen. So the first frame of a new view appears immediately -- noisy --
+  and the integrated version replaces it a stack later.
+- **The mean is taken in the JPEG's own gamma-encoded values**, not in linear
+  light. Averaging linearly is the physically correct way to add exposures, but
+  it lifts the shadows and changes how the picture looks; the point here is the
+  same picture with less noise in it.
+- **The frame rate in the status bar is the rate the picture updates at**, not
+  the rate the camera sends at, which integrating does not change. Reporting 30
+  while the image changes four times a second would be a lie about what is on
+  screen.
+
+The switch and the count are remembered between runs. Sixteen frames is half a
+second an image, which is comfortable for composing on a static subject; past
+about 32 the view has stopped being live in any useful sense, and 64 is the
+limit.
 
 ## How the click gestures fit together
 
@@ -230,6 +281,29 @@ combo boxes, which do need focus for their popups, hand it back once a value is
 chosen. There are tests asserting this, because it is invisible until someone
 notices the keys have gone dead.
 
+## The controls panel scrolls rather than squeezing
+
+With a camera connected the exposure form fills with eight rows, and the panel
+then wants more height than the window has. A layout answers that by handing
+every widget less than it asked for, and the result does not look like a panel
+that is too long -- it looks like broken controls: a spin box flattened to two
+thirds of its height, and the last line missing from every wrapped hint.
+
+Two things fix it, and both are needed:
+
+- **The panel is in a scroll area**, so the shortfall becomes scrolling instead
+  of being taken out of the controls.
+- **The wrapped hints resolve their own height.** Qt asks a label how tall it
+  wants to be at its *hint* width, not the width the column will actually give
+  it, so a wrapped label under-reports and the panel's minimum height comes out
+  too small -- which is the number a scroll area goes by. `WrappedLabel`
+  measures itself against the width it has been given and fixes its height
+  there. Safe only because the column is a fixed width: height follows width,
+  and nothing follows height, so there is no loop.
+
+The scroll area is `NoFocus`, like every other pointer-operated control here,
+for the reason in the section above.
+
 ## The level sensor
 
 The header carries the body's virtual horizon: **offset 52 is roll** and
@@ -301,6 +375,10 @@ over USB at about 23 MB/s. Live view keeps running throughout.
   drives autofocus.
 - **Exposure preview** is on by default, so aperture, shutter and ISO changes
   are visible in live view, depth of field included.
+- **Integrate** averages several frames into each displayed image, which cancels
+  the noise at the cost of frame rate: eight frames is about four frames a
+  second and roughly three times less grain. The panel says what the count you
+  have chosen will cost before you switch it on.
 - The status bar shows the live-view frame size and the rate it is arriving at
   (about 30fps).
 - Shutter, aperture, ISO, exposure compensation and white balance are settable;
@@ -345,7 +423,6 @@ They need no camera attached.
 ## TODO
 
 - set minimum step size to 18 - only it makes sound, at least with 24-120
-- light-gathering mode where several LV images are aggregated to cancel noise!
 - persist such settings to user profile
 - MLU
 - filenames

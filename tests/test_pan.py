@@ -238,5 +238,10 @@ def test_default_focus_step_sizes_are_ordered():
         for name in NikonCamera.FOCUS_INCREMENTS
     ]
     assert values == sorted(values)
-    assert values[0] == 1  # the finest the body accepts
     assert all(v > 0 for v in values)
+    # How fine the finest default can usefully be is a property of the lens,
+    # not the body: six steps move an AF-S 60/2.8 micro visibly, while a
+    # 24-120/4 needs about eighteen. So the requirement is only that it is a
+    # genuinely small step -- the number itself is the user's to tune, and the
+    # editor still goes down to the single step the body accepts.
+    assert values[0] <= 20

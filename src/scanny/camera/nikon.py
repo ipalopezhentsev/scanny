@@ -496,7 +496,9 @@ class NikonCamera:
     #: frame-to-frame noise at full frame -- though a step is far more visible
     #: magnified, which is where manual focus is actually used. A single step
     #: is the finest the body accepts, and it does take it.
-    FOCUS_STEP_DEFAULTS = {"minimum": 18, "fine": 50, "medium": 250, "coarse": 1000}
+    #: it seems minimum value depends on lens - e.g. AF-S 60/2.8 micro reacts to 6, 
+    #: while 24-140/4 reacts only from 18
+    FOCUS_STEP_DEFAULTS = {"minimum": 6, "fine": 50, "medium": 250, "coarse": 1000}
 
     #: MfDrive's direction parameter for focusing closer. Two is the other way.
     #: This follows Nikon's usual convention -- it could not be confirmed from

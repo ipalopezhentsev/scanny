@@ -1,0 +1,237 @@
+"""Tests for live-view frame integration.
+
+Averaging consecutive frames is meant to do exactly one thing: keep the scene
+and cancel the noise. The tests build frames whose "noise" is known -- a value
+either side of the truth -- so the mean can be checked against the answer
+rather than against a guess about how much cleaner it looks.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("PySide6.QtGui")
+pytest.importorskip("numpy")
+
+from PySide6.QtCore import QBuffer, QByteArray  # noqa: E402
+from PySide6.QtGui import QImage  # noqa: E402
+
+from scanny.camera.nikon import LiveViewFrame  # noqa: E402
+from scanny.ui.integration import (  # noqa: E402
+    MAX_FRAMES,
+    MIN_FRAMES,
+    FrameIntegrator,
+)
+
+
+def _jpeg(grey: int, size=(32, 24)) -> bytes:
+    """A flat grey JPEG. Flat, so the codec is not what the test measures."""
+    image = QImage(*size, QImage.Format.Format_RGB32)
+    image.fill(0xFF000000 | (grey << 16) | (grey << 8) | grey)
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+    image.save(buffer, "JPG", 100)
+    return bytes(data.data())
+
+
+def _frame(grey: int, *, crop_centre=(3008, 2008), size=(32, 24)) -> LiveViewFrame:
+    return LiveViewFrame(
+        jpeg=_jpeg(grey, size),
+        width=size[0], height=size[1],
+        image_width=6016, image_height=4016,
+        crop_width=6016, crop_height=4016,
+        crop_center_x=crop_centre[0], crop_center_y=crop_centre[1],
+        af_width=324, af_height=270,
+        af_x=3008, af_y=2008,
+    )
+
+
+def _grey(image: QImage) -> float:
+    """The mean red channel of the middle of the image."""
+    return sum(
+        QImage.pixelColor(image, x, y).red()
+        for x in range(8, 24)
+        for y in range(6, 18)
+    ) / (16 * 12)
+
+
+def _feed(integrator: FrameIntegrator, greys) -> list:
+    return [integrator.add(_frame(grey)) for grey in greys]
+
+
+def test_disabled_shows_every_frame_as_it_arrives():
+    integrator = FrameIntegrator(enabled=False)
+    shown = _feed(integrator, [40, 80, 120])
+    assert all(image is not None for image in shown)
+    assert [round(_grey(image)) for image in shown] == pytest.approx([40, 80, 120], abs=2)
+
+
+def test_a_stack_produces_one_image_and_nothing_in_between():
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    shown = _feed(integrator, [100] * 9)
+    # The first frame of a new view is shown at once, so the pattern is that
+    # one, then an image every fourth frame.
+    assert [image is not None for image in shown] == [
+        True, False, False, True, False, False, False, True, False
+    ]
+
+
+def test_noise_either_side_of_the_truth_averages_out():
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    # A scene at 100 with +-20 of noise on it, in equal measure.
+    shown = _feed(integrator, [80, 120, 80, 120])
+    assert shown[-1] is not None
+    assert _grey(shown[-1]) == pytest.approx(100, abs=2)
+
+
+def test_the_stack_is_the_frames_asked_for_and_no_others():
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    # Four frames of 100 complete a stack; the 200 that follows belongs to the
+    # next one and must not pull the answer up.
+    shown = _feed(integrator, [100, 100, 100, 100, 200])
+    assert _grey(shown[3]) == pytest.approx(100, abs=2)
+    assert shown[4] is None
+
+
+def test_a_new_view_is_shown_at_once_rather_than_a_stack_later():
+    """Panning must not look like the picture has frozen."""
+    integrator = FrameIntegrator(enabled=True, frames=8)
+    integrator.add(_frame(100))
+    for _ in range(3):
+        assert integrator.add(_frame(100)) is None
+    moved = integrator.add(_frame(200, crop_centre=(1000, 1000)))
+    assert moved is not None
+    assert _grey(moved) == pytest.approx(200, abs=2)
+    assert integrator.pending == 1
+
+
+def test_frames_from_the_old_view_do_not_leak_into_the_new_one():
+    integrator = FrameIntegrator(enabled=True, frames=2)
+    integrator.add(_frame(0))
+    integrator.add(_frame(0))
+    integrator.add(_frame(200, crop_centre=(1000, 1000)))
+    averaged = integrator.add(_frame(200, crop_centre=(1000, 1000)))
+    assert _grey(averaged) == pytest.approx(200, abs=2)
+
+
+def test_a_change_of_size_starts_a_new_stack():
+    """The body switching between its photo and movie positions resizes the frame."""
+    integrator = FrameIntegrator(enabled=True, frames=2)
+    integrator.add(_frame(100))
+    resized = integrator.add(_frame(100, size=(32, 18)))
+    assert resized is not None and resized.height() == 18
+
+
+def test_changing_the_settings_throws_away_the_part_filled_stack():
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    _feed(integrator, [100, 100])
+    assert integrator.pending == 2
+    assert integrator.configure(True, 8) is True
+    assert integrator.pending == 0
+    assert integrator.frames == 8
+
+
+def test_repeating_the_same_settings_leaves_the_stack_alone():
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    _feed(integrator, [100, 100])
+    assert integrator.configure(True, 4) is False
+    assert integrator.pending == 2
+
+
+def test_the_frame_count_is_clamped_to_what_makes_sense():
+    integrator = FrameIntegrator(enabled=True, frames=1)
+    assert integrator.frames == MIN_FRAMES
+    integrator.configure(True, 10_000)
+    assert integrator.frames == MAX_FRAMES
+
+
+def test_a_frame_that_is_not_a_picture_is_ignored():
+    integrator = FrameIntegrator(enabled=True, frames=2)
+    broken = LiveViewFrame(
+        jpeg=b"\xff\xd8\xff not a jpeg",
+        width=32, height=24,
+        image_width=6016, image_height=4016,
+        crop_width=6016, crop_height=4016,
+        crop_center_x=3008, crop_center_y=2008,
+        af_width=324, af_height=270,
+        af_x=3008, af_y=2008,
+    )
+    assert integrator.add(broken) is None
+    assert integrator.pending == 0
+
+
+def test_a_long_stack_does_not_drift_darker():
+    """Rounding down every time would cost half a level over a long stack."""
+    integrator = FrameIntegrator(enabled=True, frames=MAX_FRAMES)
+    shown = _feed(integrator, [101] * MAX_FRAMES)
+    assert _grey(shown[-1]) == pytest.approx(101, abs=1)
+
+
+# -- how the worker publishes an integrated stack ----------------------------
+
+
+class _FakeCamera:
+    """Just enough camera for the grab loop: it always has another frame."""
+
+    live_view_active = True
+
+    def __init__(self, frame: LiveViewFrame) -> None:
+        self.frame = frame
+
+    def live_view_frame(self) -> LiveViewFrame:
+        return self.frame
+
+
+@pytest.fixture
+def worker(monkeypatch):
+    from scanny.ui.worker import CameraWorker
+
+    made = CameraWorker()
+    made._camera = _FakeCamera(_frame(100))
+    now = [1000.0]
+    monkeypatch.setattr("scanny.ui.worker.time.monotonic", lambda: now[0])
+    made._tick = lambda seconds=1 / 30: now.__setitem__(0, now[0] + seconds)
+    return made
+
+
+def _grabs(worker, count: int) -> list:
+    published = []
+    worker.frameReady.connect(lambda frame, image: published.append(image))
+    for _ in range(count):
+        worker._grab()
+        worker._tick()
+    return published
+
+
+def test_every_frame_is_published_even_while_a_stack_fills(worker):
+    """The focus box and the level readout must not wait for the picture."""
+    worker.set_integration(True, 4)
+    published = _grabs(worker, 8)
+    assert len(published) == 8
+    assert [not image.isNull() for image in published] == [
+        True, False, False, True, False, False, False, True
+    ]
+
+
+def test_without_integration_every_frame_carries_its_picture(worker):
+    published = _grabs(worker, 5)
+    assert all(not image.isNull() for image in published)
+
+
+def test_the_rate_shown_is_the_rate_the_picture_updates_at(worker):
+    """Not the rate the camera sends at: that is unchanged by integrating."""
+    worker.set_integration(True, 4)
+    seen = []
+    worker.fpsChanged.connect(lambda fps, w, h: seen.append(fps))
+    _grabs(worker, 60)
+    assert seen[-1] == pytest.approx(30.0 / 4, rel=0.15)
+
+
+def test_stopping_live_view_throws_the_stack_away(worker):
+    worker.set_integration(True, 4)
+    _grabs(worker, 2)
+    assert worker._integrator.pending == 2
+    worker._camera = None
+    worker.stop_live_view()
+    assert worker._integrator.pending == 0

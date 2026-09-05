@@ -48,6 +48,12 @@ def test_every_increment_has_an_editor(window):
         assert isinstance(spin, QSpinBox)
 
 
+def test_the_editors_reach_the_single_step_the_body_accepts(window):
+    """The defaults are lens-dependent judgements; one step is the floor."""
+    for spin in window._focus_steps.values():
+        assert spin.minimum() == 1
+
+
 def test_editors_start_at_the_defaults(window):
     for name, spin in window._focus_steps.items():
         assert spin.value() == NikonCamera.FOCUS_STEP_DEFAULTS[name]

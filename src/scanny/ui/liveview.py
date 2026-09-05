@@ -81,11 +81,23 @@ class LiveViewWidget(QWidget):
     # -- content -----------------------------------------------------------
 
     def set_frame(self, frame: LiveViewFrame) -> None:
-        image = QImage.fromData(frame.jpeg, "JPG")
+        """Show a frame, decoding its own JPEG."""
+        self.show_frame(frame, QImage.fromData(frame.jpeg, "JPG"))
+
+    def show_frame(self, frame: LiveViewFrame, image: QImage) -> None:
+        """Show a frame whose picture has already been decoded.
+
+        A **null** *image* updates the overlay and leaves the picture alone,
+        which is how frames arriving in the middle of an integration stack are
+        published: the focus box and the level readout follow the camera at its
+        full rate while the picture waits for its stack to finish.
+        """
         if not image.isNull():
             self._pixmap = QPixmap.fromImage(image)
-            self._frame = frame
-            self.update()
+        elif self._pixmap is None:
+            return
+        self._frame = frame
+        self.update()
 
     def clear(self, message: str = "Live view stopped") -> None:
         self._pixmap = None
