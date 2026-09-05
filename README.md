@@ -1,0 +1,2 @@
+# scanny
+Film scanning automation
