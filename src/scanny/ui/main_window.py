@@ -746,11 +746,15 @@ class MainWindow(QMainWindow):
 
         self._thread.start()
         self.save_dir_label.setText(f"Saving to {self.worker.save_directory}")
-        # Tell the worker what was restored from the last run; the request is
-        # queued, so it arrives once the worker's thread is up.
+        # Tell the worker what was restored from the last run; the requests are
+        # queued, so they arrive once the worker's thread is up. The sharpness
+        # ones cannot go out while the panel is built, since that happens
+        # before there is a worker to hear them.
         self.requestIntegration.emit(
             self.integrate.isChecked(), self.integrate_frames.value()
         )
+        self.requestSharpness.emit(self.measure_sharpness.isChecked())
+        self._apply_measure_area()
 
     # -- slots -------------------------------------------------------------
 

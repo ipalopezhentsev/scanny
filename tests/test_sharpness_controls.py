@@ -294,3 +294,90 @@ def test_a_walk_that_ends_on_its_own_gives_the_button_back(window):
     window._on_hunt_changed(False)
     window.fine_tune_button.click()
     assert asked, "the button has to start a walk again, not stop one"
+
+
+# -- what the worker is told at startup --------------------------------------
+
+
+class _Slot:
+    """Stands in for one of the worker's slots or signals.
+
+    Connected to as a slot it records the calls; connected to as a signal it
+    swallows them, which is all the window's own slots need from it here.
+    """
+
+    def __init__(self, calls: list, name: str) -> None:
+        self._calls = calls
+        self._name = name
+
+    def __call__(self, *args) -> None:
+        self._calls.append((self._name, args))
+
+    def connect(self, *_args) -> None:
+        pass
+
+
+class _RecordingWorker:
+    """A worker that only remembers what the window asked it to do."""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def __getattr__(self, name: str) -> _Slot:
+        return _Slot(self.calls, name)
+
+
+class _IdleThread:
+    """A thread that never runs: the fake worker has nothing to run there."""
+
+    def __init__(self, _parent=None) -> None:
+        pass
+
+    def __getattr__(self, name: str) -> _Slot:
+        return _Slot([], name)
+
+
+@pytest.fixture
+def started(app, monkeypatch):
+    """A window with the real worker wiring, over a worker that only listens."""
+    worker = _RecordingWorker()
+    monkeypatch.setattr(mw, "CameraWorker", lambda: worker)
+    monkeypatch.setattr(mw, "QThread", _IdleThread)
+    QSettings().clear()
+    yield worker
+    QSettings().clear()
+
+
+def test_a_remembered_choice_reaches_the_worker_at_startup(started):
+    """Otherwise the panel says it is measuring while nothing measures.
+
+    The checkbox is restored as the panel is built, which is before there is a
+    worker to hear about it, so the request has to go out again once there is.
+    """
+    QSettings().setValue("focus/sharpness", True)
+    made = mw.MainWindow()
+    try:
+        assert made.measure_sharpness.isChecked()
+        assert ("set_sharpness", (True,)) in started.calls
+    finally:
+        made.deleteLater()
+
+
+def test_a_remembered_area_reaches_the_worker_at_startup(started):
+    QSettings().setValue("focus/sharpness", True)
+    QSettings().setValue("focus/sharpness_area", True)
+    QSettings().setValue("focus/sharpness_rect", "0.2,0.3,0.4,0.25")
+    made = mw.MainWindow()
+    try:
+        assert ("set_sharpness_area", ((0.2, 0.3, 0.4, 0.25),)) in started.calls
+    finally:
+        made.deleteLater()
+
+
+def test_measuring_left_off_is_not_switched_on_at_startup(started):
+    made = mw.MainWindow()
+    try:
+        assert ("set_sharpness", (False,)) in started.calls
+        assert ("set_sharpness_area", (None,)) in started.calls
+    finally:
+        made.deleteLater()
