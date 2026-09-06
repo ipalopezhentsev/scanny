@@ -27,6 +27,7 @@ import numpy as np
 from PySide6.QtGui import QImage
 
 from ..camera.nikon import LiveViewFrame
+from .pixels import view
 
 __all__ = ["FrameIntegrator", "MAX_FRAMES", "MIN_FRAMES", "DEFAULT_FRAMES"]
 
@@ -52,6 +53,8 @@ class FrameIntegrator:
         self._sum: "np.ndarray | None" = None
         self._count = 0
         self._key: "tuple[int, ...] | None" = None
+        self._last_whole = True
+        self._last_frame: "QImage | None" = None
 
     # -- configuration -----------------------------------------------------
 
@@ -68,6 +71,27 @@ class FrameIntegrator:
     def pending(self) -> int:
         """Frames gathered so far towards the current stack."""
         return self._count
+
+    @property
+    def last_frame(self) -> "QImage | None":
+        """The last frame decoded, as it arrived and before any averaging.
+
+        Kept because it has been decoded already: whoever wants to look at a
+        single frame -- to see how much grain is on it, say -- should not have
+        to decode the same JPEG a second time.
+        """
+        return self._last_frame
+
+    @property
+    def last_image_was_whole(self) -> bool:
+        """Whether the last picture handed back was a full stack.
+
+        The odd one out is the single frame shown the instant the view changes,
+        which is deliberately not integrated. Anything reading the picture to
+        make a decision about it -- the focus hunt does -- has to be able to
+        tell that one apart from a finished stack.
+        """
+        return self._last_whole
 
     def configure(self, enabled: bool, frames: int) -> bool:
         """Set the mode, and say whether that was actually a change.
@@ -95,33 +119,32 @@ class FrameIntegrator:
         image = QImage.fromData(frame.jpeg, "JPG")
         if image.isNull():
             return None
+        image = image.convertToFormat(QImage.Format.Format_RGB32)
+        self._last_frame = image
         if not self._enabled:
+            self._last_whole = True
             return image
 
-        # RGB32 is four bytes a pixel with no row padding, which makes the
-        # buffer a plain (height, width * 4) array of bytes.
-        image = image.convertToFormat(QImage.Format.Format_RGB32)
         key = _stack_key(frame, image)
         if key != self._key:
             self._start(key, image)
+            self._last_whole = False
             return image
         self._accumulate(image)
         if self._count < self._frames:
             return None
+        self._last_whole = True
         return self._mean(image.width(), image.height())
 
     def _start(self, key: "tuple[int, ...]", image: QImage) -> None:
         self._key = key
-        self._sum = np.zeros((image.height(), image.width() * 4), dtype=np.uint32)
+        self._sum = np.zeros((image.height(), image.width(), 4), dtype=np.uint32)
         self._count = 0
         self._accumulate(image)
 
     def _accumulate(self, image: QImage) -> None:
         assert self._sum is not None
-        pixels = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(
-            image.height(), image.bytesPerLine()
-        )[:, : image.width() * 4]
-        np.add(self._sum, pixels, out=self._sum)
+        np.add(self._sum, view(image), out=self._sum)
         self._count += 1
 
     def _mean(self, width: int, height: int) -> QImage:

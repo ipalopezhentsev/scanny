@@ -15,6 +15,7 @@ _AF_IDLE = QColor(235, 235, 235)
 _AF_FOCUSED = QColor(80, 220, 120)
 _AF_BUSY = QColor(250, 190, 70)
 _SELECTION = QColor(120, 190, 255)
+_MEASURE = QColor(255, 120, 200)
 
 
 class LiveViewWidget(QWidget):
@@ -38,6 +39,11 @@ class LiveViewWidget(QWidget):
     focusRequested = Signal()
     #: A dragged rectangle (nx, ny, nw, nh), in the same fractions.
     regionSelected = Signal(float, float, float, float)
+    #: A rectangle dragged with shift held: the part of the picture whose
+    #: sharpness is to be measured. Separate from magnifying because at full
+    #: magnification there is nowhere further to zoom, and picking out
+    #: something smaller than the frame is exactly what is wanted there.
+    measureAreaSelected = Signal(float, float, float, float)
     #: Mouse wheel: +1 to magnify, -1 to pull back.
     zoomStepped = Signal(int)
     #: Right click: back to the whole frame.
@@ -75,6 +81,8 @@ class LiveViewWidget(QWidget):
         self._target = QRect()
         self._drag_origin: "QPoint | None" = None
         self._drag_current: "QPoint | None" = None
+        self._drag_measures = False
+        self._measure_area: "tuple[float, float, float, float] | None" = None
         self._focus_state = "idle"
         self._placeholder = "Not connected"
 
@@ -105,6 +113,18 @@ class LiveViewWidget(QWidget):
         self._placeholder = message
         self.update()
 
+    def set_measure_area(
+        self, area: "tuple[float, float, float, float] | None"
+    ) -> None:
+        """Outline the part of the picture being measured, or None for all of it."""
+        if area != self._measure_area:
+            self._measure_area = area
+            self.update()
+
+    @property
+    def measure_area(self) -> "tuple[float, float, float, float] | None":
+        return self._measure_area
+
     def set_focus_state(self, state: str) -> None:
         """One of ``idle``, ``busy`` or ``focused``, which tints the focus box."""
         if state != self._focus_state:
@@ -134,9 +154,12 @@ class LiveViewWidget(QWidget):
 
         if self._frame is not None:
             self._draw_focus_box(painter)
+        if self._measure_area is not None:
+            self._draw_measure_area(painter)
         if self._drag_origin is not None and self._drag_current is not None:
-            painter.setPen(QPen(_SELECTION, 1, Qt.PenStyle.DashLine))
-            painter.setBrush(QColor(120, 190, 255, 40))
+            colour = _MEASURE if self._drag_measures else _SELECTION
+            painter.setPen(QPen(colour, 1, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(colour.red(), colour.green(), colour.blue(), 40))
             painter.drawRect(QRect(self._drag_origin, self._drag_current).normalized())
 
     def _fitted_rect(self) -> QRect:
@@ -175,6 +198,25 @@ class LiveViewWidget(QWidget):
                 painter.drawLine(cx, cy, cx + sx * tick, cy)
                 painter.drawLine(cx, cy, cx, cy + sy * tick)
 
+    def _draw_measure_area(self, painter: QPainter) -> None:
+        """The measured region, in its own colour and dashed.
+
+        Deliberately unlike the focus box: one is where the camera will focus,
+        the other is where the sharpness is being read, and they are usually
+        not the same rectangle.
+        """
+        assert self._measure_area is not None
+        nx, ny, nw, nh = self._measure_area
+        box = QRectF(
+            self._target.x() + nx * self._target.width(),
+            self._target.y() + ny * self._target.height(),
+            nw * self._target.width(),
+            nh * self._target.height(),
+        )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(_MEASURE, 2, Qt.PenStyle.DashLine))
+        painter.drawRect(box)
+
     # -- input -------------------------------------------------------------
 
     def _normalise(self, point: QPoint) -> "tuple[float, float] | None":
@@ -191,6 +233,11 @@ class LiveViewWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_origin = event.position().toPoint()
             self._drag_current = self._drag_origin
+            # Held at the moment of the press, so letting go of shift midway
+            # through cannot turn a measurement into a magnification.
+            self._drag_measures = bool(
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            )
         elif event.button() == Qt.MouseButton.RightButton:
             self.zoomToggled.emit()
 
@@ -206,13 +253,16 @@ class LiveViewWidget(QWidget):
             return
         origin, self._drag_origin = self._drag_origin, None
         current, self._drag_current = event.position().toPoint(), None
+        measuring, self._drag_measures = self._drag_measures, False
         self.update()
 
         rect = QRect(origin, current).normalized()
         # A drag has to be deliberate before it counts as a region rather than
         # a click; a few pixels of travel while pressing is still a click.
         if rect.width() < 12 or rect.height() < 12:
-            spot = self._normalise(current)
+            # A shift-click is a slip of the hand, not a request to move the
+            # focus point somewhere the user was trying to draw a box.
+            spot = None if measuring else self._normalise(current)
             if spot is not None:
                 self.pointSelected.emit(*spot)
             return
@@ -220,7 +270,8 @@ class LiveViewWidget(QWidget):
         bottom_right = self._normalise(rect.bottomRight())
         if top_left is None or bottom_right is None:
             return
-        self.regionSelected.emit(
+        signal = self.measureAreaSelected if measuring else self.regionSelected
+        signal.emit(
             top_left[0],
             top_left[1],
             bottom_right[0] - top_left[0],

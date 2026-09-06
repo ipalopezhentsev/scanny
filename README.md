@@ -55,6 +55,10 @@ second**, so the camera, not the plumbing, is the limit.
 | `camera/values.py` | Raw PTP integers to labels a photographer recognises |
 | `ui/` | Qt window, live-view canvas, and the camera worker thread |
 | `ui/integration.py` | Averaging consecutive frames to cancel sensor noise |
+| `ui/sharpness.py` | Scoring the contrast in the displayed picture, to focus against |
+| `ui/trend.py` | The plot of recent readings that focus is driven against |
+| `ui/hunt.py` | Walking focus to the top of that reading, without counting steps |
+| `ui/pixels.py` | Getting at a QImage's bytes as numpy, shared by those two |
 
 ## The live-view header
 
@@ -177,6 +181,339 @@ second an image, which is comfortable for composing on a static subject; past
 about 32 the view has stopped being live in any useful sense, and 64 is the
 limit.
 
+## Focusing against a number
+
+Focus is whatever setting puts the most contrast in the picture, which is what
+a camera's contrast-detect autofocus hunts for. A D750 will only hunt inside
+its own focus box, and that box is 324 sensor pixels across -- far larger than
+the things worth focusing this carefully on. **Measure sharpness**, in the
+Focus panel, scores the picture instead: drive focus a step, and keep the
+direction that raises the number.
+
+Magnifying is the first half of aiming it. The reading covers what is on
+screen, so at 18.8x the frame *is* a small part of the sensor -- smaller than
+the focus box, and anywhere you like rather than where the box will go.
+
+The second half is that magnification runs out. Level 7 is as far in as the
+body goes, nothing is cropped on the computer, and the subject worth focusing
+on may still be a small part of that frame -- one letter of a caption, one
+strand of something. So **shift-drag on the image** marks out a rectangle and
+the reading comes from inside it alone. The gesture switches measuring on by
+itself: drawing the box is not an ambiguous thing to be doing.
+
+The rectangle is a fraction of the *displayed picture*, not a place on the
+sensor, so it stays where it was put on screen when the camera magnifies or
+pans underneath it -- which is what you want while hunting focus, where the box
+marks a place to look rather than a subject to follow. It is drawn in its own
+colour, dashed, so it is never mistaken for the focus box: one is where the
+camera would focus, the other is where the sharpness is being read, and they
+are usually not the same rectangle. Anything smaller than 16 pixels across is
+grown to it, because a reading off a handful of pixels is all noise and jumps
+about far too much to focus against.
+
+The score is the mean squared difference between neighbouring pixels -- the
+gradient energy contrast autofocus is built on -- with the grain taken off it,
+over the square of the mean level. Both of those corrections had to be there
+before the number was worth watching.
+
+### Dividing by the level, so brightness is not what it measures
+
+Gradients scale with brightness, so without dividing by it the light changing
+would move the reading as much as focus does. Over a 3.6x range of exposure on
+one picture, the reading moves by 3% (22.21, 21.93, 21.60).
+
+### Subtracting the grain, so exposure is not what it measures
+
+Noise is contrast, and it was most of what the reading measured. A darker live
+view is a grainier one, so a stop of exposure moved the number by about a
+third -- as much as a visible focus error, which made it useless: change the
+aperture and the reading jumped, and a thoroughly defocused subject scored
+nearly as well as a sharp one because the grain scored for it.
+
+White noise adds a known amount to gradient energy -- four times its variance,
+whatever the subject is -- so given that variance it can simply be taken off.
+
+**Where that variance comes from is the whole thing.** The obvious way is to
+estimate it from the frame: a kernel that cancels anything smooth and leaves
+only what changes from one pixel to the next, which is what noise looks like.
+It is a standard trick, it is wrong here, and it fails in the worst way
+imaginable. At the point of best focus, the finest detail in the picture *is*
+what changes from pixel to pixel. The estimator reads the subject as grain and
+subtracts it, so on a finely detailed subject the sharpest frame of all reads
+**zero** while a blurred one reads well above it:
+
+| Blur | none | slight | more | a lot |
+| --- | --- | --- | --- | --- |
+| Reading, grain estimated within the frame | **0.0** | 14.9 | 2.6 | 0.0 |
+| Reading, grain measured between frames | **227.9** | 19.0 | 5.0 | 0.0 |
+
+A hunt handed the first row walks away from focus having been told that focus
+is the worst place it has been -- which is exactly what it did, and why the
+answer was not steadier readings or a better search.
+
+Two consecutive frames of a scene holding still, on the other hand, differ by
+nothing but their noise, and no amount of detail in the subject changes that.
+So the variance is measured from a pair of frames, and the smallest lately
+seen is the one used: when the picture is moving, frames differ by more than
+noise, and the smallest measurement is the one with no movement in it. Nothing
+is subtracted before anything has been measured.
+
+The same simulated focus sweep, on a subject with detail down at the pixel:
+
+| Blur | none | slight | moderate | thoroughly defocused |
+| --- | --- | --- | --- | --- |
+| Clean frames | 280 | 17.8 | 0.9 | 0.1 |
+| One noisy frame, grain counted | 299 | 39 | 22 | 21 |
+| One noisy frame, grain measured and removed | 278 | 17.7 | 1.0 | 0.0 |
+
+Counting the grain, in focus reads **14x** what thoroughly defocused reads,
+and everything below a slight blur is lost in the floor. Measuring it and
+taking it off, a single noisy frame tracks the clean sweep almost exactly the
+whole way down, and a stop of exposure moves the reading by nothing measurable
+rather than by a third.
+
+Two things follow. A picture whose detail is not clear of its own grain reads
+**zero** -- not a small number, zero -- because a small number there is really
+noise, and a hunt handed noise will chase it, lock onto whichever grain read
+highest, and drive off to somewhere with nothing in it. Zero it reads as "no
+hill here", and goes back where it came from. And integrating still earns its
+place: it lowers the grain for real rather than accounting for it.
+
+A reading costs about 3ms, and is taken once per displayed picture.
+
+### What still moves it, and why that is honest
+
+Changing the aperture with exposure preview on does change the picture: the
+lens physically stops down, so the depth of field really does get deeper and a
+defocused subject really does get sharper. Blown highlights lose their
+gradients too. So the readings either side of an exposure change are of
+different pictures, and comparing them is meaningless -- which is why changing
+any camera setting, or the exposure preview, starts the readings again rather
+than letting a stale best sit there being compared against.
+
+### The line, not the number
+
+The number on its own means nothing: there is no scale it belongs to and no
+value that means "sharp". Only its direction matters.
+
+A bar showing the reading as a fraction of the best seen was the obvious way
+to show that, and it is useless for the half of the job that matters. While
+focus is improving, every reading *is* the best one, so the bar sits at the top
+throughout and only moves once you have overshot -- "it is already at the
+maximum, and it stays at the maximum while I focus".
+
+So the panel plots the readings instead, scaled to whatever range they have
+lately covered rather than to zero. That is what makes a small change visible:
+when the reading wanders between 410 and 430, the line spends its whole height
+on that twenty. Drive focus one step and watch which way it goes; the shape of
+the curve says whether the top has been passed. The numbers underneath say
+where the reading sits against the best so far.
+
+The best, and the line with it, start again whenever the crop moves, the
+measured area moves, the integration settings change, or any camera setting
+does -- all of them make a different measurement of a different picture.
+**Reset best** does the same by hand, for when none of those has happened but
+the subject has.
+
+## Walking focus to the sharpest point
+
+**Fine tune from here** does by motor what the reading is there to be driven
+against. It is the camera's contrast autofocus, except that it works on the
+measured area rather than on the body's own focus box -- which is the whole
+point, since that box is 324 sensor pixels wide and the subject may be a tenth
+of that. It is a separate button from **Autofocus** on purpose: that one is
+the camera's own, over the camera's own box, and it is still the right thing
+when the subject is large and roughly where the box is.
+
+### Nothing counts steps
+
+Everything below rests on one decision. Focus is driven by **making steps and
+watching what the reading does**, never by remembering that the best reading
+was so many steps back and driving that far.
+
+The reason is the lens. Focus gearing has play in it, so the same number of
+steps moves the optics differently depending on which way they were last
+driven, and a reversal moves nothing at all until the play is taken up. A hunt
+that navigates by step count therefore has to know how much play a lens has,
+and drive past every target and back again to take it up -- a setting to get
+right, an overshoot on every backward move, and readings that are only
+comparable if the setting was right. All of it to make a step count mean
+something it does not naturally mean.
+
+Watching the reading needs none of it. The play shows up as steps where
+nothing happens, and the walk keeps walking until something does. There is no
+allowance to set, nothing is driven past its target, and a lens with a lot of
+play costs a few extra probes rather than a wrong answer.
+
+### The walk
+
+What a hand does, in the panel's **minimum** increment:
+
+- step until the reading **rises**; if it falls instead, turn round and walk
+  the other way;
+- keep going while it rises, remembering the best reading seen;
+- when it **turns over**, walk back until the reading is as good as that best
+  one again, and stop there.
+
+It expects focus to be close already -- get roughly there by eye or with the
+camera's own autofocus first. That is not much of a limitation: on a magnified
+macro subject, which is what the measured area is for, focus is either close
+or nowhere, and a search casting about in medium steps spends its probes at
+positions where nothing in the picture could be sharp. There was such a search
+here, in three increments, and it was worse than useless on exactly the
+subjects this is for; the walk replaced it.
+
+Against a simulated lens with twenty steps of depth of focus, from forty steps
+out, with sixty steps of play in its gearing: **two steps** of error, two
+hundred steps of lens travel, about fifteen seconds. Nearer to start with, it
+is exact and quicker.
+
+Four things about it are worth keeping.
+
+**It comes back by reading, not by step count.** Coming back, the first steps
+take up the play and the picture does not move at all; the walk simply
+continues until it does. That is the whole of what replaced the backlash
+machinery.
+
+**Rising and falling are judged against the previous reading, not the best
+one.** It sounds like a detail and it is the difference between working and
+not: every reading after the first is below the best, so a walk that asks "is
+this below the best?" answers yes to everything and gives up the moment it
+turns round. That comparison is also the noisiest one available, so it takes
+two falls in a row to turn the walk round -- one is as likely to be the
+reading wandering as the lens going the wrong way.
+
+**A reading that has not changed is not a reading that got worse.** Play shows
+up as readings that are identical, and those are walked through; going the
+wrong way shows up as readings that fall.
+
+**On the way out the step grows while nothing is happening, and drops back the
+instant it does.** Crawling through a lens's play a minimum step at a time is
+a probe a second, every one of them reading exactly what the last one read, so
+after a couple the step doubles, up to four times the increment. The way back
+never grows: the step that finally takes up the last of the play also moves
+the optics by whatever is left of it, so a long step there can carry the lens
+clean past the reading it came back for. That was a real error, watched in a
+trace. Speed where nothing is changing, and never where something is.
+
+The walk is bounded -- forty probes, three thousand steps from where it began,
+and a direction that says nothing for four hundred steps is abandoned --
+because the body does not report the end of its travel.
+
+**How much better counts as better** is what decides where it stops. Too low
+and it chases the wander in a steady reading; too high and it stops while
+there is still focus to be had. Two per cent was too high: against a modelled
+focus curve it stopped a fine step short of focus on a broad peak almost every
+time. One per cent finds it.
+
+### Focus breathing, and why the area is left alone
+
+A lens does not only change how sharp the picture is as it focuses. It changes
+how big it is: the frame grows or shrinks a little with every move and
+everything in it slides. The sharpness is read over a rectangle of the
+*screen*, so a picture that slides underneath it is read over different
+content -- and if the subject is one small thing the rectangle was drawn
+snugly around, sliding it a few pixels puts half the subject outside.
+
+The measured area used to follow the picture for that reason, by phase
+correlation against the frame the hunt started from. It is gone, and the
+reason it is gone is worth recording. The walk steps in the finest increment,
+so the picture breathes by about a pixel between probes -- less than the
+correlation can even place -- while a walk decides on one reading against the
+one before it. Moving the rectangle between those two readings changes *what*
+is being compared, and at that scale the following cost more in reading noise
+than the drift cost in content: measured on a macro subject that breathes
+hard, a walk that followed the picture landed several times further from focus
+than one that left the rectangle where it was.
+
+Following earned its place only for the search's coarse steps, which slide the
+picture far enough to matter, and the search is gone too.
+
+### Waiting for the picture to settle
+
+This is the part that is easy to get wrong, and getting it wrong does not look
+like a failure -- the hunt is simply told about the focus position it has just
+left, and walks away from focus rather than towards it. It was a fixed wait of
+three frames, and a fixed wait is a guess.
+
+It now watches the picture instead. After a move, each frame is read on its
+own -- not through the integrator, which is still holding frames from before
+the move -- and the hunt waits for two frames that agree with each other
+before starting a stack.
+
+Two frames agreeing is not enough on its own, and the reason is the whole
+trick. For the first frames after a move the picture has not started changing
+yet, because live view runs behind the lens: those frames agree with each
+other perfectly while showing exactly the focus position the hunt is trying to
+leave. So the hunt also waits for the picture to **change**, and how many
+frames that takes is the depth of the pipeline. Every move after it waits at
+least that long before stillness is allowed to mean anything, and the
+measurement is repeated on every move with the longest answer kept -- a hunt
+that begins thoroughly defocused has nothing but noise to measure against, and
+that answer must not be allowed to stand once there is a real picture to
+measure with.
+
+Two more details, both of which were bugs first:
+
+- **A move is only a move if it is large, and only the frame it first shows
+  up in counts.** A single frame can read a quarter higher than the last on
+  grain alone, and taking that for the move measures the pipeline as shorter
+  than it is -- which then has every reading after it taken too early. So a
+  move has to change the reading by a quarter, twice in a row. The frames
+  after that are still different from before the move, of course, and counting
+  those as well pushed the measurement out to wherever the settle happened to
+  end and made every probe wait the maximum. There is a floor of six frames
+  under the whole thing, and a ceiling of twelve on what will be believed.
+- **Differences are judged against the best reading of the hunt**, not only
+  against the two readings being compared. Thoroughly defocused, the reading
+  is nearly zero, and one grain of noise on nearly zero is a difference of
+  hundreds of per cent: the picture would read as changing constantly and
+  never as still.
+
+And the stack itself must not straddle a move. It is reset once the picture
+has settled -- resetting at the moment of the drive would only fill the bottom
+of the new stack with frames from the old focus -- and then the hunt waits for
+a **whole** stack. The single frame live view shows the instant a stack
+restarts is deliberately not believed, which is why the integrator says
+whether the picture it handed over was a finished stack or that one frame.
+
+So a probe costs a drive, the settling, and a whole stack. Against a simulated
+lens, a whole hunt takes about **four seconds** with integration off, **six**
+integrating four frames, and **twelve** integrating sixteen -- and the trend
+line draws itself as it goes, so what the hunt is doing is visible rather than
+a frozen button.
+
+Against a simulated lens, hunting the same subject from six starting points,
+the error is where the optics finished against where focus really was:
+
+| | ordinary lens | live view six frames behind | that, with slack and grain |
+| --- | --- | --- | --- |
+| Fixed three-frame wait | 2 | 122 | 122 |
+| Watching the picture | 2 | 2 | 2 |
+
+### Getting into the neighbourhood
+
+A thoroughly defocused frame reads zero -- correctly, since it has no detail
+above its own grain -- and zero is not a hill that can be climbed. So if the
+first settled reading of a hunt is zero, the camera's own autofocus runs to get
+roughly there and the hunt takes over from wherever that left it.
+
+That decision waits for a real reading rather than being taken when the button
+is pressed, and the difference matters: the meter having read nothing yet is
+not the same as the picture being defocused, and treating it as such would
+throw away good manual focus on the first press. If the reading is still zero
+after the camera has had its go, the hunt works through its increments once
+and then says there is nothing in the area to focus on, rather than driving
+about hopefully.
+
+### What stops it
+
+Taking the focus by hand, magnifying, moving the measured area, changing the
+integration, changing any camera setting, or stopping live view. All of them
+mean the next reading would be of a different picture from the last one, and
+comparing across that is exactly the mistake the hunt is made of. The button
+says **Stop hunting** while one is running.
+
 ## How the click gestures fit together
 
 | Gesture | Action |
@@ -185,6 +522,7 @@ limit.
 | Double click | Autofocus, without magnifying |
 | Right click | Magnify fully, or back to the whole frame if already magnified |
 | Drag | Magnify onto the dragged region |
+| Shift-drag | Mark out the area whose sharpness is measured |
 | Arrow keys | Pan the magnified view |
 | Scroll | Step magnification |
 | Enter | Autofocus |
@@ -379,6 +717,21 @@ over USB at about 23 MB/s. Live view keeps running throughout.
   the noise at the cost of frame rate: eight frames is about four frames a
   second and roughly three times less grain. The panel says what the count you
   have chosen will cost before you switch it on.
+- **Measure sharpness** scores the contrast in the picture and plots the recent
+  readings, so focus can be set by driving the line up rather than by eye.
+  Magnify onto the subject first. The line starts again whenever the view, the
+  measured area or any camera setting changes, because readings either side of
+  those are of different pictures.
+- **Shift-drag** on the image to measure one rectangle of it rather than the
+  whole frame. That is how to focus on something smaller than the camera's
+  focus box, or smaller than its strongest magnification shows.
+- **Fine tune from here** then walks focus to the top of that reading by
+  itself -- contrast autofocus on the area you marked out, rather than on the
+  camera's focus box. Out in minimum steps until the reading turns over, then
+  back until it is as good as the best it saw. Get roughly close first; it is
+  for tidying up, not for finding focus from nowhere. It counts no drive steps
+  at all, so it does not care how much play the lens has. Anything you do to
+  the focus, the view or the exposure stops it.
 - The status bar shows the live-view frame size and the rate it is arriving at
   (about 30fps).
 - Shutter, aperture, ISO, exposure compensation and white balance are settable;
@@ -422,12 +775,10 @@ They need no camera attached.
 
 ## TODO
 
-- set minimum step size to 18 - only it makes sound, at least with 24-120
 - persist such settings to user profile
 - MLU
 - filenames
 - filmstrip/delete file?
-- sharpness measurer - i.e. i manually focus via buttons and it evaluates. or it drives until maximizes sharpness in given area by me
 - focus sweep - find&visualize depth map
 - don't write file to card, just to pc
 - histogram

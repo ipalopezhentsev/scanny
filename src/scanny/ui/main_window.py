@@ -29,9 +29,15 @@ from PySide6.QtWidgets import (
 from ..camera.nikon import NikonCamera, Setting
 from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES
 from .liveview import LiveViewWidget
+from .trend import TrendGraph
 from .worker import CameraWorker
 
 __all__ = ["MainWindow", "WrappedLabel"]
+
+
+def _reading(value: float) -> str:
+    """A reading, with a decimal only while it is small enough to want one."""
+    return f"{value:.0f}" if value >= 100 else f"{value:.1f}"
 
 #: The slider steps through the levels the body accepts, not a raw 0-7 range,
 #: so every position is reachable.
@@ -40,6 +46,17 @@ _ZOOM_LEVELS = NikonCamera.ZOOM_LEVELS
 #: How wide the controls are laid out to be. The scroll area around them is
 #: this plus a scrollbar, so they keep the same width whether it shows or not.
 _SIDEBAR_WIDTH = 310
+
+#: The increment focus is walked in. Its step count is the user's, from the
+#: Focus panel, so the walk moves in a size that means something for their
+#: lens -- and making the walk finer or coarser is a matter of changing what
+#: "minimum" means.
+_FINE_INCREMENT = "minimum"
+
+#: Where a freshly switched-on measurement area starts: a third of the frame,
+#: in the middle of it. Small enough to be worth having over the whole frame,
+#: big enough to have some subject in it before it is dragged anywhere.
+_DEFAULT_MEASURE_AREA = (1 / 3, 1 / 3, 1 / 3, 1 / 3)
 
 #: What the camera delivers, near enough, for working out what integrating a
 #: given number of frames will cost in frame rate before it is switched on.
@@ -111,6 +128,11 @@ class MainWindow(QMainWindow):
     requestExposurePreview = Signal(bool)
     requestPan = Signal(int, int)
     requestIntegration = Signal(bool, int)
+    requestSharpness = Signal(bool)
+    requestSharpnessReset = Signal()
+    requestSharpnessArea = Signal(object)  # (x, y, w, h) fractions, or None
+    requestFineTune = Signal(int)  # the one increment to walk in
+    requestHuntCancel = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -122,6 +144,9 @@ class MainWindow(QMainWindow):
         self._updating_settings = False
         self._live = False
         self._fps_shown = (0.0, 0, 0)
+        self._sharpness_shown = 0.0
+        self._hunting = False
+        self._measure_area = _DEFAULT_MEASURE_AREA
 
         self._build_ui()
         self._start_worker()
@@ -138,6 +163,7 @@ class MainWindow(QMainWindow):
         self.view.zoomToggled.connect(self.requestToggleZoom)
         self.view.panStepped.connect(self.requestPan)
         self.view.focusStepped.connect(self._step_focus)
+        self.view.measureAreaSelected.connect(self._on_measure_area_selected)
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -329,6 +355,8 @@ class MainWindow(QMainWindow):
         self.requestIntegration.emit(
             self.integrate.isChecked(), self.integrate_frames.value()
         )
+        self.requestSharpness.emit(self.measure_sharpness.isChecked())
+        self._apply_measure_area()
 
     def _describe_integration(self) -> None:
         """Spell out the trade at the number of frames currently chosen.
@@ -359,7 +387,157 @@ class MainWindow(QMainWindow):
         )
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(hint)
+
+        layout.addWidget(self._build_sharpness())
         return box
+
+    def _build_sharpness(self) -> QWidget:
+        """Focusing by hand against a number, rather than by eye.
+
+        The reading on its own means nothing -- only whether it is higher than
+        the last one does -- so what the panel shows is the reading against the
+        best this view has managed, as a bar to aim at the top of.
+        """
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self.measure_sharpness = QCheckBox("Measure sharpness")
+        self.measure_sharpness.setToolTip(
+            "Score the contrast in the picture on screen, which is what focus "
+            "maximises. Drive focus and keep the direction that raises it."
+        )
+        row.addWidget(self.measure_sharpness)
+        row.addStretch(1)
+
+        self.reset_peak_button = QPushButton("Reset best")
+        self.reset_peak_button.setToolTip(
+            "Forget the best reading and start again from here"
+        )
+        self.reset_peak_button.clicked.connect(self.requestSharpnessReset)
+        row.addWidget(self.reset_peak_button)
+        column.addLayout(row)
+
+        self.measure_area = QCheckBox("Only a selected area")
+        self.measure_area.setToolTip(
+            "Read one rectangle of the picture instead of all of it. Shift-drag "
+            "on the image to put it where you want it."
+        )
+        self.measure_area.toggled.connect(self._on_measure_area_toggled)
+        column.addWidget(self.measure_area)
+
+        self.sharpness_trend = TrendGraph()
+        self.sharpness_trend.setToolTip(
+            "The readings as they arrive, scaled to the range they have lately "
+            "covered. Drive focus one step and watch which way the line goes; "
+            "it starts again whenever the view, the area or the exposure change, "
+            "since readings either side of those are not comparable."
+        )
+        column.addWidget(self.sharpness_trend)
+
+        self.sharpness_label = QLabel()
+        self.sharpness_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(self.sharpness_label)
+
+        self.fine_tune_button = QPushButton("Fine tune from here")
+        self.fine_tune_button.setToolTip(
+            "The same hunt, in minimum steps and nothing coarser, for when "
+            "focus is already close. What a macro subject wants: the depth of "
+            "focus is a hair, so a search in medium steps spends its time "
+            "somewhere no part of the picture could be sharp."
+        )
+        self.fine_tune_button.clicked.connect(self._toggle_fine_tune)
+        column.addWidget(self.fine_tune_button)
+
+        self.sharpness_hint = WrappedLabel(
+            "Magnify first, then shift-drag on the image to measure one part of "
+            "it. That is how to focus on something smaller than the camera's own "
+            "focus box, and smaller than its strongest magnification shows. "
+            "Integrate while hunting: the hunt waits for a whole stack before "
+            "believing a reading."
+        )
+        self.sharpness_hint.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(self.sharpness_hint)
+
+        settings = QSettings()
+        self._measure_area = self._stored_measure_area()
+        self.measure_sharpness.setChecked(settings.value("focus/sharpness", False, bool))
+        self.measure_area.blockSignals(True)
+        self.measure_area.setChecked(settings.value("focus/sharpness_area", False, bool))
+        self.measure_area.blockSignals(False)
+        self._show_sharpness(0.0, 0.0)
+        # The overlay belongs to what was restored, not to the worker starting:
+        # the box has to be on the image whether or not a camera turns up.
+        self._apply_measure_area()
+        self.measure_sharpness.toggled.connect(self._on_sharpness_toggled)
+        return holder
+
+    def _stored_measure_area(self) -> "tuple[float, float, float, float]":
+        stored = QSettings().value("focus/sharpness_rect", None)
+        try:
+            area = tuple(float(part) for part in str(stored).split(","))
+        except (TypeError, ValueError):
+            return _DEFAULT_MEASURE_AREA
+        if len(area) != 4 or area[2] <= 0 or area[3] <= 0:
+            return _DEFAULT_MEASURE_AREA
+        return area
+
+    @Slot(float, float, float, float)
+    def _on_measure_area_selected(self, x: float, y: float, w: float, h: float) -> None:
+        """A rectangle shift-dragged on the image.
+
+        Drawing one is a clear enough request that it also switches measuring
+        on: there is nothing else the gesture could mean.
+        """
+        self._measure_area = (x, y, w, h)
+        settings = QSettings()
+        settings.setValue("focus/sharpness_rect", ",".join(f"{v:.5f}" for v in self._measure_area))
+        settings.setValue("focus/sharpness", True)
+        settings.setValue("focus/sharpness_area", True)
+        # Ticked without their handlers running: the request they would send is
+        # sent here, once, with the new area already in place.
+        for box in (self.measure_sharpness, self.measure_area):
+            box.blockSignals(True)
+            box.setChecked(True)
+            box.blockSignals(False)
+        self.requestSharpness.emit(True)
+        self._apply_measure_area()
+        self._show_sharpness(0.0, 0.0)
+
+    def _on_measure_area_toggled(self, enabled: bool) -> None:
+        QSettings().setValue("focus/sharpness_area", enabled)
+        self._apply_measure_area()
+
+    def _apply_measure_area(self) -> None:
+        """Push the area to the worker and the overlay, or take it away."""
+        wanted = (
+            self._measure_area
+            if self.measure_sharpness.isChecked() and self.measure_area.isChecked()
+            else None
+        )
+        self.view.set_measure_area(wanted)
+        self.requestSharpnessArea.emit(wanted)
+
+    def _toggle_fine_tune(self) -> None:
+        """Walk to focus from close by, or stop the hunt that is running."""
+        if self._hunting:
+            self.requestHuntCancel.emit()
+            return
+        self.requestFineTune.emit(self._focus_steps[_FINE_INCREMENT].value())
+
+    @Slot(bool)
+    def _on_hunt_changed(self, hunting: bool) -> None:
+        self._hunting = hunting
+        self.fine_tune_button.setText("Stop" if hunting else "Fine tune from here")
+
+    def _on_sharpness_toggled(self, enabled: bool) -> None:
+        QSettings().setValue("focus/sharpness", enabled)
+        self._show_sharpness(0.0, 0.0)
+        self.requestSharpness.emit(enabled)
+        self._apply_measure_area()
 
     def _build_manual_focus(self) -> QWidget:
         """A column per increment: its name, its two buttons, and its size.
@@ -541,6 +719,11 @@ class MainWindow(QMainWindow):
         self.requestExposurePreview.connect(self.worker.set_exposure_preview)
         self.requestPan.connect(self.worker.pan)
         self.requestIntegration.connect(self.worker.set_integration)
+        self.requestSharpness.connect(self.worker.set_sharpness)
+        self.requestSharpnessReset.connect(self.worker.reset_sharpness_peak)
+        self.requestSharpnessArea.connect(self.worker.set_sharpness_area)
+        self.requestFineTune.connect(self.worker.fine_tune)
+        self.requestHuntCancel.connect(self.worker.cancel_hunt)
         self.requestDriveFocus.connect(self.worker.drive_focus)
 
         self.worker.connected.connect(self._on_connected)
@@ -551,6 +734,8 @@ class MainWindow(QMainWindow):
         self.worker.zoomChanged.connect(self._on_zoom_changed)
         self.worker.focusStateChanged.connect(self.view.set_focus_state)
         self.worker.fpsChanged.connect(self._on_fps)
+        self.worker.sharpnessChanged.connect(self._on_sharpness)
+        self.worker.huntChanged.connect(self._on_hunt_changed)
         self.worker.exposurePreviewChanged.connect(self._on_exposure_preview)
         self.worker.status.connect(self.statusBar().showMessage)
         self.worker.failed.connect(self._on_failed)
@@ -647,6 +832,46 @@ class MainWindow(QMainWindow):
             else ""
         )
         self.fps_label.setText(f"{width}x{height}  -  {fps:.1f} fps{integrated}")
+
+    @Slot(float, float)
+    def _on_sharpness(self, value: float, peak: float) -> None:
+        """Plot every reading; write the numbers out less often than that.
+
+        A peak of zero is how the worker says it has started again -- the view
+        moved, or the exposure did -- so the line starts again with it.
+        """
+        if peak <= 0.0:
+            self.sharpness_trend.clear()
+        else:
+            self.sharpness_trend.add(value)
+        now = time.monotonic()
+        # Thirty readings a second is more than the eye can read as text; the
+        # line has already had all of them.
+        if value > 0.0 and now - self._sharpness_shown < 0.2:
+            return
+        self._sharpness_shown = now
+        self._show_sharpness(value, peak)
+
+    def _show_sharpness(self, value: float, peak: float) -> None:
+        """The reading against the best of this view, or nothing when off."""
+        measuring = self.measure_sharpness.isChecked()
+        # Off, the readout is not just blank but gone: it is two rows of panel
+        # that mean nothing until it is switched on.
+        self.sharpness_trend.setVisible(measuring)
+        self.sharpness_label.setVisible(measuring)
+        self.reset_peak_button.setEnabled(measuring)
+        self.measure_area.setEnabled(measuring)
+        self.fine_tune_button.setEnabled(measuring)
+        if not measuring or peak <= 0.0:
+            self.sharpness_label.setText("Waiting for a frame...")
+            return
+        if value >= peak:
+            self.sharpness_label.setText(f"{_reading(value)}   -   best so far")
+            return
+        self.sharpness_label.setText(
+            f"{_reading(value)}   -   {100 * value / peak:.0f}% of best "
+            f"{_reading(peak)}"
+        )
 
     @Slot(bool)
     def _on_exposure_preview(self, enabled: bool) -> None:

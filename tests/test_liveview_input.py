@@ -101,13 +101,17 @@ def widget(app):
 
 @pytest.fixture
 def events(widget):
-    seen = {"clicked": [], "focus": 0, "region": [], "reset": 0, "toggle": 0, "zoom": []}
+    seen = {
+        "clicked": [], "focus": 0, "region": [], "reset": 0, "toggle": 0,
+        "zoom": [], "measure": [],
+    }
     widget.pointSelected.connect(lambda x, y: seen["clicked"].append((x, y)))
     widget.focusRequested.connect(lambda: seen.update(focus=seen["focus"] + 1))
     widget.regionSelected.connect(lambda *r: seen["region"].append(r))
     widget.zoomReset.connect(lambda: seen.update(reset=seen["reset"] + 1))
     widget.zoomToggled.connect(lambda: seen.update(toggle=seen["toggle"] + 1))
     widget.zoomStepped.connect(lambda d: seen["zoom"].append(d))
+    widget.measureAreaSelected.connect(lambda *r: seen["measure"].append(r))
     return seen
 
 
@@ -164,6 +168,53 @@ def test_drag_selects_a_region_instead_of_a_point(widget, events):
     assert events["focus"] == 0
     x, y, w, h = events["region"][0]
     assert 0.0 <= x < 1.0 and 0.0 <= y < 1.0 and w > 0 and h > 0
+
+
+def test_shift_drag_marks_out_an_area_to_measure_instead_of_magnifying(
+    widget, events
+):
+    """At full magnification there is nowhere further to zoom, so the same
+    gesture with shift held picks out a part of what is already on screen."""
+    shift = Qt.KeyboardModifier.ShiftModifier
+    QTest.mousePress(widget, Qt.MouseButton.LeftButton, shift, QPoint(200, 150))
+    QTest.mouseMove(widget, QPoint(400, 330))
+    QTest.mouseRelease(widget, Qt.MouseButton.LeftButton, shift, QPoint(400, 330))
+    assert len(events["measure"]) == 1
+    assert events["region"] == [], "it must not magnify as well"
+    assert events["clicked"] == []
+    x, y, w, h = events["measure"][0]
+    assert 0.0 <= x < 1.0 and 0.0 <= y < 1.0 and w > 0 and h > 0
+
+
+def test_letting_go_of_shift_midway_does_not_turn_a_measurement_into_a_zoom(
+    widget, events
+):
+    """What the gesture is gets decided when the button goes down."""
+    shift = Qt.KeyboardModifier.ShiftModifier
+    QTest.mousePress(widget, Qt.MouseButton.LeftButton, shift, QPoint(200, 150))
+    QTest.mouseMove(widget, QPoint(400, 330))
+    QTest.mouseRelease(
+        widget, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        QPoint(400, 330),
+    )
+    assert len(events["measure"]) == 1
+    assert events["region"] == []
+
+
+def test_a_shift_click_too_small_to_be_an_area_moves_nothing(widget, events):
+    """It is a slip of the hand, not a request to move the focus point."""
+    shift = Qt.KeyboardModifier.ShiftModifier
+    QTest.mousePress(widget, Qt.MouseButton.LeftButton, shift, QPoint(300, 240))
+    QTest.mouseRelease(widget, Qt.MouseButton.LeftButton, shift, QPoint(302, 242))
+    assert events["measure"] == []
+    assert events["clicked"] == []
+
+
+def test_the_measured_area_is_drawn_until_it_is_taken_away(widget):
+    widget.set_measure_area((0.25, 0.25, 0.5, 0.5))
+    assert widget.measure_area == (0.25, 0.25, 0.5, 0.5)
+    widget.set_measure_area(None)
+    assert widget.measure_area is None
 
 
 def test_tiny_drag_still_counts_as_a_click(widget, events):
