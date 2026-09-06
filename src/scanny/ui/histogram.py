@@ -14,9 +14,9 @@ Two decisions worth knowing about:
   everything else into the floor. Leaving the two end bins out of the scale
   keeps the shape of the picture readable, and the clipping is reported as a
   number underneath instead, where it is more use than a tall bar.
-- **The count is sampled, not exhaustive.** Counting every pixel thirty times
-  a second buys nothing: a few tens of thousands of them already describe the
-  shape to well within the width of a drawn line.
+- **The count is sampled, not exhaustive.** Counting every pixel forty-odd
+  times a second buys nothing: a few tens of thousands of them already describe
+  the shape to well within the width of a drawn line.
 """
 
 from __future__ import annotations
@@ -48,8 +48,8 @@ _CHANNELS = (
 #: whole picture, so it describes all of it rather than one corner of it.
 _SAMPLE_TARGET = 60_000
 
-#: The shortest gap between two counts. Frames arrive at up to thirty a second
-#: and no one reads a histogram that fast.
+#: The shortest gap between two counts. Frames arrive at up to forty-four a
+#: second and no one reads a histogram that fast.
 _MIN_INTERVAL = 0.1
 
 #: Below this fraction of the picture, a count in an end bin is the odd

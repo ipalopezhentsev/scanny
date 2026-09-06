@@ -433,7 +433,14 @@ class NikonCamera:
             pass
 
     def _request_largest_frame_size(self) -> None:
-        """Ask for the bigger of the two live-view frame sizes the body offers."""
+        """Ask for the bigger of the two live-view frame sizes the body offers.
+
+        Always, because the smaller one costs detail and buys nothing back:
+        measured on a D750, the body draws 320x180 at exactly the rate it
+        draws 640x360 at every magnification -- 44fps out to 3.13x, 16fps
+        from 4.7x up -- and a read is latency-bound rather than bandwidth-
+        bound, so the larger frame is no slower to fetch either.
+        """
         try:
             self.session.set_prop(Prop.NIKON_LIVE_VIEW_IMAGE_SIZE, 2)
         except (MtpError, WpdCommandError):
@@ -698,17 +705,35 @@ class NikonCamera:
     # LiveViewProhibitCondition, see values.describe_lv_prohibit -- so a body
     # left with it on may refuse to start live view next time.
     #
-    # It is written for every shot, including a delay of none. A D750 arrived
-    # here with three seconds already set on it, so leaving the property alone
-    # when no delay is wanted would mean an "off" that still waits. The value
-    # asked for here is what the shot is taken with, and the camera's own
-    # setting is handed back straight afterwards.
+    # It is written for every shot, including a delay of none: a body with a
+    # delay of its own would otherwise make "off" here still wait. The delay
+    # asked for is what the shot is taken with, and the camera's own setting is
+    # handed back straight afterwards.
 
-    #: The delays ExposureDelayMode encodes: the value is the delay in whole
-    #: seconds, and 0 is off. A D750 offers all four. Bodies before it offer
-    #: only off and one second, which is why the choices on offer are asked of
-    #: the camera rather than taken from here.
+    #: The delays offered, in seconds, 0 being none.
+    #:
+    #: The property does not hold seconds. It counts *down* to them: its
+    #: highest value is off, and every step below that adds a second. Timed
+    #: against the camera, release to the picture arriving, on a D750 whose
+    #: baseline is 1.5s:
+    #:
+    #: ======  ========  =======
+    #: value   picture   delay
+    #: ======  ========  =======
+    #: 3       1.5s      off
+    #: 2       2.5s      1s
+    #: 1       3.5s      2s
+    #: 0       4.4s      3s
+    #: ======  ========  =======
+    #:
+    #: So the seconds asked for here are turned into a value by subtracting
+    #: them from the top of the property's range, and the range is read from
+    #: the body rather than assumed: what is on offer varies by model.
     SHUTTER_DELAYS = (0, 1, 2, 3)
+
+    #: The value that means off, for a body that will not say what its range
+    #: is. Nikon's own, and the top of the range on every body seen here.
+    _DELAY_OFF_VALUE = 3
 
     @property
     def shutter_delay(self) -> int:
@@ -719,39 +744,56 @@ class NikonCamera:
         """Choose the delay. It reaches the camera when the next shot is taken."""
         self._shutter_delay = max(0, int(seconds))
 
-    def shutter_delay_on_body(self) -> "int | None":
-        """The delay the camera itself is set to, or None if it has no such setting.
+    def _delay_off_value(self) -> "int | None":
+        """The property value that means no delay: the top of its range.
 
-        Where the choice starts from: a body already set up for a copy stand
-        should not quietly lose its delay the first time it is driven from here.
+        None when the body has no such property, which is what everything
+        else here treats as "this camera cannot hold the shutter back".
         """
-        try:
-            return int(self.session.get_prop(Prop.NIKON_EXPOSURE_DELAY_MODE))
-        except (MtpError, WpdCommandError, ValueError, TypeError):
-            return None
-
-    def shutter_delay_choices(self) -> "tuple[int, ...]":
-        """The delays this body accepts; empty when it has no such setting."""
         try:
             desc = self.session.prop_desc(Prop.NIKON_EXPOSURE_DELAY_MODE)
         except (MtpError, WpdCommandError, ValueError):
-            return ()
+            return None
         if not desc.writable:
-            return ()
+            return None
         try:
-            offered = tuple(sorted({int(value) for value in desc.allowed_values}))
+            values = [int(value) for value in desc.allowed_values]
         except (TypeError, ValueError):
-            offered = ()
-        # A body that has the property but will not enumerate it still takes
-        # the values Nikon defines for it.
-        return offered or self.SHUTTER_DELAYS
+            values = []
+        # A body that has the property but will not describe its range still
+        # takes the values Nikon defines for it.
+        return max(values) if values else self._DELAY_OFF_VALUE
+
+    def shutter_delay_on_body(self) -> "int | None":
+        """The delay the camera itself is set to, in seconds.
+
+        None if it has no such setting. Where the choice starts from: a body
+        already set up for a copy stand should not quietly lose its delay the
+        first time it is driven from here.
+        """
+        off = self._delay_off_value()
+        if off is None:
+            return None
+        try:
+            value = int(self.session.get_prop(Prop.NIKON_EXPOSURE_DELAY_MODE))
+        except (MtpError, WpdCommandError, ValueError, TypeError):
+            return None
+        return max(0, off - value)
+
+    def shutter_delay_choices(self) -> "tuple[int, ...]":
+        """The delays this body accepts, in seconds; empty when it has none."""
+        off = self._delay_off_value()
+        if off is None:
+            return ()
+        return tuple(range(off + 1))
 
     @contextmanager
     def _delayed_shutter(self) -> "Iterator[None]":
         """Hold the wanted exposure delay on the camera for one shot."""
         wanted = self._shutter_delay
+        off = self._delay_off_value()
         previous = self.shutter_delay_on_body()
-        if previous is None:
+        if off is None or previous is None:
             # No such setting on this body. Asking for no delay is then simply
             # what happens anyway; asking for one is a promise that cannot be
             # kept, and is said rather than quietly dropped.
@@ -766,7 +808,9 @@ class NikonCamera:
             yield
             return
         try:
-            self.session.set_prop(Prop.NIKON_EXPOSURE_DELAY_MODE, wanted)
+            self.session.set_prop(
+                Prop.NIKON_EXPOSURE_DELAY_MODE, off - min(wanted, off)
+            )
         except (MtpError, WpdCommandError) as exc:
             if wanted:
                 raise CameraError(
@@ -783,7 +827,9 @@ class NikonCamera:
             yield
         finally:
             try:
-                self.session.set_prop(Prop.NIKON_EXPOSURE_DELAY_MODE, previous)
+                self.session.set_prop(
+                    Prop.NIKON_EXPOSURE_DELAY_MODE, off - min(previous, off)
+                )
             except (MtpError, WpdCommandError):
                 pass
 
@@ -879,12 +925,14 @@ class NikonCamera:
             # zero. A value of one is accepted but then never completes, and
             # leaves a capture pending that has to be torn down.
             params: "tuple[int, ...]" = (0xFFFFFFFF, 0x0000)
-            # The delay is on the camera for the whole sequence, release to
-            # capture-complete, and taken off again the moment it is over --
-            # including when the shutter refuses to fire.
             # What the shot will cost, read before the shutter is released
-            # rather than after, while the camera is still able to answer.
+            # rather than after, while the camera is still able to answer. The
+            # delay before the mirror is part of it, so this is read outside
+            # the block that puts that delay on the camera.
             wait = self.shot_seconds() + timeout
+            # The delay stays on the camera for the whole sequence, release to
+            # the last event, and comes off the moment it is over -- including
+            # when the shutter refuses to fire.
             with self._delayed_shutter():
                 # Anything already queued belongs to something that happened
                 # before this shot -- an earlier capture whose events arrived

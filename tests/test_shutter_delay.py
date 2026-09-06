@@ -1,10 +1,12 @@
 """The mirror-up delay: Nikon's exposure delay mode, driven for one shot.
 
-The point of the tests below is not that the property is written -- it is
-*when* it is written. The delay has to be on the camera before the shutter is
-released and off it again afterwards, whatever the shot did, because a body
-left with exposure delay mode on is a body that may refuse to start live view
-next time.
+Two things are being pinned down here. *When* the property is written -- the
+delay has to be on the camera before the shutter is released and off it again
+afterwards, whatever the shot did -- and *what* is written, which is not the
+number of seconds. The property counts down to the delay: its highest value is
+off and each step below adds a second, measured against the camera and written
+up on `NikonCamera.SHUTTER_DELAYS`. Writing the seconds straight in is how the
+first version of this asked for three seconds and got none.
 """
 
 from __future__ import annotations
@@ -35,7 +37,8 @@ class FakeSession:
     """Just enough of PtpSession to take a picture."""
 
     def __init__(self, *, delays=(0, 1, 2, 3), writable=True, refuse_delay=False):
-        self.props = {_DELAY: 0}
+        # 3 is what "off" is encoded as on a D750: the top of the range.
+        self.props = {_DELAY: 3}
         self.writes: "list[tuple[int, object]]" = []
         self.operations: "list[int]" = []
         self.desc = FakeDesc(delays, writable) if delays else None
@@ -93,21 +96,30 @@ def test_a_body_already_off_is_not_written_to(camera):
     assert delays_written(camera) == []
 
 
+def test_the_property_counts_down_to_the_delay(camera):
+    # Timed against a D750: 3 fires at once, 0 waits three seconds.
+    for seconds, value in ((1, 2), (2, 1), (3, 0)):
+        camera.session.writes.clear()
+        camera.set_shutter_delay(seconds)
+        camera.capture()
+        assert delays_written(camera)[0] == value
+
+
 def test_the_delay_is_set_for_the_shot_and_taken_off_after(camera):
     camera.set_shutter_delay(2)
     camera.capture()
-    assert delays_written(camera) == [2, 0]
+    assert delays_written(camera) == [1, 3]
 
 
 def test_the_cameras_own_delay_is_taken_off_when_none_was_asked_for(camera):
-    # This D750 arrived with three seconds set on it. Off has to mean off.
-    camera.session.props[_DELAY] = 3
+    # A body carrying three seconds of its own. Off has to mean off.
+    camera.session.props[_DELAY] = 0
     camera.capture()
-    assert delays_written(camera) == [0, 3]
+    assert delays_written(camera) == [3, 0]
 
 
 def test_a_camera_that_will_not_let_go_of_its_delay_still_takes_the_picture(camera):
-    camera.session.props[_DELAY] = 3
+    camera.session.props[_DELAY] = 0
     camera.session.refuse_delay = True
     camera.capture()
     assert Op.NIKON_INITIATE_CAPTURE_REC_IN_MEDIA in camera.session.operations
@@ -125,19 +137,19 @@ def test_the_shot_is_released_while_the_delay_is_on(camera):
 
     camera.session.execute = watching
     camera.capture()
-    assert released == [3]
+    assert released == [0]  # nought is three seconds
 
 
 def test_the_body_gets_back_the_setting_it_had(camera):
-    camera.session.props[_DELAY] = 1
+    camera.session.props[_DELAY] = 2      # the body is set to one second
     camera.set_shutter_delay(3)
     camera.capture()
-    assert delays_written(camera) == [3, 1]
-    assert camera.session.props[_DELAY] == 1
+    assert delays_written(camera) == [0, 2]
+    assert camera.session.props[_DELAY] == 2
 
 
 def test_a_body_already_set_the_way_it_is_wanted_is_left_alone(camera):
-    camera.session.props[_DELAY] = 2
+    camera.session.props[_DELAY] = 1      # two seconds already
     camera.set_shutter_delay(2)
     camera.capture()
     assert delays_written(camera) == []
@@ -157,9 +169,13 @@ def test_a_body_with_no_delay_at_all_still_shoots_without_one(camera):
     assert Op.NIKON_INITIATE_CAPTURE_REC_IN_MEDIA in camera.session.operations
 
 
-def test_what_the_body_is_set_to_is_readable(camera):
-    camera.session.props[_DELAY] = 3
+def test_what_the_body_is_set_to_is_read_as_seconds(camera):
+    camera.session.props[_DELAY] = 0
     assert camera.shutter_delay_on_body() == 3
+    camera.session.props[_DELAY] = 2
+    assert camera.shutter_delay_on_body() == 1
+    camera.session.props[_DELAY] = 3
+    assert camera.shutter_delay_on_body() == 0
 
 
 def test_a_body_with_no_such_setting_reports_no_delay_of_its_own(camera):
@@ -172,7 +188,7 @@ def test_a_shutter_that_would_not_fire_still_gives_the_delay_back(camera):
     camera.session.shutter_response = Response.NIKON_OUT_OF_FOCUS
     with pytest.raises(CameraError):
         camera.capture()
-    assert delays_written(camera) == [2, 0]
+    assert delays_written(camera) == [1, 3]
 
 
 def test_a_camera_that_refuses_the_delay_is_not_shot_with(camera):
@@ -192,8 +208,13 @@ def test_the_wait_is_added_to_the_time_the_shot_is_given(camera):
 
 
 def test_the_delays_on_offer_come_from_the_body(camera):
+    # A body with only two values has one second to offer, and off.
     camera.session.desc = FakeDesc((0, 1))
     assert camera.shutter_delay_choices() == (0, 1)
+
+
+def test_a_body_with_the_whole_range_offers_every_second(camera):
+    assert camera.shutter_delay_choices() == (0, 1, 2, 3)
 
 
 def test_a_body_with_no_such_setting_offers_nothing(camera):

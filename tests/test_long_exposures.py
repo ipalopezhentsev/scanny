@@ -34,7 +34,8 @@ import struct
 import pytest
 
 from scanny.camera.nikon import CameraError, NikonCamera
-from scanny.ptp.codes import Event, Op, Prop, Response
+from scanny.ptp.codes import Event, FormFlag, Op, Prop, Response
+from scanny.wpd.device import MtpError
 
 #: PTP ExposureTime counts in units of 0.1 ms.
 SECOND = 10_000
@@ -54,6 +55,18 @@ def _packed(events) -> bytes:
     return struct.pack("<H", len(events)) + b"".join(
         struct.pack("<HI", int(code), int(param)) for code, param in events
     )
+
+
+class _DelayDesc:
+    """The exposure delay property as a D750 describes it: a range of 0 to 3."""
+
+    form = FormFlag.RANGE
+    writable = True
+    minimum, maximum, step = 0, 3, 1
+
+    @property
+    def allowed_values(self):
+        return [0, 1, 2, 3]
 
 
 class _ShootingSession:
@@ -82,11 +95,20 @@ class _ShootingSession:
         self.props = {
             int(Prop.EXPOSURE_TIME): exposure,
             int(Prop.NIKON_LONG_EXPOSURE_NOISE_REDUCTION): int(noise_reduction),
+            # 3 is how the exposure delay property encodes "off": the top of
+            # its range. See NikonCamera.SHUTTER_DELAYS. A body with a delay
+            # set is test_shutter_delay.py's business, not this file's.
+            int(Prop.NIKON_EXPOSURE_DELAY_MODE): 3,
         }
         self.fired = False
         self.terminated = False
         self.queue_when_fired: "list | None" = None
         self.polls_after_firing = 0
+
+    def prop_desc(self, code, refresh=True):
+        if int(code) != int(Prop.NIKON_EXPOSURE_DELAY_MODE):
+            raise MtpError(Op.GET_DEVICE_PROP_DESC, Response.DEVICE_PROP_NOT_SUPPORTED)
+        return _DelayDesc()
 
     def set_prop(self, code, value):
         self.props[int(code)] = value

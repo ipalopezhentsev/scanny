@@ -172,15 +172,24 @@ def test_a_long_stack_does_not_drift_darker():
 
 
 class _FakeCamera:
-    """Just enough camera for the grab loop: it always has another frame."""
+    """Just enough camera for the grab loop: it always has another frame.
+
+    Another *different* frame. The worker discards a read that comes back
+    holding the frame it already has, so a fake handing out identical bytes
+    would exercise that path instead of the one under test here. The scene
+    stays put and a single grey level moves either side of it, which is what
+    a real frame does and what integration exists to average away.
+    """
 
     live_view_active = True
 
-    def __init__(self, frame: LiveViewFrame) -> None:
-        self.frame = frame
+    def __init__(self, grey: int = 100) -> None:
+        self._grey = grey
+        self._grabs = 0
 
     def live_view_frame(self) -> LiveViewFrame:
-        return self.frame
+        self._grabs += 1
+        return _frame(self._grey + (1 if self._grabs % 2 else -1))
 
 
 @pytest.fixture
@@ -188,10 +197,10 @@ def worker(monkeypatch):
     from scanny.ui.worker import CameraWorker
 
     made = CameraWorker()
-    made._camera = _FakeCamera(_frame(100))
+    made._camera = _FakeCamera(100)
     now = [1000.0]
     monkeypatch.setattr("scanny.ui.worker.time.monotonic", lambda: now[0])
-    made._tick = lambda seconds=1 / 30: now.__setitem__(0, now[0] + seconds)
+    made._tick = lambda seconds=1 / 44: now.__setitem__(0, now[0] + seconds)
     return made
 
 
@@ -225,7 +234,7 @@ def test_the_rate_shown_is_the_rate_the_picture_updates_at(worker):
     seen = []
     worker.fpsChanged.connect(lambda fps, w, h: seen.append(fps))
     _grabs(worker, 60)
-    assert seen[-1] == pytest.approx(30.0 / 4, rel=0.15)
+    assert seen[-1] == pytest.approx(44.0 / 4, rel=0.15)
 
 
 def test_stopping_live_view_throws_the_stack_away(worker):
@@ -235,3 +244,125 @@ def test_stopping_live_view_throws_the_stack_away(worker):
     worker._camera = None
     worker.stop_live_view()
     assert worker._integrator.pending == 0
+
+
+# -- reads that come back holding the frame we already have ------------------
+
+
+class _StutteringCamera:
+    """A camera polled twice as fast as it draws.
+
+    Which is roughly the real situation: the worker's timer is set a little
+    faster than the body's own frame rate on purpose, so that no frame is
+    missed when that rate moves.
+    """
+
+    live_view_active = True
+
+    def __init__(self) -> None:
+        self._reads = 0
+        self._drawn = 0
+
+    def live_view_frame(self) -> LiveViewFrame:
+        if self._reads % 2 == 0:
+            self._drawn += 1
+        self._reads += 1
+        # Identical bytes for as long as the frame stands, which is what makes
+        # the re-read recognisable as one.
+        return _frame(100 + (1 if self._drawn % 2 else -1))
+
+
+@pytest.fixture
+def stuttering(monkeypatch):
+    from scanny.ui.worker import CameraWorker
+
+    made = CameraWorker()
+    made._camera = _StutteringCamera()
+    now = [1000.0]
+    monkeypatch.setattr("scanny.ui.worker.time.monotonic", lambda: now[0])
+    return made
+
+
+def test_a_re_read_does_not_count_towards_the_stack(stuttering):
+    """Averaging a frame with a copy of itself cancels nothing: the copy
+    carries the same noise, which adds coherently instead of averaging down.
+    Counting one in would only finish the stack early, and leave it grainier
+    than the number of frames claims."""
+    stuttering.set_integration(True, 4)
+    for _ in range(6):
+        stuttering._grab()
+    # Six reads, three frames drawn; a stack that counted reads would have
+    # completed at four and be two into the next one.
+    assert stuttering._integrator.pending == 3
+
+
+def test_a_re_read_publishes_nothing(stuttering):
+    """There is no news in one -- not a new picture, and not a new focus box
+    or level reading either, because they come off the same frame."""
+    stuttering.set_integration(True, 4)
+    published = []
+    stuttering.frameReady.connect(lambda frame, image: published.append(image))
+    for _ in range(8):
+        stuttering._grab()
+    assert [not image.isNull() for image in published] == [True, False, False, True]
+
+
+def test_the_skip_can_be_switched_off(stuttering):
+    """Off, every read is a frame again -- which is what the code did before
+    the camera's draw rate was measured, and is how the gap between the poll
+    rate and the draw rate can be seen at all."""
+    stuttering.set_deduplicate(False)
+    stuttering.set_integration(True, 4)
+    published = []
+    stuttering.frameReady.connect(lambda frame, image: published.append(image))
+    for _ in range(8):
+        stuttering._grab()
+    assert len(published) == 8
+    assert [not image.isNull() for image in published] == [
+        True, False, False, True, False, False, False, True
+    ]
+
+
+def test_switching_the_skip_back_on_starts_a_clean_stack(stuttering):
+    """A stack half filled under the other rule is a mix of the two."""
+    stuttering.set_deduplicate(False)
+    stuttering.set_integration(True, 8)
+    for _ in range(3):
+        stuttering._grab()
+    assert stuttering._integrator.pending == 3
+    stuttering.set_deduplicate(True)
+    assert stuttering._integrator.pending == 0
+
+
+# -- a thrown-away stack is not a moved view ---------------------------------
+
+
+def test_restarting_a_stack_leaves_the_clean_picture_up():
+    """The flash of grain: focus settles, the stack is dropped because it
+    holds frames from the old focus position, and the next frame -- a single
+    noisy one -- went straight to the screen in place of a clean image. The
+    view has not moved, so there is nothing to catch up with: fill quietly."""
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    _feed(integrator, [100] * 4)
+    integrator.reset()
+    assert integrator.add(_frame(100)) is None
+    assert integrator.pending == 1
+
+
+def test_a_moved_view_is_still_shown_at_once():
+    """The other side of it: panning must not look like it has frozen."""
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    _feed(integrator, [100] * 4)
+    integrator.reset()
+    moved = integrator.add(_frame(200, crop_centre=(1000, 1000)))
+    assert moved is not None
+    assert not integrator.last_image_was_whole
+
+
+def test_forgetting_shows_the_next_frame_at_once():
+    """Live view stopping and starting again leaves nothing on screen, so the
+    first frame back has to go up rather than wait out a stack."""
+    integrator = FrameIntegrator(enabled=True, frames=4)
+    _feed(integrator, [100] * 4)
+    integrator.forget()
+    assert integrator.add(_frame(100)) is not None

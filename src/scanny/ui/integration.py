@@ -3,9 +3,17 @@
 Sensor noise is different in every frame while the scene is not, so the mean of
 N frames keeps the picture and shrinks the noise by roughly the square root of
 N. Live view cannot be asked for a longer exposure -- the camera sends what it
-sends, about 30 frames a second -- so the only currency available is frame
-rate: show the mean of each N frames and the picture arrives 30/N times a
-second with visibly less grain in it.
+sends, about 44 frames a second on a D750 and only 16 of them once the view is
+magnified past 4.7x -- so the only currency available is frame rate: show the
+mean of each N frames and the picture arrives N times less often, with visibly
+less grain in it.
+
+The N frames have to be N *different* frames for any of that to hold. Averaging
+a frame with a copy of itself cancels nothing, because the copy carries the
+same noise and it adds coherently rather than averaging down -- the mean of a
+stack is the mean of its distinct frames however many times each was counted.
+The worker polls faster than the camera draws and drops the re-reads, so what
+arrives here is only ever new; nothing in this file re-checks it.
 
 Two choices worth knowing about:
 
@@ -14,11 +22,19 @@ Two choices worth knowing about:
   but it also lifts the shadows and changes how the picture looks. The point
   here is the same picture with less noise in it, so the arithmetic stays in
   the values the camera sent.
-- **A frame that does not match the stack is shown immediately**, and starts a
-  new stack. Magnifying or panning changes the crop the camera renders, and
-  waiting out the rest of a stack before showing the new view would make every
-  pan feel like it had frozen. This way the first frame of a new view appears
-  at once -- noisy -- and the integrated version replaces it a stack later.
+- **A frame of a view we have nothing to show for is shown immediately**, and
+  starts a new stack. Magnifying or panning changes the crop the camera
+  renders, and waiting out the rest of a stack before showing the new view
+  would make every pan feel like it had frozen. This way the first frame of a
+  new view appears at once -- noisy -- and the integrated version replaces it
+  a stack later.
+
+  A stack thrown away by :meth:`FrameIntegrator.reset` is not that. The view
+  has not moved, so the picture already on screen is still a picture of it,
+  and a far cleaner one than the single frame that would replace it. Those
+  restarts fill quietly, and the last good image stays up. Telling the two
+  apart is what :attr:`_last_key` is for: it outlives a reset, where
+  :attr:`_key` does not.
 """
 
 from __future__ import annotations
@@ -29,10 +45,16 @@ from PySide6.QtGui import QImage
 from ..camera.nikon import LiveViewFrame
 from .pixels import view
 
-__all__ = ["FrameIntegrator", "MAX_FRAMES", "MIN_FRAMES", "DEFAULT_FRAMES"]
+__all__ = [
+    "FrameIntegrator",
+    "MAX_FRAMES",
+    "MIN_FRAMES",
+    "DEFAULT_FRAMES",
+    "source_fps",
+]
 
-#: Fewer than two frames is not an average, and 64 frames is already two
-#: seconds of integration at the camera's 30fps -- long enough that the view
+#: Fewer than two frames is not an average, and 64 frames is already a second
+#: and a half of integration at the camera's 44fps -- long enough that the view
 #: has stopped being live in any useful sense.
 MIN_FRAMES = 2
 MAX_FRAMES = 64
@@ -53,6 +75,9 @@ class FrameIntegrator:
         self._sum: "np.ndarray | None" = None
         self._count = 0
         self._key: "tuple[int, ...] | None" = None
+        # The view the picture on screen belongs to. Unlike _key it survives a
+        # reset, so a restarted stack can be told from a moved view.
+        self._last_key: "tuple[int, ...] | None" = None
         self._last_whole = True
         self._last_frame: "QImage | None" = None
 
@@ -107,10 +132,22 @@ class FrameIntegrator:
         return True
 
     def reset(self) -> None:
-        """Throw away the part-filled stack, as when live view restarts."""
+        """Throw away the part-filled stack, the view being unchanged.
+
+        What is on screen stays there while the stack fills again, because it
+        is still a picture of this view and a cleaner one than any single
+        frame. Use :meth:`forget` where that is not true.
+        """
         self._sum = None
         self._count = 0
         self._key = None
+
+    def forget(self) -> None:
+        """Throw away the stack *and* what is on screen, as when live view
+        stops: the next frame has nothing to be continuous with, so it is
+        shown as soon as it arrives rather than a stack later."""
+        self.reset()
+        self._last_key = None
 
     # -- integration -------------------------------------------------------
 
@@ -127,7 +164,15 @@ class FrameIntegrator:
 
         key = _stack_key(frame, image)
         if key != self._key:
+            moved = key != self._last_key
+            self._last_key = key
             self._start(key, image)
+            if not moved:
+                # A restarted stack, not a new view. Leave the picture that is
+                # already up: showing this one frame instead would replace a
+                # clean image with a noisy one for no reason, which is exactly
+                # what it looks like on screen -- a flash of grain.
+                return None
             self._last_whole = False
             return image
         self._accumulate(image)
@@ -159,6 +204,30 @@ class FrameIntegrator:
         return QImage(
             mean.tobytes(), width, height, width * 4, QImage.Format.Format_RGB32
         ).copy()
+
+
+def source_fps(zoom_level: int, exposure_preview: bool) -> float:
+    """How fast the camera draws, under the two conditions that decide it.
+
+    Measured on a D750, and a hint rather than a promise: it is here so the
+    controls can say what a setting will cost before it is switched on, while
+    the status bar goes on reporting the rate actually arriving.
+
+    Magnification dominates. Out to 3.13x the body draws 44 frames a second,
+    or 30 with the exposure preview off; from 4.7x up it draws 16 whatever
+    else is set, the preview included. The live-view frame size does not come
+    into it -- 320x180 is drawn at exactly the rate 640x360 is, at every
+    magnification -- so asking for the small frame buys detail away for
+    nothing, and is not a way to go faster.
+    """
+    if zoom_level >= _SLOW_ZOOM_LEVEL:
+        return 16.0
+    return 44.0 if exposure_preview else 30.0
+
+
+#: The magnification at which the body's draw rate falls away. Level 3 is
+#: 3.13x and holds 44fps; level 4 is 4.7x and does not.
+_SLOW_ZOOM_LEVEL = 4
 
 
 def _clamp(frames: int) -> int:

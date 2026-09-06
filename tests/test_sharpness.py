@@ -265,14 +265,20 @@ def test_the_best_can_be_forgotten_on_request():
 
 
 class _FakeCamera:
+    """The same scene every grab, with fresh noise on it -- as the camera
+    sends. The worker throws away a read that returns the frame it already
+    has, so a fake repeating one frame would never reach the measuring."""
+
     live_view_active = True
     exposure_preview = True
 
-    def __init__(self, frame: LiveViewFrame) -> None:
-        self.frame = frame
+    def __init__(self, pixels: np.ndarray) -> None:
+        self.pixels = pixels
+        self._grabs = 0
 
     def live_view_frame(self) -> LiveViewFrame:
-        return self.frame
+        self._grabs += 1
+        return _jpeg_frame(_noisy(self.pixels, 1.0, self._grabs))
 
     def stop_live_view(self) -> None:
         pass
@@ -286,6 +292,11 @@ class _FakeCamera:
     def set_exposure_preview(self, enabled: bool) -> None:
         self.exposure_preview = enabled
 
+    def zoom_level(self) -> int:
+        # Read back after an exposure-preview change, which resets it on a
+        # real body.
+        return 0
+
 
 @pytest.fixture
 def worker():
@@ -293,7 +304,7 @@ def worker():
     from scanny.ui.worker import CameraWorker
 
     made = CameraWorker()
-    made._camera = _FakeCamera(_jpeg_frame(_subject()))
+    made._camera = _FakeCamera(_subject())
     return made
 
 
@@ -316,14 +327,18 @@ def test_a_reading_for_every_frame_that_is_displayed(worker):
     assert all(value > 0 for value, _ in seen)
 
 
-def test_only_the_frames_that_are_displayed_are_measured(worker):
-    """Integrating, the picture changes once a stack; measuring the frames in
-    between would be measuring pictures nobody sees."""
+def test_only_whole_stacks_are_measured(worker):
+    """Integrating, only a completed stack is measured. The frames in between
+    are pictures nobody sees, and the one frame that *is* shown without being
+    stacked -- the first of a moved view -- carries the full grain of a single
+    frame, so reading it would spike the trend and could leave the hunt with a
+    peak no focus position can be returned to."""
     worker.set_integration(True, 4)
     worker.set_sharpness(True)
     seen = _readings(worker, 8)
-    # The first frame of a view is shown at once, then one per completed stack.
-    assert len(seen) == 3
+    # Eight frames, four to a stack: two stacks, and no reading for the first
+    # frame even though it went on screen.
+    assert len(seen) == 2
 
 
 def test_changing_the_integration_forgets_the_best(worker):

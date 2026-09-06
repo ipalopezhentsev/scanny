@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QSettings, Qt, QThread, Signal, Slot
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -29,12 +41,12 @@ from PySide6.QtWidgets import (
 
 from ..camera.nikon import NikonCamera, Setting
 from .histogram import HistogramWidget
-from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES
+from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES, source_fps
 from .liveview import LiveViewWidget
 from .naming import DEFAULT_PREFIX, MAX_NUMBER, format_name
 from .navigator import NavigatorWidget
 from .trend import TrendGraph
-from .worker import CameraWorker
+from .worker import _FRAME_INTERVAL_MS, CameraWorker
 
 __all__ = ["MainWindow", "WrappedLabel"]
 
@@ -62,13 +74,20 @@ _FINE_INCREMENT = "minimum"
 #: big enough to have some subject in it before it is dragged anywhere.
 _DEFAULT_MEASURE_AREA = (1 / 3, 1 / 3, 1 / 3, 1 / 3)
 
+#: The shape of a live-view picture: what a D750 sends in its photo position,
+#: 640x424. The window opens this shape so the picture fills the image area
+#: instead of sitting in it between two black strips -- strips are not merely
+#: untidy, they are room the picture could have been shown in. A body that
+#: sends another size, or the movie position, gets thin ones back.
+_LIVE_VIEW_ASPECT = 640 / 424
+
+#: How much of the screen a first-run window takes. Short of the whole of it,
+#: so the window's own edges and the taskbar are still there to grab.
+_SCREEN_SHARE = 0.9
+
 #: How long a naming prefix may be. Long enough for any label worth typing,
 #: short enough that the path stays well inside what Windows will open.
 _MAX_PREFIX = 64
-
-#: What the camera delivers, near enough, for working out what integrating a
-#: given number of frames will cost in frame rate before it is switched on.
-_SOURCE_FPS = 30.0
 
 
 class WrappedLabel(QLabel):
@@ -112,6 +131,49 @@ class WrappedLabel(QLabel):
             self.setFixedHeight(self.heightForWidth(self.width()))
 
 
+class _WheelGuard(QObject):
+    """Sends a wheel notch to the panel instead of to the control under it.
+
+    A combo box or a spin box reads a notch as "change my value", which is
+    what it should mean when the pointer went there to use the control. It is
+    not what it means while the panel is being scrolled past: the pointer is
+    over the control only because the control is in the way, and a shutter
+    speed that quietly steps as the panel goes by is a real change to a real
+    camera, announced by nothing. Scrolling becomes a thing to be afraid of,
+    which is a poor state to leave a panel that has to be scrolled.
+
+    Qt has no setting for this. The remedy is to take the wheel away from
+    every control in the panel that reads one and give it to the panel, which
+    is the gesture the hand was making.
+    """
+
+    def __init__(self, scroller: QScrollArea) -> None:
+        super().__init__(scroller)
+        self._scroller = scroller
+
+    def watch(self, widget: QWidget) -> None:
+        widget.installEventFilter(self)
+
+    def watch_all(self, within: QWidget) -> None:
+        """Guard every control under *within* that answers the wheel."""
+        for kind in (QComboBox, QAbstractSpinBox, QSlider):
+            for control in within.findChildren(kind):
+                self.watch(control)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        bar = self._scroller.verticalScrollBar()
+        # A notch is 120 eighths of a degree, and the system setting says how
+        # many lines it is worth. The line is floored at twenty pixels: a
+        # scroll area whose widget resizes with it can report a single step of
+        # one, and a panel that moves three pixels a notch has not scrolled.
+        notches = event.angleDelta().y() / 120
+        lines = QApplication.wheelScrollLines() or 3
+        bar.setValue(bar.value() - round(notches * max(bar.singleStep(), 20) * lines))
+        return True
+
+
 class MainWindow(QMainWindow):
     """Drives a :class:`CameraWorker` living on its own thread."""
 
@@ -135,6 +197,8 @@ class MainWindow(QMainWindow):
     requestShutdown = Signal()
     requestResetZoom = Signal()
     requestExposurePreview = Signal(bool)
+    #: Discard reads that come back with the frame already on screen.
+    requestDeduplicate = Signal(bool)
     requestSaveToCard = Signal(bool)
     requestShutterDelay = Signal(int)  # seconds, mirror up, before the shot
     requestPan = Signal(int, int)
@@ -151,13 +215,14 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("scanny")
-        self.resize(1280, 820)
 
         self._combos: "dict[str, QComboBox]" = {}
         self._level_shown = 0.0
         self._updating_settings = False
         self._live = False
         self._fps_shown = (0.0, 0, 0)
+        # The camera's magnification, which decides how fast it draws.
+        self._zoom_level = 0
         self._sharpness_shown = 0.0
         self._hunting = False
         self._measure_area = _DEFAULT_MEASURE_AREA
@@ -166,7 +231,66 @@ class MainWindow(QMainWindow):
         self._updating_naming = False
 
         self._build_ui()
+        self._restore_geometry()
         self._start_worker()
+
+    # -- geometry ----------------------------------------------------------
+
+    def _restore_geometry(self) -> None:
+        """Where the window was left last time, or a first size that fits."""
+        stored = QSettings().value("window/geometry")
+        if stored is not None and self.restoreGeometry(stored):
+            return
+        self.resize(self._size_that_fits_the_frame())
+
+    def _size_that_fits_the_frame(self) -> QSize:
+        """A window whose image area is the shape of a live-view frame.
+
+        The picture is drawn as large as fits with its shape kept, so any
+        mismatch between the window and the frame comes back as black strips
+        down two sides of it. Opening at the frame's own shape starts those
+        strips at nothing. The user is then free to resize into whatever shape
+        suits them -- and that, rather than this, is what gets saved.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        room = screen.availableGeometry() if screen else QRect(0, 0, 1280, 800)
+        beside, above = self._chrome()
+        picture_h = room.height() * _SCREEN_SHARE - above
+        widest = room.width() * _SCREEN_SHARE - beside
+        if picture_h * _LIVE_VIEW_ASPECT > widest:
+            picture_h = widest / _LIVE_VIEW_ASPECT
+        # Two floors the window cannot open under: the height the pinned panes
+        # give the right-hand column, and the width the image insists on. Both
+        # are answered in the picture's height, so that whichever of them wins
+        # the picture is still the shape of a frame -- meet one of them by
+        # stretching the window alone and the strips are back.
+        smallest = self.minimumSizeHint()
+        picture_h = max(
+            picture_h,
+            smallest.height() - above,
+            (smallest.width() - beside) / _LIVE_VIEW_ASPECT,
+        )
+        return QSize(
+            round(picture_h * _LIVE_VIEW_ASPECT + beside), round(picture_h + above)
+        )
+
+    def _chrome(self) -> "tuple[int, int]":
+        """How much of the window is not the picture: beside it, and above it."""
+        layout = self.centralWidget().layout()
+        margins = layout.contentsMargins()
+        beside = (
+            self._right_column.width()
+            + layout.spacing()
+            + margins.left()
+            + margins.right()
+        )
+        above = (
+            self.menuBar().sizeHint().height()
+            + self.statusBar().sizeHint().height()
+            + margins.top()
+            + margins.bottom()
+        )
+        return beside, above
 
     # -- construction ------------------------------------------------------
 
@@ -187,7 +311,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
         layout.addWidget(self.view, 1)
-        layout.addWidget(self._build_sidebar_scroller(), 0)
+        layout.addWidget(self._build_right_column(), 0)
         self.setCentralWidget(central)
 
         # Buttons, checkboxes and the slider are all operated by pointer, so
@@ -209,6 +333,29 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.fps_label)
         self._build_menu()
 
+    def _build_right_column(self) -> QWidget:
+        """The panes that stay put, above the controls that scroll.
+
+        The navigator and the histogram are read *while* something else is
+        being done -- focus driven, an aperture chosen -- so a readout that
+        has to be scrolled back to is a readout that gets looked at once and
+        then forgotten about. They keep their place at the top; everything
+        below them is a control, and controls can be scrolled to.
+        """
+        self._right_column = column = QWidget()
+        stack = QVBoxLayout(column)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(6)
+        stack.addWidget(self._build_navigator_box())
+        stack.addWidget(self._build_histogram_box())
+        scroller = self._build_sidebar_scroller()
+        # The whole column takes the scroller's width, so the pinned panes
+        # line up with the controls under them whether the bar is showing or
+        # not.
+        column.setFixedWidth(scroller.width())
+        stack.addWidget(scroller, 1)
+        return column
+
     def _build_sidebar_scroller(self) -> QScrollArea:
         """The sidebar, free to be as tall as its contents ask to be.
 
@@ -221,8 +368,9 @@ class MainWindow(QMainWindow):
         size it asked for and puts the shortfall somewhere the user can see and
         act on.
         """
-        scroller = QScrollArea()
-        scroller.setWidget(self._build_sidebar())
+        self._scroller = scroller = QScrollArea()
+        sidebar = self._build_sidebar()
+        scroller.setWidget(sidebar)
         scroller.setWidgetResizable(True)
         scroller.setFrameShape(QFrame.Shape.NoFrame)
         scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -235,6 +383,9 @@ class MainWindow(QMainWindow):
         # Like every other pointer-operated control here, it must not take the
         # keyboard away from the image.
         scroller.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Nothing in here may answer the wheel itself; see _WheelGuard.
+        self._wheels = _WheelGuard(scroller)
+        self._wheels.watch_all(sidebar)
         return scroller
 
     def _build_sidebar(self) -> QWidget:
@@ -248,9 +399,7 @@ class MainWindow(QMainWindow):
         column.addWidget(self.camera_label)
 
         column.addWidget(self._build_live_view_box())
-        column.addWidget(self._build_navigator_box())
         column.addWidget(self._build_focus_box())
-        column.addWidget(self._build_histogram_box())
         column.addWidget(self._build_exposure_box())
         column.addWidget(self._build_capture_box())
         column.addStretch(1)
@@ -298,6 +447,12 @@ class MainWindow(QMainWindow):
             "difference."
         )
         self.exposure_preview.toggled.connect(self.requestExposurePreview)
+        # It is one of the two things that set how fast the camera draws, so
+        # the integration hint has to be redrawn with it -- straight away,
+        # rather than waiting for the camera to confirm.
+        self.exposure_preview.toggled.connect(
+            lambda _: self._describe_integration()
+        )
         layout.addWidget(self.exposure_preview)
 
         layout.addWidget(self._build_integration())
@@ -340,16 +495,40 @@ class MainWindow(QMainWindow):
         self.integrate_hint.setStyleSheet("color: #888; font-size: 11px;")
         column.addWidget(self.integrate_hint)
 
+        # The two levers on where the frames come from, under the control that
+        # spends them. Both change the rate rather than the picture, which is
+        # why they live with integration rather than with the exposure.
+        self.deduplicate = QCheckBox("Skip repeated frames")
+        self.deduplicate.setToolTip(
+            "The camera is polled faster than it draws, so some reads come "
+            "back with the frame already on screen. Averaging one of those in "
+            "cancels no noise -- it carries the same noise, which adds instead "
+            "of averaging down -- so they are dropped. Turn off to see the "
+            "raw poll rate instead of the rate the camera actually draws at."
+        )
+        column.addWidget(self.deduplicate)
+
         settings = QSettings()
         self.integrate.setChecked(settings.value("liveview/integrate", False, bool))
         self.integrate_frames.setValue(self._stored_integration_frames())
+        self.deduplicate.setChecked(
+            bool(settings.value("liveview/deduplicate", True, bool))
+        )
         self._integrating = self.integrate.isChecked()
         self._describe_integration()
         # Connected last, so restoring the stored values does not count as the
         # user asking for anything.
         self.integrate.toggled.connect(self._on_integration_changed)
         self.integrate_frames.valueChanged.connect(self._on_integration_changed)
+        self.deduplicate.toggled.connect(self._on_deduplicate_changed)
         return holder
+
+    def _on_deduplicate_changed(self, enabled: bool) -> None:
+        QSettings().setValue("liveview/deduplicate", enabled)
+        self._describe_integration()
+        self._fps_shown = (0.0, *self._fps_shown[1:])
+        self._show_fps()
+        self.requestDeduplicate.emit(enabled)
 
     def _stored_integration_frames(self) -> int:
         try:
@@ -385,47 +564,65 @@ class MainWindow(QMainWindow):
         """
         frames = self.integrate_frames.value()
         self.integrate_frames.setEnabled(self.integrate.isChecked())
+        source = source_fps(self._zoom_level, self.exposure_preview.isChecked())
+        # Without the check, a re-read counts as a frame: the stack fills at
+        # the rate we poll at rather than the rate the camera draws at, and
+        # arrives that much sooner with that much less of the noise gone.
+        if not self.deduplicate.isChecked():
+            polled = 1000.0 / _FRAME_INTERVAL_MS
+            distinct = max(frames * source / polled, 1.0)
+            self.integrate_hint.setText(
+                f"About {polled / frames:.1f} fps, but only ~{distinct:.1f} of "
+                f"each {frames} frames are redrawn, so roughly "
+                f"{distinct ** 0.5:.1f}x less noise."
+            )
+            return
         self.integrate_hint.setText(
-            f"About {_SOURCE_FPS / frames:.1f} fps, with roughly "
+            f"About {source / frames:.1f} fps, with roughly "
             f"{frames ** 0.5:.1f}x less noise."
         )
 
     def _build_navigator_box(self) -> QGroupBox:
         """Where the magnified view sits in the frame, and a way to move it.
 
-        Next to the zoom controls, because that is what it is about: once the
-        view is magnified there is nothing on screen that says which part of
-        the frame is on screen, and the arrow keys pan without ever saying how
-        far there is left to go.
+        Once the view is magnified there is nothing on the picture itself that
+        says which part of the frame is on screen, and the arrow keys pan
+        without ever saying how much further there is to go.
+
+        What would be a paragraph of hint underneath is in the tooltip
+        instead. The pane is pinned, so every line under it is a line the
+        controls do not get, and the one thing worth explaining -- why the
+        picture stops moving when the rectangle does not -- is not worth
+        reading more than once.
         """
         box = QGroupBox("Navigator")
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(6, 6, 6, 6)
 
         self.navigator = NavigatorWidget()
         self.navigator.setToolTip(
             "The whole frame, with the part on screen marked on it. Drag the "
             "rectangle to move the view, or press anywhere to send it there."
+            "\n\n"
+            "The picture is the last whole frame the camera sent: while you "
+            "are magnified it cannot send the rest of the frame, so the "
+            "picture waits and only the rectangle moves."
         )
         self.navigator.viewCentreMoved.connect(self._on_view_centre_moved)
         layout.addWidget(self.navigator)
-
-        hint = WrappedLabel(
-            "The picture here is the last whole frame the camera sent: while "
-            "you are magnified it cannot send the rest of it, so the picture "
-            "waits and only the rectangle moves."
-        )
-        hint.setStyleSheet("color: #888; font-size: 11px;")
-        layout.addWidget(hint)
         return box
 
     def _build_histogram_box(self) -> QGroupBox:
-        """The levels in the picture on screen, above the exposure controls.
+        """The levels in the picture on screen, under the navigator.
 
-        Where it is is the point: it is read to decide what to do with the
-        controls immediately below it.
+        The pair belong together: both are read off the picture rather than
+        set, and both are read while a hand is busy somewhere else -- which is
+        why they are pinned above the controls instead of scrolling with them.
         """
         box = QGroupBox("Histogram")
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(6, 6, 6, 4)
+        layout.setSpacing(2)
 
         self.histogram = HistogramWidget()
         self.histogram.setToolTip(
@@ -919,10 +1116,10 @@ class MainWindow(QMainWindow):
         rather than left offering a delay that would never happen.
 
         Where the choice starts, on a camera never driven from here, is
-        whatever that camera is set to: this one arrived with three seconds on
-        it, and a scanning rig set up that way should not lose it just because
-        something else is now releasing the shutter. Once a delay has been
-        chosen here, that is what is remembered and used.
+        whatever that camera is set to: a rig already set up with a delay on
+        the body should not lose it just because something else is now
+        releasing the shutter. Once a delay has been chosen here, that is what
+        is remembered and used.
         """
         wanted = self._stored_shutter_delay()
         if wanted is None:
@@ -1037,6 +1234,7 @@ class MainWindow(QMainWindow):
         self.requestShutterDelay.connect(self.worker.set_shutter_delay)
         self.requestPan.connect(self.worker.pan)
         self.requestIntegration.connect(self.worker.set_integration)
+        self.requestDeduplicate.connect(self.worker.set_deduplicate)
         self.requestSharpness.connect(self.worker.set_sharpness)
         self.requestSharpnessReset.connect(self.worker.reset_sharpness_peak)
         self.requestSharpnessArea.connect(self.worker.set_sharpness_area)
@@ -1075,6 +1273,7 @@ class MainWindow(QMainWindow):
         self.requestIntegration.emit(
             self.integrate.isChecked(), self.integrate_frames.value()
         )
+        self.requestDeduplicate.emit(self.deduplicate.isChecked())
         self.requestSharpness.emit(self.measure_sharpness.isChecked())
         self._apply_measure_area()
         self.requestSaveToCard.emit(self.save_to_card.isChecked())
@@ -1120,6 +1319,10 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_zoom_changed(self, level: int) -> None:
+        # Kept because the rate the camera draws at depends on it: past 4.7x
+        # the large frame falls to a third of its speed.
+        self._zoom_level = level
+        self._describe_integration()
         index = _ZOOM_LEVELS.index(level) if level in _ZOOM_LEVELS else 0
         self.zoom_slider.blockSignals(True)
         self.zoom_slider.setValue(index)
@@ -1196,8 +1399,8 @@ class MainWindow(QMainWindow):
         else:
             self.sharpness_trend.add(value)
         now = time.monotonic()
-        # Thirty readings a second is more than the eye can read as text; the
-        # line has already had all of them.
+        # Forty-odd readings a second is more than the eye can read as text;
+        # the line has already had all of them.
         if value > 0.0 and now - self._sharpness_shown < 0.2:
             return
         self._sharpness_shown = now
@@ -1261,6 +1464,8 @@ class MainWindow(QMainWindow):
         self.exposure_preview.blockSignals(True)
         self.exposure_preview.setChecked(enabled)
         self.exposure_preview.blockSignals(False)
+        # It is one of the three things that decide how fast the camera draws.
+        self._describe_integration()
 
     @Slot(object)
     def _on_settings(self, settings: "list[Setting]") -> None:
@@ -1282,6 +1487,7 @@ class MainWindow(QMainWindow):
                 combo.activated.connect(
                     lambda _index, name=setting.name: self._on_setting_chosen(name)
                 )
+                self._wheels.watch(combo)
                 self._combos[setting.name] = combo
                 self.exposure_form.addRow(setting.name, combo)
 
@@ -1370,6 +1576,9 @@ class MainWindow(QMainWindow):
         # event loop stops, or the body is left streaming after we are gone.
         # The worker ends its own loop once it is done, so the wait returns as
         # soon as the camera is closed.
+        # Saved first: a camera that hangs on the way out must not cost the
+        # user the window they had arranged.
+        QSettings().setValue("window/geometry", self.saveGeometry())
         self.requestShutdown.emit()
         if not self._thread.wait(5000):
             # A camera command that never came back. Nothing left to do but

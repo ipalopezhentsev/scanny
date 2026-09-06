@@ -2,9 +2,9 @@
 
 Two things are worth holding onto here. The count is the user's, remembered
 between runs like the focus increments are, and the frame rate the status bar
-shows has to be the rate the *picture* updates at -- the camera still sends
-thirty frames a second while they are being stacked, and reporting that would
-be a lie about what is on screen.
+shows has to be the rate the *picture* updates at -- the camera still draws
+forty-odd frames a second while they are being stacked, and reporting that
+would be a lie about what is on screen.
 """
 
 from __future__ import annotations
@@ -87,10 +87,10 @@ def test_the_count_cannot_be_set_past_what_the_integrator_accepts(window):
 
 
 def test_the_cost_is_shown_before_it_is_switched_on(window):
-    """Ten frames is a third of a second an image; say so rather than let it
-    be discovered."""
+    """Ten frames is about a quarter of a second an image; say so rather than
+    let it be discovered."""
     window.integrate_frames.setValue(10)
-    assert "3.0 fps" in window.integrate_hint.text()
+    assert "4.4 fps" in window.integrate_hint.text()
     # Averaging ten frames divides the noise by the square root of ten.
     assert "3.2x less noise" in window.integrate_hint.text()
 
@@ -142,3 +142,47 @@ def test_a_change_that_alters_nothing_leaves_the_rate_alone(window):
     window._on_fps(30.0, 640, 424)
     window.integrate_frames.setValue(12)
     assert "30.0 fps" in window.fps_label.text()
+
+
+# -- where the frames come from ----------------------------------------------
+
+
+def test_skipping_repeats_is_on_unless_it_is_turned_off(window):
+    """It is what makes the count of frames in a stack mean anything."""
+    assert window.deduplicate.isChecked()
+
+
+def test_turning_off_the_skip_says_what_the_stack_is_really_worth(window):
+    """Counting re-reads fills a stack at the rate we poll rather than the
+    rate the camera draws, so it arrives sooner with less of the noise gone.
+    The hint has to own up to that rather than keep promising the square root
+    of the number in the box."""
+    window.integrate_frames.setValue(16)
+    window.deduplicate.setChecked(False)
+    text = window.integrate_hint.text()
+    assert "redrawn" in text
+    # Sixteen reads at 15ms collect about seven distinct frames, not sixteen.
+    assert "16 frames are redrawn" in text
+    assert "4.0x less noise" not in text
+
+
+def test_magnifying_costs_frame_rate_and_the_hint_says_so(window):
+    """Past 4.7x the body draws at 16fps instead of 44, so eight frames is two
+    and a half seconds an image rather than a fifth of one."""
+    window.integrate_frames.setValue(8)
+    window._on_zoom_changed(3)
+    assert "5.5 fps" in window.integrate_hint.text()
+    window._on_zoom_changed(4)
+    assert "2.0 fps" in window.integrate_hint.text()
+
+
+def test_turning_off_the_exposure_preview_costs_rate_only_below_4x(window):
+    """From 4.7x up the body is at 16fps whichever way the preview is set."""
+    window.integrate_frames.setValue(8)
+    window._on_zoom_changed(0)
+    window.exposure_preview.setChecked(False)
+    assert "3.8 fps" in window.integrate_hint.text()
+    window._on_zoom_changed(7)
+    assert "2.0 fps" in window.integrate_hint.text()
+    window.exposure_preview.setChecked(True)
+    assert "2.0 fps" in window.integrate_hint.text()

@@ -581,3 +581,58 @@ def test_the_measured_area_is_read_where_it_was_put(worker):
     _run(worker, lens, area=area)
     assert worker._sharpness.area == area
     assert lens.error <= 12
+
+
+def test_nothing_is_shown_or_measured_while_the_lens_is_moving(worker):
+    """A frame caught mid-move belongs to no focus position. Stacking one
+    blends two positions into a picture and then measures the blend; showing
+    one on its own puts a flash of grain on screen where a clean image was."""
+    lens = _ready(worker, _Lens(start=30))
+    pictures, readings = [], []
+    worker.frameReady.connect(
+        lambda frame, image: pictures.append(image) if not image.isNull() else None
+    )
+    worker.sharpnessChanged.connect(lambda value, peak: readings.append(value))
+    worker.fine_tune(STEP)
+    for _ in range(3000):
+        if worker._hunt is None:
+            break
+        drives = len(lens.drives)
+        worker._grab()
+        if len(lens.drives) == drives:
+            continue
+        pictures.clear()
+        readings.clear()
+        while worker._settling:
+            worker._grab()
+        assert pictures == [], "a picture went up while the lens was moving"
+        assert readings == [], "a reading was taken while the lens was moving"
+
+
+def test_the_first_frame_after_a_move_is_not_shown_on_its_own(worker):
+    """The stack is dropped when the move lands, because it holds frames from
+    the focus position just left. The frame that starts the new one is a
+    single unaveraged frame: it must not go to the screen in place of the
+    clean picture that is already there."""
+    lens = _ready(worker, _Lens(start=30))
+    pictures = []
+    worker.frameReady.connect(
+        lambda frame, image: pictures.append(image) if not image.isNull() else None
+    )
+    worker.fine_tune(STEP)
+    for _ in range(3000):
+        if worker._hunt is None:
+            break
+        drives = len(lens.drives)
+        worker._grab()
+        if len(lens.drives) == drives:
+            continue
+        while worker._settling:
+            worker._grab()
+        pictures.clear()
+        # The frame that restarts the stack, and the rest of that stack.
+        for _ in range(worker._integrator.frames - 1):
+            worker._grab()
+        assert pictures == [], "an unaveraged frame went up after the move"
+        worker._grab()
+        assert len(pictures) == 1, "the completed stack did not go up"

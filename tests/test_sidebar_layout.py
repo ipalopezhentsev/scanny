@@ -17,10 +17,12 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6.QtWidgets")
 
-from PySide6.QtCore import QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QPointF, QSettings, Qt  # noqa: E402
+from PySide6.QtGui import QWheelEvent  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QCheckBox,
+    QComboBox,
     QScrollArea,
     QSpinBox,
 )
@@ -114,6 +116,50 @@ def test_scrolling_the_panel_does_not_take_the_keyboard_from_the_image(window):
     assert _scroller(window).focusPolicy() == Qt.FocusPolicy.NoFocus
 
 
+# -- what does not scroll ---------------------------------------------------
+
+
+def test_the_readout_panes_are_not_in_the_scrolling_part(window):
+    """Both are read while a hand is busy with something else.
+
+    A readout that has to be scrolled back to is one that gets looked at once
+    and then forgotten about, so the navigator and the histogram keep their
+    place whatever the controls below them are doing.
+    """
+    scroller = _scroller(window)
+    for pane in (window.navigator, window.histogram):
+        assert not scroller.isAncestorOf(pane)
+
+
+def test_the_readout_panes_stay_put_while_the_controls_scroll(window):
+    """The panel here is well past what the window can show, so this is the
+    state the question actually arises in."""
+    scroller = _scroller(window)
+    bar = scroller.verticalScrollBar()
+    before = [window.navigator.pos(), window.histogram.pos()]
+    bar.setValue(bar.maximum())
+    QApplication.processEvents()
+    assert bar.value() > 0, "nothing scrolled, so nothing was tested"
+    assert [window.navigator.pos(), window.histogram.pos()] == before
+
+
+def test_the_panes_line_up_with_the_controls_under_them(window):
+    """One column, not a column and two things beside it."""
+    scroller = _scroller(window)
+    for pane in (window.navigator, window.histogram):
+        box = pane.parentWidget()  # its group box
+        assert box.width() == scroller.width()
+
+
+def test_the_pinned_panes_leave_the_controls_room_to_be_scrolled(window):
+    """Pinning is only worth having if what is left is still usable.
+
+    At the shortest window these tests use, the two panes must not take so
+    much of the column that the controls have nowhere to appear at all.
+    """
+    assert _scroller(window).viewport().height() > 120
+
+
 def test_a_wrapped_hint_takes_back_the_height_its_text_needs(app):
     """The mechanism itself, at the point where it has to hold.
 
@@ -146,3 +192,89 @@ def test_a_wrapped_hint_follows_a_change_of_text(app):
     )
     QApplication.processEvents()
     assert label.height() == label.heightForWidth(140)
+
+
+# -- the wheel over the panel ----------------------------------------------
+
+
+def _wheel(widget, notches: int = -1) -> None:
+    """One notch of the wheel over *widget*, as the mouse would deliver it."""
+    at = QPointF(4, 4)
+    QApplication.sendEvent(
+        widget,
+        QWheelEvent(
+            at,
+            QPointF(widget.mapToGlobal(QPoint(4, 4))),
+            QPoint(0, 0),
+            QPoint(0, 120 * notches),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        ),
+    )
+
+
+def test_the_wheel_over_a_combo_scrolls_rather_than_setting_the_camera(window):
+    """The exposure combos are the dangerous ones: a notch that lands on the
+    shutter speed while the panel is being scrolled past changes the exposure
+    of the next photograph, and says nothing about having done it.
+
+    These are also the combos built after the panel was guarded -- they arrive
+    with the camera's answer -- so this covers the later ones too.
+    """
+    combo = window._combos["Shutter"]
+    bar = _scroller(window).verticalScrollBar()
+    was, where = combo.currentIndex(), bar.value()
+    _wheel(combo)
+    assert combo.currentIndex() == was
+    assert bar.value() > where
+
+
+def test_the_wheel_over_a_spin_box_scrolls_rather_than_changing_it(window):
+    spin = window._focus_steps["fine"]
+    bar = _scroller(window).verticalScrollBar()
+    was, where = spin.value(), bar.value()
+    _wheel(spin)
+    assert spin.value() == was
+    assert bar.value() > where
+
+
+def test_the_wheel_over_the_zoom_slider_scrolls_rather_than_zooming(window):
+    slider = window.zoom_slider
+    bar = _scroller(window).verticalScrollBar()
+    was, where = slider.value(), bar.value()
+    _wheel(slider)
+    assert slider.value() == was
+    assert bar.value() > where
+
+
+def test_the_panel_scrolls_both_ways(window):
+    combo = window._combos["ISO"]
+    bar = _scroller(window).verticalScrollBar()
+    _wheel(combo, notches=-3)
+    down = bar.value()
+    assert down > 0
+    _wheel(combo, notches=1)
+    assert bar.value() < down
+
+
+def test_every_control_that_reads_the_wheel_is_guarded(window):
+    """Nothing in the panel may answer the wheel itself.
+
+    Named by type rather than one by one, so a control added later is covered
+    by this the day it is added.
+    """
+    scroller = _scroller(window)
+    for kind in (QComboBox, QSpinBox):
+        for control in scroller.widget().findChildren(kind):
+            bar = scroller.verticalScrollBar()
+            bar.setValue(0)
+            before = control.property("value") if isinstance(control, QSpinBox) else None
+            index = control.currentIndex() if isinstance(control, QComboBox) else None
+            _wheel(control)
+            assert bar.value() > 0, f"{kind.__name__} swallowed the wheel"
+            if isinstance(control, QSpinBox):
+                assert control.value() == before
+            else:
+                assert control.currentIndex() == index

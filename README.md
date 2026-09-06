@@ -39,7 +39,45 @@ from the typelibs, because `comtypes.client.GetModule` mis-marshals them:
 entirely.
 
 Measured on a D750, this transport sustains about **110 live-view reads per
-second**, so the camera, not the plumbing, is the limit.
+second**, so the camera, not the plumbing, is the limit. A read costs about
+9ms and the frame size does not change that — 320x180 reads no faster than
+640x360 — so what the transport is spending is per-transaction latency rather
+than bandwidth, and the larger live-view frame is free.
+
+The camera draws about **44 new frames a second** (a fresh one every 23ms),
+which is where the useful ceiling actually sits: past that, reads come back
+holding a frame that was already here. Two things are worth knowing before
+trusting that number anywhere:
+
+- **Magnification decides it.** Measured on a D750, in new frames a second:
+
+  | magnification | preview on | preview off |
+  | --- | --- | --- |
+  | 1.0x – 3.13x | **44** | 30 |
+  | 4.7x – 18.8x | **16** | 16 |
+
+  Past 4.7x the body draws at a third of the rate, and the exposure preview
+  stops mattering. This is the camera, not the transport: reads are *faster*
+  at high magnification (5.9ms against 8.2ms), and what stretches is the gap
+  between distinct frames, from 23ms to 63ms.
+
+  The **live-view frame size does not come into it** — 320x180 is drawn at
+  exactly the rate 640x360 is, at every magnification — so asking for the
+  small frame is not a way to buy the rate back. Beware of measuring this the
+  obvious way: toggling the exposure preview resets the body's zoom to 1.0x,
+  so a sweep that sets the preview between readings will report high
+  magnifications that were never in force. Read `magnification` back off the
+  frames you actually measured.
+
+  It is, at least, indifferent to shutter speed: flat at 44fps across the
+  whole range from 1/500 to a full second, so the body is not integrating the
+  sensor for the set exposure to draw live view.
+- **Nothing in the code relies on it.** `ui/worker.py` polls every 15ms,
+  faster than the camera draws, and discards the reads that come back
+  unchanged. That is what keeps frame integration honest when the rate moves —
+  an averaged stack only cancels noise if its frames are genuinely different
+  from each other, because a duplicate carries identical noise and adds
+  coherently instead of averaging down.
 
 ## Layout
 
@@ -141,9 +179,13 @@ well, so at anything above base ISO the picture is grainy -- and the grain is
 different in every frame while the scene is not. Averaging N frames therefore
 keeps the picture and divides the noise by roughly the square root of N. There
 is no exposure control to reach for here: the camera sends what it sends, about
-thirty frames a second, so the only currency is frame rate. **Integrate**, in
-the Live view panel, spends it: the mean of each N frames, arriving 30/N times
-a second.
+forty-four frames a second (see the table above — sixteen, if you are magnified
+past 4.7x), so the only currency is frame rate. **Integrate**,
+in the Live view panel, spends it: the mean of each N frames, arriving 44/N
+times a second. Only frames the camera has actually redrawn are counted — a
+re-read of the frame already on hand carries identical noise, which adds
+coherently rather than averaging down, so counting one would finish the stack
+early and leave it grainier than the number of frames claims.
 
 Measured against synthetic frames with a known amount of noise on them, sixteen
 frames behave exactly as the arithmetic says, and cost about a tenth of the
@@ -706,10 +748,27 @@ that moves, and the wait is free sharpness.
 
 `0xD06A` is not in the body's list of supported properties, in the same way as
 the rest of Nikon's vendor properties over WPD, but `GetDevicePropDesc` answers
-for it: a `UINT8` with a range form of 0 to 3 in steps of one, writable, where
-the value is the delay in seconds and zero is off. Which of those a body offers
-varies by model, so the choices in the panel are the ones this camera reported
-rather than a fixed four.
+for it: a `UINT8` with a range form of 0 to 3 in steps of one, writable. Which
+of those a body offers varies by model, so the choices in the panel are the
+ones this camera reported rather than a fixed four.
+
+The value is **not** the number of seconds. The property counts *down* to the
+delay: its highest value is off, and each step below it adds a second. Timed
+against the camera, release to the picture arriving, at 1/8s in live view:
+
+| value | picture arrives | delay |
+| --- | --- | --- |
+| 3 | 1.5s | off |
+| 2 | 2.5s | 1s |
+| 1 | 3.5s | 2s |
+| 0 | 4.4s | 3s |
+
+Reading it the obvious way round is how the first version of this asked for
+three seconds, wrote 3, and got no delay at all -- while "off" wrote 0 and
+waited the full three. So the seconds are turned into a value by subtracting
+them from the top of the range, and the top of the range is read from the body
+rather than assumed. End to end through `capture()`, the same shot takes 7.00s
+with no delay, 7.70s at one second and 10.39s at three.
 
 The delay is written for each shot and the camera's own setting handed back
 immediately afterwards, including when the shutter refuses to fire. Two reasons.
@@ -719,11 +778,11 @@ start live view next time. And it is the camera's setting, not this program's,
 to leave as it was found.
 
 That cuts both ways, which is why *off* is written too rather than the property
-being left alone: the D750 here arrived with three seconds already set on it, so
-leaving it alone would have made "off" mean "three seconds". For the same
-reason the control starts at whatever the connected body is set to -- a rig
-already configured this way keeps its delay -- and once a delay has been chosen
-in the panel, that is what is remembered and used.
+being left alone: a body carrying a delay of its own would make "off" here mean
+"whatever the camera says". For the same reason the control starts at whatever
+the connected body is set to -- a rig already configured this way keeps its
+delay -- and once a delay has been chosen in the panel, that is what is
+remembered and used.
 
 ### Naming what lands on the computer
 
@@ -797,7 +856,8 @@ Switched off, the camera's own names are kept, and a collision is decorated
   at all, so it does not care how much play the lens has. Anything you do to
   the focus, the view or the exposure stops it.
 - The status bar shows the live-view frame size and the rate it is arriving at
-  (about 30fps).
+  (about 44fps, or 44/N while integrating N frames). It drops to 16fps when
+  the view is magnified past 4.7x, which is the camera and not the connection.
 - Shutter, aperture, ISO, exposure compensation and white balance are settable;
   the exposure mode, focus mode and drive mode are shown but are set on the
   body, so the camera reports them read-only.
@@ -850,6 +910,7 @@ They need no camera attached.
 
 ## TODO
 
-- persist such settings to user profile
 - filmstrip/delete file?
 - focus sweep - find&visualize depth map
+- wb - set to fix value
+

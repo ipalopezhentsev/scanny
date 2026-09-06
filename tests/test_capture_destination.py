@@ -25,7 +25,7 @@ from PySide6.QtCore import QSettings, QThread  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from scanny.camera.nikon import NikonCamera  # noqa: E402
-from scanny.ptp.codes import Event, Op, Prop, Response  # noqa: E402
+from scanny.ptp.codes import Event, FormFlag, Op, Prop, Response  # noqa: E402
 from scanny.ui import main_window as mw  # noqa: E402
 from scanny.ui.main_window import MainWindow  # noqa: E402
 from scanny.ui.worker import CameraWorker  # noqa: E402
@@ -40,11 +40,25 @@ _STORED = "capture/save_to_card"
 # -- the camera ------------------------------------------------------------
 
 
+class _DelayDesc:
+    """The exposure delay property as a D750 describes it: a range of 0 to 3."""
+
+    form = FormFlag.RANGE
+    writable = True
+    minimum, maximum, step = 0, 3, 1
+
+    @property
+    def allowed_values(self):
+        return [0, 1, 2, 3]
+
+
 class _FakeSession:
     """Enough of a PTP session to watch what the camera asks of the body."""
 
     def __init__(self, refuse_media: bool = False) -> None:
-        self.props: "dict[int, int]" = {}
+        # 3 is how the exposure delay property encodes "off": the top of its
+        # range. See NikonCamera.SHUTTER_DELAYS.
+        self.props: "dict[int, int]" = {int(Prop.NIKON_EXPOSURE_DELAY_MODE): 3}
         self.refuse_media = refuse_media
         self.executed: "list[tuple[int, tuple[int, ...]]]" = []
         #: The shot only exists once the shutter has been released, and its
@@ -52,6 +66,11 @@ class _FakeSession:
         #: queue the capture empties on its way in.
         self.fired = False
         self.reported = False
+
+    def prop_desc(self, code, refresh=True):
+        if int(code) != int(Prop.NIKON_EXPOSURE_DELAY_MODE):
+            raise MtpError(Op.GET_DEVICE_PROP_DESC, Response.DEVICE_PROP_NOT_SUPPORTED)
+        return _DelayDesc()
 
     def set_prop(self, code, value):
         if code == Prop.NIKON_RECORDING_MEDIA and self.refuse_media:

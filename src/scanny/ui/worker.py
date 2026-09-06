@@ -8,6 +8,7 @@ queues the command slots in between frame grabs.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import deque
 from pathlib import Path
@@ -27,9 +28,32 @@ from .sharpness import SharpnessMeter, grain_reading, measure, variance_between
 
 __all__ = ["CameraWorker"]
 
-#: Interval between live-view grabs. The camera itself tops out near 30fps;
-#: polling faster only re-reads frames that have not changed.
-_FRAME_INTERVAL_MS = 33
+#: Interval between live-view grabs. Measured on a D750, the body draws a new
+#: frame every 23ms -- about 44 a second, not the 30 this was originally set
+#: for -- and a read plus its decode costs enough that the timer has to be set
+#: well under that to keep up with it. Frames actually collected, against the
+#: interval asked for:
+#:
+#: ===== =====  ===== =====  ===== =====
+#: 33ms  30/s   25ms  34/s   20ms  40/s
+#: 15ms  44/s   10ms  44/s    5ms  44/s
+#: ===== =====  ===== =====  ===== =====
+#:
+#: 15ms is where that flattens: everything the camera draws, without spending
+#: reads to find it. Polling harder is not wrong, only wasted -- the duplicates
+#: it collects are discarded either way.
+#:
+#: The 44 is not a constant of the body. Magnification decides it: out to 3.13x
+#: it is 44 with the exposure preview on and 30 with it off, and from 4.7x up
+#: it is 16 whichever way the preview is set. The live-view frame size does not
+#: enter into it -- 320x180 is drawn at the same rate as 640x360 everywhere.
+#:
+#: So no number here is load-bearing, which is the whole point: the timer
+#: overshoots whatever the rate currently is -- by 4x, in that 16fps corner --
+#: and :meth:`CameraWorker._grab` throws away the re-reads. The alternative,
+#: a timer tracking the observed rate, would save reads that cost 6ms each and
+#: would have to be got right at every zoom and preview transition.
+_FRAME_INTERVAL_MS = 15
 
 #: Consecutive grab failures tolerated before concluding live view has ended.
 _MAX_GRAB_ERRORS = 15
@@ -115,6 +139,12 @@ class CameraWorker(QObject):
         self._zoom_level = 0
         self._com_ready = False
         self._last_frame: "LiveViewFrame | None" = None
+        # Digest of the last JPEG the camera sent, to recognise a re-read of a
+        # frame it has not replaced yet. See _grab.
+        self._last_digest: "bytes | None" = None
+        # Whether those re-reads are discarded. On, unless someone wants to see
+        # the raw poll rate or suspects the check itself of dropping frames.
+        self._deduplicate = True
         # Timestamps of recent frames, for the displayed rate.
         self._frame_times: "deque[float]" = deque(maxlen=60)
         # Magnification observed at each zoom level, seeded from measurements
@@ -255,8 +285,11 @@ class CameraWorker(QObject):
             return
         self._grab_errors = 0
         self._frame_times.clear()
-        self._integrator.reset()
+        # Forget rather than reset: the canvas is blank, so the first frame
+        # has to go up as it arrives instead of a stack later.
+        self._integrator.forget()
         self._sharpness.reset()
+        self._last_digest = None
         self._zoom_level = camera.zoom_level()
         self.exposurePreviewChanged.emit(camera.exposure_preview)
         self.liveViewChanged.emit(True)
@@ -271,9 +304,10 @@ class CameraWorker(QObject):
         if self._camera is not None:
             self._camera.stop_live_view()
         self._frame_times.clear()
-        self._integrator.reset()
+        self._integrator.forget()
         self._sharpness.reset()
         self._last_frame = None
+        self._last_digest = None
         self.fpsChanged.emit(0.0, 0, 0)
         self.sharpnessChanged.emit(0.0, 0.0)
         self.liveViewChanged.emit(False)
@@ -310,8 +344,41 @@ class CameraWorker(QObject):
                 self.failed.emit("Live view stopped responding and was shut down.")
             return
         self._grab_errors = 0
+        # Polling overshoots the camera's draw rate on purpose, so some reads
+        # return the frame that was already here. Everything below this point
+        # would be wrong or wasted on one: averaging a frame with itself
+        # cancels no noise (duplicated noise adds coherently, so the mean of a
+        # stack is the mean of its *distinct* frames, and counting a re-read
+        # towards the stack only makes it finish early and grainier than it
+        # claims), the grain meter reads the difference between consecutive
+        # frames and would call an identical pair noise-free, and the JPEG
+        # decode is the most expensive thing on this thread.
+        if self._deduplicate:
+            digest = hashlib.blake2b(frame.jpeg, digest_size=8).digest()
+            if digest == self._last_digest:
+                return
+            self._last_digest = digest
         self._last_frame = frame
         self._note_magnification(frame)
+        if self._settling:
+            # The lens is moving. A frame caught mid-move belongs to no focus
+            # position in particular, so nothing is shown or measured from
+            # one: a stack completing here would blend two focus positions
+            # into one picture, and the reading taken off it would describe
+            # neither. Whatever these frames make of the stack is dropped when
+            # the move lands.
+            #
+            # They still go through the integrator, because the grain meter
+            # reads the frame it decoded and the settling is judged against
+            # that grain -- starve it and a blank picture never reads as
+            # still. The overlay wants the frame too: the focus box and the
+            # level on it are current.
+            self._integrator.add(frame)
+            self._note_noise()
+            self.frameReady.emit(frame, QImage())
+            if self._hunt is not None:
+                self._advance_hunt(frame, None)
+            return
         # Every frame is published, so the focus box and the level readout stay
         # as responsive as the camera is; only the picture waits for its stack.
         image = self._integrator.add(frame)
@@ -319,7 +386,13 @@ class CameraWorker(QObject):
         reading = None
         if image is not None:
             self._note_frame_rate(frame)
-            reading = self._note_sharpness(frame, image)
+            # Only a completed stack is measured. The odd one out is the
+            # single frame shown the instant the view moves, which carries the
+            # full grain of one frame: reading it would put a spike in the
+            # trend and could hand the hunt a peak that no focus position can
+            # be returned to.
+            if self._integrator.last_image_was_whole:
+                reading = self._note_sharpness(frame, image)
         self.frameReady.emit(frame, image if image is not None else QImage())
         if self._hunt is not None:
             self._advance_hunt(frame, reading)
@@ -356,10 +429,11 @@ class CameraWorker(QObject):
     ) -> "float | None":
         """Read the picture that is about to be shown, if measuring is on."""
         # The picture is the mean of however many frames went into it, and
-        # averaging frames divides their noise by as many.
+        # averaging frames divides their noise by as many. Only whole stacks
+        # reach here, so that is always the full count.
         frames = self._integrator.frames if self._integrator.enabled else 1
         reading = self._sharpness.measure(
-            frame, image, self._noise_variance / (frames if self._last_whole() else 1)
+            frame, image, self._noise_variance / frames
         )
         if reading is None:
             return None
@@ -374,8 +448,8 @@ class CameraWorker(QObject):
         """Publish the rate measured over the last second of displayed images.
 
         Displayed, not grabbed: while frames are being integrated the camera
-        still sends thirty a second, but the picture only changes when a stack
-        completes, and that is the number worth showing.
+        still draws forty-odd a second, but the picture only changes when a
+        stack completes, and that is the number worth showing.
         """
         now = time.monotonic()
         self._frame_times.append(now)
@@ -593,6 +667,11 @@ class CameraWorker(QObject):
         camera.set_exposure_preview(enabled)
         self._forget_sharpness()
         self.exposurePreviewChanged.emit(camera.exposure_preview)
+        # A D750 drops back to 1.0x when this is written, without saying so.
+        # Left unread, the slider and the navigator would go on claiming a
+        # magnification the camera is no longer at.
+        self._zoom_level = camera.zoom_level()
+        self.zoomChanged.emit(self._zoom_level)
         self.status.emit(
             "Live view shows the actual exposure"
             if enabled
@@ -665,6 +744,31 @@ class CameraWorker(QObject):
             f"Integrating {self._integrator.frames} frames into each image"
             if self._integrator.enabled
             else "Showing every frame as it arrives"
+        )
+
+    @Slot(bool)
+    def set_deduplicate(self, enabled: bool) -> None:
+        """Whether a read returning the frame already in hand is discarded.
+
+        Off, every read is treated as a frame, which is what the code did
+        before the camera's draw rate was measured. It is worth having as a
+        switch rather than a constant: it is the difference between the rate
+        on the status bar meaning frames the camera drew and meaning times a
+        second we asked, and seeing both is how the gap between them -- which
+        is large, and moves with zoom -- can be seen at all.
+        """
+        if bool(enabled) == self._deduplicate:
+            return
+        self._deduplicate = bool(enabled)
+        # A stack begun under the other rule is a mix of the two.
+        self._last_digest = None
+        self._integrator.reset()
+        self._frame_times.clear()
+        self._forget_sharpness()
+        self.status.emit(
+            "Counting only the frames the camera redraws"
+            if enabled
+            else "Counting every read, redrawn or not"
         )
 
     # -- sharpness ---------------------------------------------------------
@@ -898,9 +1002,6 @@ class CameraWorker(QObject):
         # still, so the settling would run to its limit every time.
         scale = max(now, against, _READING_FLOOR * best, self._grain_scale, 1e-9)
         return abs(now - against) > fraction * scale
-
-    def _last_whole(self) -> bool:
-        return self._integrator.last_image_was_whole
 
     def _frame_reading(self, frame: LiveViewFrame) -> "float | None":
         """One frame's sharpness on its own, for judging whether it has moved."""
