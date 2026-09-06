@@ -141,6 +141,10 @@ class Prop(IntEnum):
     STILL_CAPTURE_MODE = 0x5013
     FOCUS_METERING_MODE = 0x501C
 
+    #: The colour temperature in kelvin the body uses when WHITE_BALANCE is
+    #: set to 0x8012. Described as a range to choose a number from rather than
+    #: a list of values to pick between.
+    NIKON_WHITE_BALANCE_COLOUR_TEMP = 0xD01E
     #: Custom setting d4 on a D750: how long the body waits, mirror up,
     #: before it releases the shutter. The value is the delay in seconds.
     NIKON_EXPOSURE_DELAY_MODE = 0xD06A

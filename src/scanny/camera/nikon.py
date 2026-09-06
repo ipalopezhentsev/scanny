@@ -7,23 +7,35 @@ change.
 
 from __future__ import annotations
 
+import os
 import struct
+import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterator
 
-from ..ptp.codes import Event, Op, Prop, Response
-from ..ptp.parser import Reader
+from ..ptp.codes import Event, FormFlag, Op, Prop, Response
+from ..ptp.parser import PropDesc, Reader
 from ..ptp.session import PtpSession
 from ..wpd.device import DeviceInfo as WpdDeviceInfo
 from ..wpd.device import MtpError, WpdCommandError, WpdMtpTransport, enumerate_devices
 from . import values as v
 
-__all__ = ["NikonCamera", "LiveViewFrame", "Setting", "CameraError", "NIKON_VID"]
+__all__ = ["NikonCamera", "LiveViewFrame", "Setting", "Span", "CameraError", "NIKON_VID"]
 
 NIKON_VID = 0x04B0
+
+#: Set SCANNY_TRACE=1 in the environment to have a capture say, on stderr,
+#: what it waited for and for how long. Timings against the camera are the
+#: only way to tell a wait the body needs from one spent on nothing.
+_TRACE = bool(os.environ.get("SCANNY_TRACE"))
+
+
+def _trace(message: str) -> None:
+    if _TRACE:
+        print(f"[scanny] {message}", file=sys.stderr, flush=True)
 
 
 class CameraError(RuntimeError):
@@ -201,6 +213,17 @@ class LiveViewFrame:
 
 
 @dataclass(frozen=True)
+class Span:
+    """The numbers a property takes, when it takes a range instead of a list."""
+
+    minimum: int
+    maximum: int
+    step: int
+    #: What follows the number when it is shown, " K" for a temperature.
+    unit: str = ""
+
+
+@dataclass(frozen=True)
 class Setting:
     """A camera property presented for display: current value plus its choices."""
 
@@ -210,6 +233,11 @@ class Setting:
     label: str
     writable: bool
     choices: "tuple[tuple[Any, str], ...]"
+    #: Set instead of ``choices`` for a number to type in rather than a value
+    #: to pick from a list.
+    span: "Span | None" = None
+    #: Why the setting cannot be changed right now, when that needs saying.
+    note: str = ""
 
     @property
     def choice_labels(self) -> "list[str]":
@@ -222,17 +250,80 @@ class Setting:
         raise KeyError(label)
 
 
+@dataclass(frozen=True)
+class _Control:
+    """One property the UI offers: what to call it, and how to show it."""
+
+    name: str
+    code: int
+    format: "Callable[[Any], str]"
+    #: True for a property whose values are a range of numbers to choose from
+    #: rather than a handful of named settings. Only these are read as a
+    #: :class:`Span`: a body may well describe shutter or aperture as a range
+    #: too, but in encoded units that mean nothing typed in raw.
+    numeric: bool = False
+    unit: str = ""
+
+
+#: Where the vendor's own property codes begin. Below this is PTP's standard
+#: range, which a body does list in its DeviceInfo.
+_VENDOR_PROPERTY = 0xD000
+
+#: The white balance setting that uses the colour temperature property.
+_WB_COLOUR_TEMPERATURE = 0x8012
+
+_WHITE_BALANCE = "White balance"
+_COLOUR_TEMPERATURE = "Colour temp."
+
 #: The properties the UI offers, in display order.
-_SETTINGS: "tuple[tuple[str, int, Callable[[Any], str]], ...]" = (
-    ("Shutter", Prop.EXPOSURE_TIME, v.format_shutter),
-    ("Aperture", Prop.F_NUMBER, v.format_aperture),
-    ("ISO", Prop.EXPOSURE_INDEX, v.format_iso),
-    ("Exp. comp.", Prop.EXPOSURE_BIAS_COMPENSATION, v.format_exposure_bias),
-    ("White balance", Prop.WHITE_BALANCE, v.format_white_balance),
-    ("Mode", Prop.EXPOSURE_PROGRAM_MODE, v.format_program_mode),
-    ("Focus mode", Prop.FOCUS_MODE, v.format_focus_mode),
-    ("Drive", Prop.STILL_CAPTURE_MODE, v.format_capture_mode),
+_SETTINGS: "tuple[_Control, ...]" = (
+    _Control("Shutter", Prop.EXPOSURE_TIME, v.format_shutter),
+    _Control("Aperture", Prop.F_NUMBER, v.format_aperture),
+    _Control("ISO", Prop.EXPOSURE_INDEX, v.format_iso),
+    _Control("Exp. comp.", Prop.EXPOSURE_BIAS_COMPENSATION, v.format_exposure_bias),
+    _Control(_WHITE_BALANCE, Prop.WHITE_BALANCE, v.format_white_balance),
+    _Control(
+        _COLOUR_TEMPERATURE,
+        Prop.NIKON_WHITE_BALANCE_COLOUR_TEMP,
+        v.format_colour_temperature,
+        numeric=True,
+        unit=" K",
+    ),
+    _Control("Mode", Prop.EXPOSURE_PROGRAM_MODE, v.format_program_mode),
+    _Control("Focus mode", Prop.FOCUS_MODE, v.format_focus_mode),
+    _Control("Drive", Prop.STILL_CAPTURE_MODE, v.format_capture_mode),
 )
+
+
+def _span_of(desc: PropDesc, control: "_Control") -> "Span | None":
+    """The range a numeric control covers, if the body describes one."""
+    if not control.numeric or desc.form != FormFlag.RANGE:
+        return None
+    if not all(isinstance(n, int) for n in (desc.minimum, desc.maximum, desc.step)):
+        return None
+    return Span(desc.minimum, desc.maximum, max(desc.step, 1), control.unit)
+
+
+def _gate_colour_temperature(settings: "list[Setting]") -> "list[Setting]":
+    """Close the temperature box unless white balance is set to use it.
+
+    The body keeps the two apart: a temperature typed in while white balance
+    is on Daylight is remembered but changes nothing in the picture. Better a
+    box that says why it is closed than one that takes a number and ignores it.
+    """
+    by_name = {s.name: s for s in settings}
+    temperature = by_name.get(_COLOUR_TEMPERATURE)
+    balance = by_name.get(_WHITE_BALANCE)
+    if temperature is None or balance is None:
+        return settings
+    if balance.value == _WB_COLOUR_TEMPERATURE:
+        return settings
+    closed = replace(
+        temperature,
+        writable=False,
+        note=f"Set {_WHITE_BALANCE.lower()} to Colour temperature to use this",
+    )
+    return [closed if s is temperature else s for s in settings]
 
 
 class NikonCamera:
@@ -591,45 +682,56 @@ class NikonCamera:
     # -- exposure settings -------------------------------------------------
 
     def setting(self, name: str) -> "Setting | None":
-        for label, code, formatter in _SETTINGS:
-            if label == name:
-                return self._read_setting(label, code, formatter)
+        for control in _SETTINGS:
+            if control.name == name:
+                return self._read_setting(control)
         return None
 
     def settings(self) -> "list[Setting]":
-        """Every exposure control the body reports, ready for display."""
+        """Every exposure control the body reports, ready for display.
+
+        A D750 lists its twenty-two standard properties in DeviceInfo and not
+        one of its vendor ones, yet answers for those perfectly well when
+        asked. So the list is trusted for the standard codes and ignored for
+        the vendor ones, which are asked for and dropped if the body has
+        nothing to say about them.
+        """
         supported = set(self.session.device_info().device_properties_supported)
         out = []
-        for label, code, formatter in _SETTINGS:
-            if code not in supported:
+        for control in _SETTINGS:
+            if control.code < _VENDOR_PROPERTY and control.code not in supported:
                 continue
-            found = self._read_setting(label, code, formatter)
+            found = self._read_setting(control)
             if found is not None:
                 out.append(found)
-        return out
+        return _gate_colour_temperature(out)
 
-    def _read_setting(
-        self, name: str, code: int, formatter: Callable[[Any], str]
-    ) -> "Setting | None":
+    def _read_setting(self, control: "_Control") -> "Setting | None":
         try:
-            desc = self.session.prop_desc(code)
+            desc = self.session.prop_desc(control.code)
         except (MtpError, WpdCommandError, ValueError):
             return None
-        choices = tuple((value, formatter(value)) for value in desc.allowed_values)
+        span = _span_of(desc, control)
+        choices = (
+            ()
+            if span is not None
+            else tuple((value, control.format(value)) for value in desc.allowed_values)
+        )
         return Setting(
-            code=code,
-            name=name,
+            code=control.code,
+            name=control.name,
             value=desc.current,
-            label=formatter(desc.current),
+            label=control.format(desc.current),
             writable=desc.writable,
             choices=choices,
+            span=span,
         )
 
     def set_setting(self, name: str, value: Any) -> None:
-        for label, code, _ in _SETTINGS:
-            if label == name:
+        for control in _SETTINGS:
+            if control.name == name:
                 try:
-                    self.session.set_prop(code, value)
+                    self.session.set_prop(control.code, value)
                 except MtpError as exc:
                     raise CameraError(
                         f"camera refused {name} = {value} (0x{exc.response:04X})"
@@ -930,6 +1032,7 @@ class NikonCamera:
             # delay before the mirror is part of it, so this is read outside
             # the block that puts that delay on the camera.
             wait = self.shot_seconds() + timeout
+            fired = time.monotonic()
             # The delay stays on the camera for the whole sequence, release to
             # the last event, and comes off the moment it is over -- including
             # when the shutter refuses to fire.
@@ -961,12 +1064,21 @@ class NikonCamera:
                         raise CameraError(
                             f"shutter did not fire (0x{exc.response:04X})"
                         ) from exc
-                return self._collect_capture_handles(wait)
+                handles = self._collect_capture_handles(wait)
+            _trace(f"shot over {time.monotonic() - fired:.2f}s after the shutter")
+            return handles
 
-    #: How long the second of the two events is given, where waiting for it
-    #: is a courtesy rather than the point. Not used for the picture itself
-    #: when the picture is the only copy -- see _collect_capture_handles.
+    #: How long a picture is given once the exposure is over and the file is
+    #: on the card anyway, where the handle is a convenience rather than the
+    #: point. Not used for the picture itself when the picture is the only
+    #: copy there is -- see _collect_capture_handles.
     _EVENT_GRACE = 5.0
+
+    #: How long a second picture is given once the first is in hand. A raw and
+    #: the jpeg beside it are one release of the shutter and land a poll or two
+    #: apart, so this is short: by then the shot has produced what was waited
+    #: for, and everything still outstanding is bookkeeping.
+    _COMPANION_GRACE = 0.5
 
     def _collect_capture_handles(self, timeout: float) -> "list[int]":
         """Wait for the shot to end, and for the picture it made.
@@ -979,6 +1091,7 @@ class NikonCamera:
         for itself.
         """
         handles: "list[int]" = []
+        released = time.monotonic()
 
         def remember(code: int, param: int) -> None:
             # A handle only once: shooting to SDRAM every picture is handle
@@ -992,6 +1105,10 @@ class NikonCamera:
         complete = False
         while time.monotonic() < deadline:
             for code, param in self.poll_events():
+                _trace(
+                    f"event 0x{code:04X} param 0x{param:08X} at "
+                    f"{time.monotonic() - released:.2f}s"
+                )
                 remember(code, param)
                 if code in (
                     Event.CAPTURE_COMPLETE,
@@ -1003,12 +1120,23 @@ class NikonCamera:
                 # are not split across two polls with the second one missed.
                 for code, param in self.poll_events():
                     remember(code, param)
+                _trace(f"picture in hand at {time.monotonic() - released:.2f}s")
                 return handles
-            elif handles or (complete and self._save_to_card):
-                # Half the pair is in and the other is only tidiness now: the
-                # picture is already in hand, or the exposure is over and the
-                # file is on the card whatever handle does or does not turn
-                # up. Give it a moment rather than the rest of the budget.
+            elif handles:
+                # The picture exists and its handle is in hand, which is the
+                # whole point of the wait; the completion event would only
+                # confirm what the picture already proves. Not every body
+                # sends one for every shot -- a short exposure held in SDRAM
+                # while live view runs is the case seen here -- and holding
+                # the shot open for one that is not coming is seconds of dead
+                # time between the shutter and the download. So what is left
+                # to wait for is a companion file, and that is quick.
+                deadline = min(deadline, time.monotonic() + self._COMPANION_GRACE)
+            elif complete and self._save_to_card:
+                # The exposure is over and the file is on the card whatever
+                # handle does or does not turn up, so nothing is lost by
+                # giving up on it. Still worth a moment: a body writing to the
+                # card offers the handle a little after it finishes.
                 #
                 # Deliberately not the case of a completion with no picture
                 # and no card. Then the buffer is the only copy there is, and
@@ -1040,6 +1168,7 @@ class NikonCamera:
                 "switched off here, nothing was written to it either. Tick "
                 "\"Write to the camera's card\" to shoot this one again safely."
             )
+        _trace(f"waiting stopped at {time.monotonic() - released:.2f}s")
         return handles
 
     def poll_events(self) -> "list[tuple[int, int]]":

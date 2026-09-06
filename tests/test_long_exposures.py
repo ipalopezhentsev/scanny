@@ -173,6 +173,30 @@ def test_the_exposure_is_waited_for_after_the_picture_arrives():
     assert camera.session.polls_after_firing >= 4
 
 
+def test_a_picture_without_a_completion_is_not_waited_out(monkeypatch):
+    """The picture is what the wait was for.
+
+    Not every body sends CaptureComplete for every shot -- a short exposure
+    held in SDRAM with live view running is the case this was found on. Once
+    the handle is in hand the missing event would confirm nothing the picture
+    does not already prove, and holding the shot open for one that is never
+    coming is seconds of silence between the shutter and the download.
+    """
+    monkeypatch.setattr(NikonCamera, "_COMPANION_GRACE", 0.05)
+    camera = _camera(schedule={1: [PICTURE]})
+    assert camera.capture() == [NEW_HANDLE]
+    # A handful of polls for the companion file, not the hundred that waiting
+    # out the courtesy wait for the completion would take.
+    assert camera.session.polls_after_firing < 10
+
+
+def test_the_jpeg_beside_a_raw_is_caught_without_a_completion():
+    """What the short wait after the picture is actually for: the second file
+    of a raw-plus-jpeg shot, a poll behind the first."""
+    camera = _camera(schedule={1: [PICTURE], 2: [JPEG]})
+    assert camera.capture() == [NEW_HANDLE, JPEG_HANDLE]
+
+
 def test_an_ordinary_shot_waits_for_nothing_extra():
     """Both events together, as a short exposure sends them: no grace spent."""
     camera = _camera(schedule={1: SHOT})

@@ -1,6 +1,6 @@
 """The controls panel must never be squeezed to make itself fit.
 
-With a camera connected the exposure form fills with eight rows, and by then
+With a camera connected the exposure form fills with nine rows, and by then
 the panel wants more height than the window has. A plain layout answers that
 by handing every widget less than it asked for, which flattens the spin boxes
 and cuts the last line off every wrapped hint -- damage that reads as a broken
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QSpinBox,
 )
 
-from scanny.camera.nikon import Setting  # noqa: E402
+from scanny.camera.nikon import Setting, Span  # noqa: E402
 from scanny.ui import main_window as mw  # noqa: E402
 
 #: What the sidebar looks like with a camera on the end of the cable: this is
@@ -40,6 +40,10 @@ _CONNECTED = [
         ("White balance", "Daylight", "Auto"), ("Mode", "Manual", "Aperture"),
         ("Focus mode", "AF-S", "MF"), ("Drive", "Single", "Continuous"),
     )
+] + [
+    # The one row that is typed into rather than picked from.
+    Setting(0, "Colour temp.", 5000, "5000 K", True, (),
+            span=Span(2500, 10000, 10, " K")),
 ]
 
 
@@ -223,7 +227,7 @@ def test_the_wheel_over_a_combo_scrolls_rather_than_setting_the_camera(window):
     These are also the combos built after the panel was guarded -- they arrive
     with the camera's answer -- so this covers the later ones too.
     """
-    combo = window._combos["Shutter"]
+    combo = window._setting_widgets["Shutter"]
     bar = _scroller(window).verticalScrollBar()
     was, where = combo.currentIndex(), bar.value()
     _wheel(combo)
@@ -250,7 +254,7 @@ def test_the_wheel_over_the_zoom_slider_scrolls_rather_than_zooming(window):
 
 
 def test_the_panel_scrolls_both_ways(window):
-    combo = window._combos["ISO"]
+    combo = window._setting_widgets["ISO"]
     bar = _scroller(window).verticalScrollBar()
     _wheel(combo, notches=-3)
     down = bar.value()

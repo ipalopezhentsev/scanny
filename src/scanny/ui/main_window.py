@@ -216,7 +216,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("scanny")
 
-        self._combos: "dict[str, QComboBox]" = {}
+        #: One control per exposure setting: a combo box for a setting that is
+        #: a choice, a spin box for one that is a number.
+        self._setting_widgets: "dict[str, QWidget]" = {}
         self._level_shown = 0.0
         self._updating_settings = False
         self._live = False
@@ -1477,49 +1479,99 @@ class MainWindow(QMainWindow):
 
     def _rebuild_exposure_form(self, settings: "list[Setting]") -> None:
         existing = {s.name for s in settings}
-        if set(self._combos) != existing:
+        if set(self._setting_widgets) != existing:
             while self.exposure_form.rowCount():
                 self.exposure_form.removeRow(0)
-            self._combos.clear()
+            self._setting_widgets.clear()
             for setting in settings:
-                combo = QComboBox()
-                combo.setEnabled(setting.writable and bool(setting.choices))
-                combo.activated.connect(
-                    lambda _index, name=setting.name: self._on_setting_chosen(name)
-                )
-                self._wheels.watch(combo)
-                self._combos[setting.name] = combo
-                self.exposure_form.addRow(setting.name, combo)
+                widget = self._setting_widget(setting)
+                self._wheels.watch(widget)
+                self._setting_widgets[setting.name] = widget
+                self.exposure_form.addRow(setting.name, widget)
 
         for setting in settings:
-            combo = self._combos[setting.name]
-            labels = setting.choice_labels or [setting.label]
-            if [combo.itemText(i) for i in range(combo.count())] != labels:
-                combo.blockSignals(True)
-                combo.clear()
-                for value, label in setting.choices or ((setting.value, setting.label),):
-                    combo.addItem(label, value)
-                combo.blockSignals(False)
-            index = combo.findText(setting.label)
-            if index >= 0:
-                combo.blockSignals(True)
-                combo.setCurrentIndex(index)
-                combo.blockSignals(False)
-            combo.setToolTip(
-                "Set on the camera body" if not setting.writable else setting.name
+            widget = self._setting_widgets[setting.name]
+            if isinstance(widget, QSpinBox):
+                self._show_setting_number(widget, setting)
+            elif isinstance(widget, QComboBox):
+                self._show_setting_choices(widget, setting)
+            widget.setEnabled(
+                setting.writable and (setting.span is not None or bool(setting.choices))
             )
+            tip = setting.note or (
+                setting.name if setting.writable else "Set on the camera body"
+            )
+            widget.setToolTip(tip)
+            # A disabled control is past the reach of the mouse, and a tooltip
+            # it cannot be given is no way to say why it is disabled. Its row
+            # label is still live, so the reason goes there as well.
+            label = self.exposure_form.labelForField(widget)
+            if label is not None:
+                label.setToolTip(tip)
+
+    def _setting_widget(self, setting: "Setting") -> QWidget:
+        """A box to type the value into, or a list to pick it from."""
+        if setting.span is None:
+            combo = QComboBox()
+            combo.activated.connect(
+                lambda _index, name=setting.name: self._on_setting_chosen(name)
+            )
+            return combo
+        spin = QSpinBox()
+        spin.setSuffix(setting.span.unit)
+        # Off, so that typing 5000 does not send 5, then 50, then 500 to the
+        # camera on the way: the value goes when the number is finished.
+        spin.setKeyboardTracking(False)
+        spin.valueChanged.connect(
+            lambda _value, name=setting.name: self._on_setting_chosen(name)
+        )
+        return spin
+
+    def _show_setting_choices(self, combo: QComboBox, setting: "Setting") -> None:
+        labels = setting.choice_labels or [setting.label]
+        if [combo.itemText(i) for i in range(combo.count())] != labels:
+            combo.blockSignals(True)
+            combo.clear()
+            for value, label in setting.choices or ((setting.value, setting.label),):
+                combo.addItem(label, value)
+            combo.blockSignals(False)
+        index = combo.findText(setting.label)
+        if index >= 0:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+
+    def _show_setting_number(self, spin: QSpinBox, setting: "Setting") -> None:
+        span = setting.span
+        try:
+            value = int(setting.value)
+        except (TypeError, ValueError):
+            return
+        spin.blockSignals(True)
+        if span is not None:
+            spin.setRange(span.minimum, span.maximum)
+            spin.setSingleStep(span.step)
+        if spin.value() != value:
+            spin.setValue(value)
+        spin.blockSignals(False)
 
     def _on_setting_chosen(self, name: str) -> None:
         if self._updating_settings:
             return
-        combo = self._combos.get(name)
-        if combo is None:
+        widget = self._setting_widgets.get(name)
+        if widget is None:
             return
-        value = combo.currentData()
+        if isinstance(widget, QSpinBox):
+            self.requestSetting.emit(name, widget.value())
+            return
+        if not isinstance(widget, QComboBox):
+            return
+        value = widget.currentData()
         if value is not None:
             self.requestSetting.emit(name, value)
         # The combo needed the keyboard for its popup; give it back to the
-        # image so the shortcuts keep working.
+        # image so the shortcuts keep working. A spin box keeps it: the number
+        # in it is likely still being adjusted.
         self.view.setFocus()
 
     @Slot(float, float)

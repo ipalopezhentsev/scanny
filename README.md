@@ -912,5 +912,5 @@ They need no camera attached.
 
 - filmstrip/delete file?
 - focus sweep - find&visualize depth map
-- wb - set to fix value
+
 

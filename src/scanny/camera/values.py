@@ -18,6 +18,7 @@ __all__ = [
     "format_iso",
     "format_exposure_bias",
     "format_white_balance",
+    "format_colour_temperature",
     "format_program_mode",
     "format_focus_mode",
     "format_capture_mode",
@@ -154,6 +155,14 @@ def _lookup(table: "dict[int, str]", value: Any) -> str:
 
 def format_white_balance(value: Any) -> str:
     return _lookup(_WHITE_BALANCE, value)
+
+
+def format_colour_temperature(value: Any) -> str:
+    """Nikon's white balance colour temperature, already in kelvin."""
+    try:
+        return f"{int(value)} K"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def format_program_mode(value: Any) -> str:
