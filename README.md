@@ -910,7 +910,6 @@ They need no camera attached.
 
 ## TODO
 
-- filmstrip/delete file?
 - focus sweep - find&visualize depth map
 
 

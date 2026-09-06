@@ -12,10 +12,11 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QThread,
+    QUrl,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -935,9 +936,16 @@ class MainWindow(QMainWindow):
         self.save_dir_label.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self.save_dir_label)
 
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(4)
         choose = QPushButton("Change folder...")
         choose.clicked.connect(self._choose_save_directory)
-        layout.addWidget(choose)
+        folder_row.addWidget(choose, 1)
+        reveal = QPushButton("Open folder")
+        reveal.setToolTip("Show the folder photos are saved to in Explorer.")
+        reveal.clicked.connect(self._open_save_directory)
+        folder_row.addWidget(reveal, 0)
+        layout.addLayout(folder_row)
 
         layout.addWidget(self._build_naming())
 
@@ -1619,6 +1627,19 @@ class MainWindow(QMainWindow):
         if chosen:
             self.worker.set_save_directory(chosen)
             self.save_dir_label.setText(f"Saving to {chosen}")
+
+    def _open_save_directory(self) -> None:
+        # The folder is only made when the first picture lands in it, so it may
+        # not be there yet. Making it here is what the next save would have done
+        # anyway, and it beats an "open" that quietly does nothing.
+        directory = self.worker.save_directory
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Cannot open {directory}: {exc}", 8000)
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+            self.statusBar().showMessage(f"Cannot open {directory}", 8000)
 
     # -- shutdown ----------------------------------------------------------
 
