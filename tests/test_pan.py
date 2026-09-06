@@ -1,9 +1,14 @@
-"""Tests for arrow-key panning.
+"""Tests for panning, by the arrow keys and by the navigator pane.
 
 Panning has no dedicated camera command: the body centres its magnified view on
 the focus point, so scrolling the view means moving that point. A step is an
 eighth of what is currently on screen, so the view travels by the same visible
 amount however far in you are zoomed.
+
+The navigator drags the same point, but says where it wants it as a fraction
+of the whole frame rather than as a step. Those coordinates cannot go through
+the crop rectangle the way a click on the image does -- the pane is looking at
+the frame the picture on screen was cut out of.
 """
 
 from __future__ import annotations
@@ -245,3 +250,40 @@ def test_default_focus_step_sizes_are_ordered():
     # genuinely small step -- the number itself is the user's to tune, and the
     # editor still goes down to the single step the body accepts.
     assert values[0] <= 20
+
+
+# -- the navigator's own way of moving the point ---------------------------
+
+
+def test_a_fraction_of_the_frame_maps_straight_to_the_sensor():
+    worker, camera = _worker(make_frame(**ZOOMED))
+    worker.move_point_in_frame(0.25, 0.75)
+    # The frame is 6016x3376 of focus space, whatever the crop on screen is.
+    assert camera.moves == [(6016 // 4, 3 * 3376 // 4)]
+
+
+def test_the_magnification_does_not_come_into_it():
+    """The same fraction means the same place however far in the view is.
+
+    A click on the image does not work this way and must not: it is a fraction
+    of what is on screen, which is a different rectangle at every zoom level.
+    """
+    wide, wide_cam = _worker(make_frame())
+    wide.move_point_in_frame(0.25, 0.25)
+    tight, tight_cam = _worker(make_frame(**ZOOMED))
+    tight.move_point_in_frame(0.25, 0.25)
+    assert wide_cam.moves == tight_cam.moves
+
+
+def test_the_edge_of_the_frame_is_clamped_to_where_the_box_fits():
+    worker, camera = _worker(make_frame(**ZOOMED))
+    worker.move_point_in_frame(0.0, 0.0)
+    assert camera.moves == [(162, 135)]
+
+
+def test_a_navigator_drag_without_a_camera_is_harmless():
+    worker = CameraWorker()
+    failures = []
+    worker.failed.connect(failures.append)
+    worker.move_point_in_frame(0.5, 0.5)
+    assert failures  # reported, not crashed

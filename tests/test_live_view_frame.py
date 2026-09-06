@@ -154,3 +154,42 @@ def test_level_fields_are_optional_for_frames_without_them():
     # The geometry-only frames the other tests build must still work.
     frame = make_frame()
     assert frame.roll == 0 and frame.pitch == 0
+
+
+# -- where the picture sits in the frame -----------------------------------
+
+
+def test_a_whole_frame_covers_all_of_itself():
+    x, y, w, h = make_frame().crop_normalised
+    assert (x, y, w, h) == pytest.approx((0.0, 0.0, 1.0, 1.0))
+
+
+def test_a_magnified_frame_covers_the_part_it_shows():
+    """What the navigator draws: a quarter of the frame, in its top left."""
+    frame = make_frame(crop=(1504, 844), crop_centre=(752, 422))
+    assert frame.crop_normalised == pytest.approx((0.0, 0.0, 0.25, 0.25))
+
+
+def test_the_crop_follows_the_focus_point_across_the_frame():
+    frame = make_frame(crop=(1504, 844), crop_centre=(4512, 2532))
+    x, y, w, h = frame.crop_normalised
+    assert (x + w / 2, y + h / 2) == pytest.approx((0.75, 0.75))
+
+
+def test_a_fraction_of_the_frame_maps_to_the_sensor_whatever_is_on_screen():
+    """The navigator's coordinates do not go through the crop rectangle.
+
+    A click on the image does, and must: it is a fraction of what is on
+    screen. These are fractions of the frame that picture was cut from, so
+    they mean the same place at every magnification.
+    """
+    whole = make_frame()
+    magnified = make_frame(crop=(1504, 844), crop_centre=(4512, 2532))
+    assert whole.to_af_coords_in_frame(0.25, 0.5) == (1504, 1688)
+    assert magnified.to_af_coords_in_frame(0.25, 0.5) == (1504, 1688)
+
+
+def test_a_point_at_the_edge_is_pulled_in_to_where_the_box_fits():
+    frame = make_frame()
+    assert frame.to_af_coords_in_frame(0.0, 0.0) == (162, 135)
+    assert frame.to_af_coords_in_frame(1.0, 1.0) == (6016 - 162, 3376 - 135)

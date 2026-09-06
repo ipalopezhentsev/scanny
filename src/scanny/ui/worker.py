@@ -21,6 +21,7 @@ from ..camera.nikon import CameraError, LiveViewFrame, NikonCamera
 from ..wpd.device import MtpError, WpdCommandError
 from .hunt import Walk
 from .integration import FrameIntegrator
+from .naming import NameSequence, unique
 from .pixels import green
 from .sharpness import SharpnessMeter, grain_reading, measure, variance_between
 
@@ -92,6 +93,17 @@ class CameraWorker(QObject):
     #: Whether the focus hunt is running.
     huntChanged = Signal(bool)
     exposurePreviewChanged = Signal(bool)
+    #: Whether shots are being written to the camera's card. Reported back
+    #: rather than assumed: a body that refuses the choice keeps using it.
+    saveToCardChanged = Signal(bool)
+    #: The shutter delays the connected body offers, in seconds, and the one
+    #: it is itself set to. Both are asked of the camera: what is on offer
+    #: varies by model, and what the body is set to is where the choice starts.
+    shutterDelaysAvailable = Signal(object, object)  # tuple[int, ...], int | None
+    #: The number the next saved picture will be given, reported once a shot
+    #: has used one. Only ever emitted when the counter moved by itself: an
+    #: override comes from the window, and is not echoed back at it.
+    nextNumber = Signal(int)
     status = Signal(str)
     failed = Signal(str)
 
@@ -137,6 +149,15 @@ class CameraWorker(QObject):
         self._grain_scale = 0.0
         self._settle_frames = 0
         self._save_dir = Path.home() / "Pictures" / "scanny"
+        # Tethered by default: the picture comes straight down the cable and
+        # the card is left out of it. See NikonCamera.set_save_to_card.
+        self._save_to_card = False
+        # Seconds between the mirror lifting and the shutter firing. Kept here
+        # as well as on the camera so it survives a reconnection.
+        self._shutter_delay = 0
+        # What downloaded pictures are called. Off by default: the camera's
+        # own names are what someone expects until they ask for otherwise.
+        self._namer = NameSequence()
 
     # -- thread lifecycle --------------------------------------------------
 
@@ -192,6 +213,15 @@ class CameraWorker(QObject):
             self.failed.emit(f"Could not open the camera: {exc}")
             return
         self._camera = camera
+        camera.set_save_to_card(self._save_to_card)
+        # The camera has the last word: one that will not be told where to
+        # record keeps using its card.
+        self._save_to_card = camera.save_to_card
+        self.saveToCardChanged.emit(self._save_to_card)
+        camera.set_shutter_delay(self._shutter_delay)
+        self.shutterDelaysAvailable.emit(
+            camera.shutter_delay_choices(), camera.shutter_delay_on_body()
+        )
         battery = camera.battery_level()
         suffix = f" - battery {battery}%" if battery is not None else ""
         self.connected.emit(f"{camera.model}  |  firmware {camera.firmware}{suffix}")
@@ -374,7 +404,28 @@ class CameraWorker(QObject):
         frame = self._current_frame()
         if frame is None:
             return
-        x, y = frame.to_af_coords(nx, ny)
+        self._move_point_to(camera, *frame.to_af_coords(nx, ny))
+
+    @Slot(float, float)
+    def move_point_in_frame(self, fx: float, fy: float) -> None:
+        """Move the focus rectangle to a fraction of the *whole* frame.
+
+        What the navigator drags. Unlike :meth:`move_point`, whose coordinates
+        are fractions of the picture on screen, these are fractions of the
+        frame that picture was cut from -- the only coordinates the navigator
+        has, since it is showing the whole frame while the live view shows a
+        part of it. Moving the point is what pans the magnified view, so this
+        is also how the navigator scrolls the picture.
+        """
+        camera = self._require()
+        if camera is None:
+            return
+        frame = self._current_frame()
+        if frame is None:
+            return
+        self._move_point_to(camera, *frame.to_af_coords_in_frame(fx, fy))
+
+    def _move_point_to(self, camera: NikonCamera, x: int, y: int) -> None:
         try:
             camera.set_af_area(x, y)
         except CameraError as exc:
@@ -521,15 +572,14 @@ class CameraWorker(QObject):
             return
         step_x = max(1, (frame.crop_width or frame.image_width) // 8)
         step_y = max(1, (frame.crop_height or frame.image_height) // 8)
-        x, y = frame.af_x + dx * step_x, frame.af_y + dy * step_y
-        # Reuse the frame's own clamping so the focus box cannot leave the sensor.
-        half_w, half_h = frame.af_width // 2, frame.af_height // 2
-        x = min(max(x, half_w), max(frame.image_width - half_w, half_w))
-        y = min(max(y, half_h), max(frame.image_height - half_h, half_h))
+        # The frame's own clamping, so the focus box cannot leave the sensor.
+        x, y = frame.clamp_af_coords(
+            frame.af_x + dx * step_x, frame.af_y + dy * step_y
+        )
         if (x, y) == (frame.af_x, frame.af_y):
             return
         try:
-            camera.set_af_area(int(x), int(y))
+            camera.set_af_area(x, y)
         except CameraError as exc:
             self.failed.emit(str(exc))
 
@@ -548,6 +598,53 @@ class CameraWorker(QObject):
             if enabled
             else "Live view brightness normalised by the camera"
         )
+
+    # -- where shots are recorded ------------------------------------------
+
+    @Slot(bool)
+    def set_save_to_card(self, enabled: bool) -> None:
+        # Remembered even with no camera attached, so the choice survives a
+        # reconnection and is applied to whatever turns up next.
+        self._save_to_card = bool(enabled)
+        camera = self._camera
+        if camera is not None and not camera.set_save_to_card(self._save_to_card):
+            self._save_to_card = camera.save_to_card
+            self.failed.emit(
+                "This camera will not be told where to record, so shots keep "
+                "going to its card."
+            )
+        else:
+            self.status.emit(
+                "Shots will be written to the camera's card"
+                if self._save_to_card
+                else "Shots will go straight to the computer"
+            )
+        self.saveToCardChanged.emit(self._save_to_card)
+
+    @property
+    def save_to_card(self) -> bool:
+        return self._save_to_card
+
+    # -- shutter delay -----------------------------------------------------
+
+    @Slot(int)
+    def set_shutter_delay(self, seconds: int) -> None:
+        """Wait this many seconds, mirror up, before each shot is released."""
+        # Held here as well as on the camera, for the same reason as the
+        # recording media: the choice outlives any one connection.
+        self._shutter_delay = max(0, int(seconds))
+        camera = self._camera
+        if camera is not None:
+            camera.set_shutter_delay(self._shutter_delay)
+        self.status.emit(
+            f"The shutter will fire {self._shutter_delay}s after the mirror lifts"
+            if self._shutter_delay
+            else "The shutter will fire as soon as it is asked to"
+        )
+
+    @property
+    def shutter_delay(self) -> int:
+        return self._shutter_delay
 
     # -- noise integration -------------------------------------------------
 
@@ -891,7 +988,9 @@ class CameraWorker(QObject):
         camera = self._require()
         if camera is None:
             return
-        self.status.emit("Releasing shutter...")
+        # The wait is the camera's, and nothing arrives while it runs, so say
+        # what is being waited for rather than let the window look stuck.
+        self.status.emit(self._shutter_message(camera))
         try:
             handles = camera.capture(autofocus=autofocus)
         except CameraError as exc:
@@ -902,34 +1001,75 @@ class CameraWorker(QObject):
             self.refresh_settings()
             return
 
+        # A picture the camera is holding in SDRAM rather than writing to
+        # the card is gone the moment the next one is taken, so there is no
+        # such thing as choosing not to download it.
+        download = download or not camera.save_to_card
+
+        # One name for the whole release of the shutter, so a RAW and a JPEG
+        # of the same picture stay a pair. Claimed once the shot is known to
+        # exist, so a capture that produced nothing does not eat a number.
+        naming = download and self._namer.enabled
+        stem = self._namer.claim(self._save_dir) if naming else ""
+
         names = []
         for handle in handles:
-            try:
-                info = camera.session.object_info(handle)
-            except (MtpError, WpdCommandError):
+            if not download:
+                names.append(self._filename(camera, handle))
                 continue
-            names.append(info.filename)
-            if download:
-                self._download(camera, handle, info.filename)
-        if names and not download:
+            if self._download(camera, handle, stem) and not camera.save_to_card:
+                camera.release_from_sdram(handle)
+        if names:
             self.status.emit("Captured " + ", ".join(names))
+        if naming:
+            self.nextNumber.emit(self._namer.number)
         self.refresh_settings()
 
-    def _download(self, camera: NikonCamera, handle: int, filename: str) -> None:
-        self.status.emit(f"Downloading {filename}...")
+    @staticmethod
+    def _shutter_message(camera: NikonCamera) -> str:
+        """Say what the camera is about to spend the wait on.
+
+        A long exposure is the case that needs saying: with noise reduction
+        the body is busy for twice the shutter speed, taking a dark frame it
+        subtracts from the picture, and until that is over there is no picture
+        to fetch. Silence for half a minute reads as a program that has hung.
+        """
+        seconds = camera.shot_seconds()
+        delay = camera.shutter_delay
+        if seconds - delay >= 2:
+            return f"Shooting -- about {seconds:.0f}s, the camera's own time..."
+        if delay:
+            return f"Mirror up, shutter in {delay}s..."
+        return "Releasing shutter..."
+
+    def _filename(self, camera: NikonCamera, handle: int) -> str:
         try:
-            _, data = camera.download(handle)
+            return camera.session.object_info(handle).filename
+        except (MtpError, WpdCommandError):
+            return f"image {handle:#010x}"
+
+    def _download(self, camera: NikonCamera, handle: int, stem: str = "") -> bool:
+        """Fetch one captured picture and write it out. False if it failed.
+
+        `stem` is the name this shot was given by the sequence; empty means
+        the sequence is off and the camera's own name is kept. Either way the
+        camera's extension is: it is what says whether the file is a NEF.
+        """
+        self.status.emit("Downloading...")
+        try:
+            filename, data = camera.download(handle)
         except (MtpError, WpdCommandError, CameraError) as exc:
-            self.failed.emit(f"Could not download {filename}: {exc}")
-            return
+            self.failed.emit(f"Could not download the picture: {exc}")
+            return False
         self._save_dir.mkdir(parents=True, exist_ok=True)
-        path = self._save_dir / filename
-        stem, suffix, counter = path.stem, path.suffix, 1
-        while path.exists():
-            path = self._save_dir / f"{stem}_{counter}{suffix}"
-            counter += 1
+        if stem:
+            path = self._save_dir / f"{stem}{Path(filename).suffix}"
+        else:
+            path = self._save_dir / filename
+        path = unique(path)
         path.write_bytes(data)
         self.status.emit(f"Saved {path}")
+        return True
 
     @Slot(str)
     def set_save_directory(self, path: str) -> None:
@@ -938,6 +1078,21 @@ class CameraWorker(QObject):
     @property
     def save_directory(self) -> Path:
         return self._save_dir
+
+    @Slot(bool, str, int)
+    def set_naming(self, enabled: bool, prefix: str, number: int) -> None:
+        """Take the naming the window is showing, including an override.
+
+        Nothing is emitted back: the window already has these values, and
+        answering with them would fight whatever is being typed right now.
+        The counter only reports itself after it has moved on its own, which
+        is when a shot has used a number.
+        """
+        self._namer.configure(enabled, prefix, number)
+
+    @property
+    def naming(self) -> NameSequence:
+        return self._namer
 
     # -- helpers -----------------------------------------------------------
 

@@ -58,7 +58,10 @@ second**, so the camera, not the plumbing, is the limit.
 | `ui/sharpness.py` | Scoring the contrast in the displayed picture, to focus against |
 | `ui/trend.py` | The plot of recent readings that focus is driven against |
 | `ui/hunt.py` | Walking focus to the top of that reading, without counting steps |
-| `ui/pixels.py` | Getting at a QImage's bytes as numpy, shared by those two |
+| `ui/navigator.py` | The whole frame, with the magnified view marked on it and draggable |
+| `ui/histogram.py` | The levels in the picture on screen, per channel |
+| `ui/pixels.py` | Getting at a QImage's bytes as numpy, shared by everything that reads them |
+| `ui/naming.py` | The prefix-and-counter names that downloaded pictures are saved under |
 
 ## The live-view header
 
@@ -693,6 +696,67 @@ reported before the shutter is asked to fire.
 A shot lands on the card at full resolution (a 23 MB NEF here) and downloads
 over USB at about 23 MB/s. Live view keeps running throughout.
 
+### Waiting for the mirror to stop moving
+
+Nikon's exposure delay mode -- custom setting d4 on a D750, and
+`ExposureDelayMode` (`0xD06A`) over PTP -- lifts the mirror, waits one, two or
+three seconds, and only then releases the shutter, so what the mirror shook has
+settled before the exposure starts. On a copy stand that is the largest thing
+that moves, and the wait is free sharpness.
+
+`0xD06A` is not in the body's list of supported properties, in the same way as
+the rest of Nikon's vendor properties over WPD, but `GetDevicePropDesc` answers
+for it: a `UINT8` with a range form of 0 to 3 in steps of one, writable, where
+the value is the delay in seconds and zero is off. Which of those a body offers
+varies by model, so the choices in the panel are the ones this camera reported
+rather than a fixed four.
+
+The delay is written for each shot and the camera's own setting handed back
+immediately afterwards, including when the shutter refuses to fire. Two reasons.
+Nikon lists exposure delay mode among the conditions that prohibit live view
+(bit 20 of `LiveViewProhibitCondition`), so a body left with it on may refuse to
+start live view next time. And it is the camera's setting, not this program's,
+to leave as it was found.
+
+That cuts both ways, which is why *off* is written too rather than the property
+being left alone: the D750 here arrived with three seconds already set on it, so
+leaving it alone would have made "off" mean "three seconds". For the same
+reason the control starts at whatever the connected body is set to -- a rig
+already configured this way keeps its delay -- and once a delay has been chosen
+in the panel, that is what is remembered and used.
+
+### Naming what lands on the computer
+
+The camera's own names are no use for a scan. `DSC_1234.NEF` comes from a
+counter that belongs to the body: it wraps at 9999 and starts again from one
+whenever the card is formatted, so the order the pages were shot in is not
+recoverable from the folder afterwards.
+
+So the Capture panel offers a sequence of its own -- a prefix and the number
+the next picture will get, giving `page_0084.NEF`. Three things about it:
+
+- **It starts where you say.** A book resumed at page 84 is set to 84 before
+  shooting, not renamed afterwards.
+- **It can be overridden at any time.** Both boxes are live. Type over either
+  between two shots and the next shot uses what was typed; nothing has to be
+  switched off and on again.
+- **Counting carries on from the override.** Set 84 and the shots after it are
+  85, 86, and so on. The counter's only state is the next number, so there is
+  no earlier sequence hiding behind an override to snap back to.
+
+The number box is also the readout: it always shows what the next picture will
+be called, and moves by itself as shots use numbers up. Where it reached is
+remembered between runs, so a scan spread over two sittings is one sequence.
+
+A number some file in the folder is already using is skipped rather than
+overwritten -- whatever extension that file has, since a RAW and its JPEG are
+one picture under one number. Pointing at a half-scanned folder therefore adds
+to it instead of writing over page one. The extension always stays the
+camera's: it is what says whether the file is a NEF or a JPEG.
+
+Switched off, the camera's own names are kept, and a collision is decorated
+(`DSC_0001_2.NEF`) rather than overwritten.
+
 ## Using it
 
 - **Click** the image to move the focus rectangle there. It does not focus and
@@ -737,8 +801,19 @@ over USB at about 23 MB/s. Live view keeps running throughout.
 - Shutter, aperture, ISO, exposure compensation and white balance are settable;
   the exposure mode, focus mode and drive mode are shown but are set on the
   body, so the camera reports them read-only.
+- **Mirror-up delay** holds the shutter back for one to three seconds after the
+  mirror lifts, so nothing is shaking when the exposure starts. It is the
+  camera's own exposure delay mode, switched on for the shot and off again
+  afterwards, and it starts at whatever the camera is already set to.
 - Shots go to the card at full resolution and are downloaded to
   `~/Pictures/scanny` unless you turn that off.
+
+- **Number the files myself** saves each picture as a prefix and a counter --
+  `page_0084.NEF` -- instead of under the camera's name. Start the counter
+  wherever the batch starts; type over it or the prefix at any time and the
+  counting carries on from there. The box always shows what the next shot will
+  be called, and numbers already used in the folder are skipped, never
+  overwritten.
 
 Exposure time is reported by PTP in whole tenths of a millisecond, which cannot
 distinguish 1/8000 from 1/6400 from 1/5000. `camera/values.py` snaps to the
@@ -776,10 +851,5 @@ They need no camera attached.
 ## TODO
 
 - persist such settings to user profile
-- MLU
-- filenames
 - filmstrip/delete file?
 - focus sweep - find&visualize depth map
-- don't write file to card, just to pc
-- histogram
-- preview of full frame, so i can orient when zoomed-in

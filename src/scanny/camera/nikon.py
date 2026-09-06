@@ -10,8 +10,9 @@ from __future__ import annotations
 import struct
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from ..ptp.codes import Event, Op, Prop, Response
 from ..ptp.parser import Reader
@@ -112,8 +113,27 @@ class LiveViewFrame:
         to a focus-point coordinate, clamped to where the box actually fits."""
         crop_w = self.crop_width or self.image_width
         crop_h = self.crop_height or self.image_height
-        x = self.crop_center_x + (nx - 0.5) * crop_w
-        y = self.crop_center_y + (ny - 0.5) * crop_h
+        return self.clamp_af_coords(
+            self.crop_center_x + (nx - 0.5) * crop_w,
+            self.crop_center_y + (ny - 0.5) * crop_h,
+        )
+
+    def to_af_coords_in_frame(self, fx: float, fy: float) -> "tuple[int, int]":
+        """The same, for a position given as a fraction of the *whole* frame.
+
+        What the navigator works in: it is showing the entire sensor frame
+        while the live view shows a part of it, so its coordinates cannot go
+        through the crop rectangle the way a click on the image does.
+        """
+        return self.clamp_af_coords(fx * self.image_width, fy * self.image_height)
+
+    def clamp_af_coords(self, x: float, y: float) -> "tuple[int, int]":
+        """Pull a focus-point coordinate back to where the box actually fits.
+
+        The camera will not put the focus box off the edge of the sensor, so
+        every route to one -- a click, a pan, a drag on the navigator -- ends
+        here.
+        """
         half_w, half_h = self.af_width // 2, self.af_height // 2
         x = min(max(x, half_w), max(self.image_width - half_w, half_w))
         y = min(max(y, half_h), max(self.image_height - half_h, half_h))
@@ -130,6 +150,22 @@ class LiveViewFrame:
         cy = (self.af_y - self.crop_center_y) / crop_h + 0.5
         w = self.af_width / crop_w
         h = self.af_height / crop_h
+        return (cx - w / 2, cy - h / 2, w, h)
+
+    @property
+    def crop_normalised(self) -> "tuple[float, float, float, float]":
+        """The displayed region as (x, y, w, h) fractions of the whole frame.
+
+        The complement of :attr:`af_box_normalised`: that one places something
+        on the picture on screen, this one places the picture on screen within
+        the frame it was cut from -- which is what the navigator draws.
+        """
+        if not self.image_width or not self.image_height:
+            return (0.0, 0.0, 1.0, 1.0)
+        w = (self.crop_width or self.image_width) / self.image_width
+        h = (self.crop_height or self.image_height) / self.image_height
+        cx = self.crop_center_x / self.image_width
+        cy = self.crop_center_y / self.image_height
         return (cx - w / 2, cy - h / 2, w, h)
 
     @classmethod
@@ -217,6 +253,8 @@ class NikonCamera:
         self.session = PtpSession(transport)
         self._live_view = False
         self._exposure_preview = True
+        self._save_to_card = False
+        self._shutter_delay = 0
         self._lock = threading.RLock()
 
     # -- discovery and lifecycle ------------------------------------------
@@ -248,6 +286,7 @@ class NikonCamera:
         # Leaving live view running from a previous process wedges the next
         # StartLiveView, so always begin from a known state.
         self.session.try_execute(Op.NIKON_END_LIVE_VIEW)
+        self._apply_recording_media()
 
     def close(self) -> None:
         if self._live_view:
@@ -597,15 +636,238 @@ class NikonCamera:
         except (MtpError, WpdCommandError, ValueError):
             return None
 
+    # -- where shots are recorded ------------------------------------------
+    #
+    # Nikon's RecordingMedia property chooses between the memory card and the
+    # body's own SDRAM buffer. Shooting to SDRAM is what makes tethering worth
+    # having: the file comes straight down the cable, and nothing is written to
+    # the card at all -- no card needed, none of its wear, and nothing left
+    # behind to clear out afterwards.
+    #
+    # Either way the picture is the real one, full resolution, in whatever
+    # quality the body is set to; SDRAM here does not mean the preview image.
+    # What it does mean is that the buffer holds one frame and only until the
+    # next shot, so a capture taken this way exists nowhere until it has been
+    # downloaded. Callers that turn the card off must download.
+
+    #: Values of Prop.NIKON_RECORDING_MEDIA. Two is both at once, unused here.
+    _MEDIA_CARD, _MEDIA_SDRAM = 0, 1
+
+    @property
+    def save_to_card(self) -> bool:
+        """Whether shots are written to the camera's memory card."""
+        return self._save_to_card
+
+    def set_save_to_card(self, enabled: bool) -> bool:
+        """Record to the card, or hold shots in SDRAM for downloading.
+
+        Returns False if the body will not be told where to record, which
+        leaves it writing to the card as it was -- the shot is still there to
+        download, it has just been written to the card as well.
+        """
+        self._save_to_card = bool(enabled)
+        return self._apply_recording_media()
+
+    def _apply_recording_media(self) -> bool:
+        try:
+            self.session.set_prop(
+                Prop.NIKON_RECORDING_MEDIA,
+                self._MEDIA_CARD if self._save_to_card else self._MEDIA_SDRAM,
+            )
+        except (MtpError, WpdCommandError):
+            # Reality wins over what was asked for: a body that will not take
+            # the property is writing to its card, and callers read
+            # save_to_card to decide whether a shot has to be downloaded and
+            # whether the SDRAM buffer is theirs to clear.
+            self._save_to_card = True
+            return False
+        return True
+
+    # -- shutter delay -----------------------------------------------------
+    #
+    # Nikon's ExposureDelayMode -- custom setting d4 on a D750 -- lifts the
+    # mirror, waits the chosen number of seconds, and only then releases the
+    # shutter, so whatever the mirror shook has settled before the exposure
+    # starts. On a copy stand that is the difference between a sharp scan and
+    # a slightly smeared one, and it costs nothing but the wait.
+    #
+    # It is set for the shot and put back afterwards rather than left on, for
+    # two reasons. It is the camera's own setting, and the photographer may
+    # want a different one away from here. And Nikon lists exposure delay mode
+    # among the conditions that prohibit live view -- bit 20 of
+    # LiveViewProhibitCondition, see values.describe_lv_prohibit -- so a body
+    # left with it on may refuse to start live view next time.
+    #
+    # It is written for every shot, including a delay of none. A D750 arrived
+    # here with three seconds already set on it, so leaving the property alone
+    # when no delay is wanted would mean an "off" that still waits. The value
+    # asked for here is what the shot is taken with, and the camera's own
+    # setting is handed back straight afterwards.
+
+    #: The delays ExposureDelayMode encodes: the value is the delay in whole
+    #: seconds, and 0 is off. A D750 offers all four. Bodies before it offer
+    #: only off and one second, which is why the choices on offer are asked of
+    #: the camera rather than taken from here.
+    SHUTTER_DELAYS = (0, 1, 2, 3)
+
+    @property
+    def shutter_delay(self) -> int:
+        """Seconds the body waits, mirror up, before releasing the shutter."""
+        return self._shutter_delay
+
+    def set_shutter_delay(self, seconds: int) -> None:
+        """Choose the delay. It reaches the camera when the next shot is taken."""
+        self._shutter_delay = max(0, int(seconds))
+
+    def shutter_delay_on_body(self) -> "int | None":
+        """The delay the camera itself is set to, or None if it has no such setting.
+
+        Where the choice starts from: a body already set up for a copy stand
+        should not quietly lose its delay the first time it is driven from here.
+        """
+        try:
+            return int(self.session.get_prop(Prop.NIKON_EXPOSURE_DELAY_MODE))
+        except (MtpError, WpdCommandError, ValueError, TypeError):
+            return None
+
+    def shutter_delay_choices(self) -> "tuple[int, ...]":
+        """The delays this body accepts; empty when it has no such setting."""
+        try:
+            desc = self.session.prop_desc(Prop.NIKON_EXPOSURE_DELAY_MODE)
+        except (MtpError, WpdCommandError, ValueError):
+            return ()
+        if not desc.writable:
+            return ()
+        try:
+            offered = tuple(sorted({int(value) for value in desc.allowed_values}))
+        except (TypeError, ValueError):
+            offered = ()
+        # A body that has the property but will not enumerate it still takes
+        # the values Nikon defines for it.
+        return offered or self.SHUTTER_DELAYS
+
+    @contextmanager
+    def _delayed_shutter(self) -> "Iterator[None]":
+        """Hold the wanted exposure delay on the camera for one shot."""
+        wanted = self._shutter_delay
+        previous = self.shutter_delay_on_body()
+        if previous is None:
+            # No such setting on this body. Asking for no delay is then simply
+            # what happens anyway; asking for one is a promise that cannot be
+            # kept, and is said rather than quietly dropped.
+            if wanted:
+                raise CameraError(
+                    "this camera has no exposure delay mode, so the shutter "
+                    "cannot be held back. Set the delay to off."
+                )
+            yield
+            return
+        if previous == wanted:
+            yield
+            return
+        try:
+            self.session.set_prop(Prop.NIKON_EXPOSURE_DELAY_MODE, wanted)
+        except (MtpError, WpdCommandError) as exc:
+            if wanted:
+                raise CameraError(
+                    f"the camera would not take a {wanted} second shutter "
+                    "delay, so nothing was shot. Set the delay to off here, or "
+                    "set exposure delay mode on the camera itself."
+                ) from exc
+            # It would not let go of its own delay. The picture is still the
+            # right picture -- it is only slower to arrive than was asked for
+            # -- so it is taken rather than refused.
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                self.session.set_prop(Prop.NIKON_EXPOSURE_DELAY_MODE, previous)
+            except (MtpError, WpdCommandError):
+                pass
+
+    # -- how long a shot takes ---------------------------------------------
+    #
+    # Long enough that it cannot be guessed at. A shot is not over when the
+    # shutter closes: with long exposure noise reduction on -- custom setting
+    # d5, and Nikon turns it on for anything of a second or longer -- the body
+    # immediately takes a second exposure of the same length with the shutter
+    # closed and subtracts that dark frame from the picture. A 15 second
+    # exposure is a 30 second shot, and the finished picture does not exist
+    # until the end of it.
+    #
+    # Waiting less than that is what made every shot hand back the one before
+    # it: the wait ran out, the camera's own events for that shot arrived
+    # afterwards and sat in its queue, and the next shot read them the instant
+    # it fired -- and downloaded the buffer, which still held the previous
+    # picture. Hence both halves of the fix: wait long enough, and never
+    # believe an event that was already waiting when the shutter was released.
+
+    #: Nikon applies long exposure noise reduction from this shutter speed up.
+    _NR_FROM_SECONDS = 1.0
+
+    def exposure_seconds(self) -> float:
+        """How long the shutter will be open, in seconds, as best as is known.
+
+        Zero where the camera will not say: bulb, or a mode where the body
+        chooses the speed at the moment of release.
+        """
+        try:
+            raw = int(self.session.get_prop(Prop.EXPOSURE_TIME))
+        except (MtpError, WpdCommandError, ValueError, TypeError):
+            return 0.0
+        # PTP ExposureTime counts in units of 0.1 ms; 0xFFFFFFFF is bulb.
+        if raw <= 0 or raw == 0xFFFFFFFF:
+            return 0.0
+        return raw / 10_000
+
+    def long_exposure_nr(self) -> bool:
+        """Whether the body will follow the exposure with a dark frame."""
+        try:
+            return bool(int(self.session.get_prop(
+                Prop.NIKON_LONG_EXPOSURE_NOISE_REDUCTION
+            )))
+        except (MtpError, WpdCommandError, ValueError, TypeError):
+            return False
+
+    def shot_seconds(self) -> float:
+        """How long the camera will be busy with the next shot, end to end.
+
+        The delay before the mirror, the exposure, and the dark frame after it
+        where one is coming. What the picture is worth waiting for.
+        """
+        exposure = self.exposure_seconds()
+        total = self._shutter_delay + exposure
+        if exposure >= self._NR_FROM_SECONDS and self.long_exposure_nr():
+            total += exposure
+        return total
+
     # -- capture -----------------------------------------------------------
 
     def capture(self, autofocus: bool = False, timeout: float = 20.0) -> "list[int]":
         """Take a picture. Returns the handles of any objects the camera created.
 
-        The shot goes to the card, which is what makes it a full-resolution raw
-        or JPEG rather than the SDRAM preview. Live view stays running.
+        Where the picture lands is :attr:`save_to_card`'s to decide; it is a
+        full-resolution raw or JPEG rather than the live-view image either way.
+        Live view stays running.
+
+        The :attr:`shutter_delay` asked for is what the shot is taken with,
+        whatever the camera's own exposure delay mode is set to; the body gets
+        its own setting back afterwards. A delay makes the call that many
+        seconds longer -- the wait happens inside the camera, between the
+        mirror lifting and the shutter opening.
+
+        `timeout` is the slack allowed on top of the shot itself, not the
+        whole wait: how long the exposure and any dark frame after it will
+        take is asked of the camera and added. See :meth:`shot_seconds`.
         """
         with self._lock:
+            # Re-asserted for every shot rather than set once: the body drops
+            # back to the card over a power cycle or a reconnection, and doing
+            # that quietly would put the scan on the card instead of on the
+            # computer without anything saying so.
+            self._apply_recording_media()
             if autofocus:
                 # Driven as its own step rather than through a capture
                 # parameter, so a failure to lock is reported before the
@@ -617,46 +879,119 @@ class NikonCamera:
             # zero. A value of one is accepted but then never completes, and
             # leaves a capture pending that has to be torn down.
             params: "tuple[int, ...]" = (0xFFFFFFFF, 0x0000)
-            try:
-                self.session.execute(opcode, params)
-            except MtpError as exc:
-                if exc.response in (
-                    Response.OPERATION_NOT_SUPPORTED,
-                    Response.PARAMETER_NOT_SUPPORTED,
-                    Response.INVALID_PARAMETER,
-                ):
-                    self.session.execute(Op.INITIATE_CAPTURE, (0x00000000, 0x00000000))
-                elif exc.response == Response.NIKON_OUT_OF_FOCUS:
-                    raise CameraError(
-                        "shutter did not fire: autofocus could not lock. Focus "
-                        "first, or switch the lens to manual."
-                    ) from exc
-                else:
-                    raise CameraError(
-                        f"shutter did not fire (0x{exc.response:04X})"
-                    ) from exc
-            return self._collect_capture_handles(timeout)
+            # The delay is on the camera for the whole sequence, release to
+            # capture-complete, and taken off again the moment it is over --
+            # including when the shutter refuses to fire.
+            # What the shot will cost, read before the shutter is released
+            # rather than after, while the camera is still able to answer.
+            wait = self.shot_seconds() + timeout
+            with self._delayed_shutter():
+                # Anything already queued belongs to something that happened
+                # before this shot -- an earlier capture whose events arrived
+                # late, most of all. Read now, it would be taken for this
+                # shot's, and the picture downloaded would be the one before
+                # it. Dropped on the floor here, where the camera is between
+                # shots and nothing of this one exists yet.
+                self.poll_events()
+                try:
+                    self.session.execute(opcode, params)
+                except MtpError as exc:
+                    if exc.response in (
+                        Response.OPERATION_NOT_SUPPORTED,
+                        Response.PARAMETER_NOT_SUPPORTED,
+                        Response.INVALID_PARAMETER,
+                    ):
+                        self.session.execute(
+                            Op.INITIATE_CAPTURE, (0x00000000, 0x00000000)
+                        )
+                    elif exc.response == Response.NIKON_OUT_OF_FOCUS:
+                        raise CameraError(
+                            "shutter did not fire: autofocus could not lock. Focus "
+                            "first, or switch the lens to manual."
+                        ) from exc
+                    else:
+                        raise CameraError(
+                            f"shutter did not fire (0x{exc.response:04X})"
+                        ) from exc
+                return self._collect_capture_handles(wait)
+
+    #: How long the second of the two events is given, where waiting for it
+    #: is a courtesy rather than the point. Not used for the picture itself
+    #: when the picture is the only copy -- see _collect_capture_handles.
+    _EVENT_GRACE = 5.0
 
     def _collect_capture_handles(self, timeout: float) -> "list[int]":
+        """Wait for the shot to end, and for the picture it made.
+
+        Two separate events, and the camera does not send them together.
+        CaptureComplete says the exposure is over; ObjectAdded says the
+        picture exists and can be fetched. After a long exposure the first
+        arrives while the image is still being written into the buffer -- so
+        stopping at it is how a finished exposure ends up with nothing to show
+        for itself.
+        """
         handles: "list[int]" = []
+
+        def remember(code: int, param: int) -> None:
+            # A handle only once: shooting to SDRAM every picture is handle
+            # 0xFFFF0001, and taking it twice would download the one buffer
+            # twice and then free it twice over.
+            added = (Event.OBJECT_ADDED, Event.NIKON_OBJECT_ADDED_IN_SDRAM)
+            if code in added and param not in handles:
+                handles.append(param)
+
         deadline = time.monotonic() + timeout
         complete = False
-        while time.monotonic() < deadline and not complete:
+        while time.monotonic() < deadline:
             for code, param in self.poll_events():
-                if code in (Event.OBJECT_ADDED, Event.NIKON_OBJECT_ADDED_IN_SDRAM):
-                    handles.append(param)
-                elif code in (
+                remember(code, param)
+                if code in (
                     Event.CAPTURE_COMPLETE,
                     Event.NIKON_CAPTURE_COMPLETE_RECV_IN_SDRAM,
                 ):
                     complete = True
-            if not complete:
-                time.sleep(0.05)
-        if not complete:
+            if complete and handles:
+                # One more look before going, so a raw and the jpeg beside it
+                # are not split across two polls with the second one missed.
+                for code, param in self.poll_events():
+                    remember(code, param)
+                return handles
+            elif handles or (complete and self._save_to_card):
+                # Half the pair is in and the other is only tidiness now: the
+                # picture is already in hand, or the exposure is over and the
+                # file is on the card whatever handle does or does not turn
+                # up. Give it a moment rather than the rest of the budget.
+                #
+                # Deliberately not the case of a completion with no picture
+                # and no card. Then the buffer is the only copy there is, and
+                # the camera can call the exposure over with the dark frame it
+                # subtracts still to come -- a wait as long again as the
+                # shutter speed. The budget already covers that, so let it.
+                deadline = min(deadline, time.monotonic() + self._EVENT_GRACE)
+            time.sleep(0.05)
+        if not complete and not handles:
             # Leaving a capture outstanding stops the camera accepting the next
             # one, and can leave live view unable to restart until the body is
             # power cycled.
             self.session.try_execute(Op.NIKON_TERMINATE_CAPTURE)
+            # Said rather than passed over in silence: the shot may well still
+            # be coming, and the events for it will turn up in the camera's
+            # queue after this has given up on them.
+            raise CameraError(
+                f"the camera did not finish the shot within {timeout:.0f} "
+                "seconds. A long exposure with noise reduction takes twice "
+                "the shutter speed; if that is what this is, nothing is "
+                "wrong but the waiting."
+            )
+        if complete and not handles and not self._save_to_card:
+            # Nothing was written to a card either, so saying "no new file"
+            # and moving on would be losing the picture quietly.
+            raise CameraError(
+                "the camera finished the exposure but never offered the "
+                "picture, so there was nothing to fetch -- and with the card "
+                "switched off here, nothing was written to it either. Tick "
+                "\"Write to the camera's card\" to shoot this one again safely."
+            )
         return handles
 
     def poll_events(self) -> "list[tuple[int, int]]":
@@ -681,3 +1016,12 @@ class NikonCamera:
         """Fetch a captured image by handle, as (filename, bytes)."""
         info = self.session.object_info(handle)
         return info.filename, self.session.get_object(handle)
+
+    def release_from_sdram(self, handle: int) -> None:
+        """Drop a picture the body is holding in SDRAM, once it is safely down.
+
+        The next shot would overwrite it anyway; clearing it keeps the buffer
+        from being handed back a second time. Best effort -- a body without the
+        operation simply keeps it until it is replaced.
+        """
+        self.session.try_execute(Op.NIKON_DELETE_IMAGE_SDRAM, (int(handle),))

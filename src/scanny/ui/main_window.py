@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QScrollArea,
@@ -27,8 +28,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..camera.nikon import NikonCamera, Setting
+from .histogram import HistogramWidget
 from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES
 from .liveview import LiveViewWidget
+from .naming import DEFAULT_PREFIX, MAX_NUMBER, format_name
+from .navigator import NavigatorWidget
 from .trend import TrendGraph
 from .worker import CameraWorker
 
@@ -57,6 +61,10 @@ _FINE_INCREMENT = "minimum"
 #: in the middle of it. Small enough to be worth having over the whole frame,
 #: big enough to have some subject in it before it is dragged anywhere.
 _DEFAULT_MEASURE_AREA = (1 / 3, 1 / 3, 1 / 3, 1 / 3)
+
+#: How long a naming prefix may be. Long enough for any label worth typing,
+#: short enough that the path stays well inside what Windows will open.
+_MAX_PREFIX = 64
 
 #: What the camera delivers, near enough, for working out what integrating a
 #: given number of frames will cost in frame rate before it is switched on.
@@ -115,6 +123,7 @@ class MainWindow(QMainWindow):
     requestStopLiveView = Signal()
     requestAutofocus = Signal()
     requestMovePoint = Signal(float, float)
+    requestMovePointInFrame = Signal(float, float)
     requestToggleZoom = Signal()
     requestDriveFocus = Signal(int)
     requestZoom = Signal(int)
@@ -126,6 +135,8 @@ class MainWindow(QMainWindow):
     requestShutdown = Signal()
     requestResetZoom = Signal()
     requestExposurePreview = Signal(bool)
+    requestSaveToCard = Signal(bool)
+    requestShutterDelay = Signal(int)  # seconds, mirror up, before the shot
     requestPan = Signal(int, int)
     requestIntegration = Signal(bool, int)
     requestSharpness = Signal(bool)
@@ -133,6 +144,9 @@ class MainWindow(QMainWindow):
     requestSharpnessArea = Signal(object)  # (x, y, w, h) fractions, or None
     requestFineTune = Signal(int)  # the one increment to walk in
     requestHuntCancel = Signal()
+    #: Naming for downloaded pictures: on, the prefix, and the next number.
+    #: Sent whole on every change, since an override may touch any of them.
+    requestNaming = Signal(bool, str, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -147,6 +161,9 @@ class MainWindow(QMainWindow):
         self._sharpness_shown = 0.0
         self._hunting = False
         self._measure_area = _DEFAULT_MEASURE_AREA
+        # Set while the counter is being written into the box by the worker
+        # rather than by the user, so it is not mistaken for an override.
+        self._updating_naming = False
 
         self._build_ui()
         self._start_worker()
@@ -231,7 +248,9 @@ class MainWindow(QMainWindow):
         column.addWidget(self.camera_label)
 
         column.addWidget(self._build_live_view_box())
+        column.addWidget(self._build_navigator_box())
         column.addWidget(self._build_focus_box())
+        column.addWidget(self._build_histogram_box())
         column.addWidget(self._build_exposure_box())
         column.addWidget(self._build_capture_box())
         column.addStretch(1)
@@ -370,6 +389,58 @@ class MainWindow(QMainWindow):
             f"About {_SOURCE_FPS / frames:.1f} fps, with roughly "
             f"{frames ** 0.5:.1f}x less noise."
         )
+
+    def _build_navigator_box(self) -> QGroupBox:
+        """Where the magnified view sits in the frame, and a way to move it.
+
+        Next to the zoom controls, because that is what it is about: once the
+        view is magnified there is nothing on screen that says which part of
+        the frame is on screen, and the arrow keys pan without ever saying how
+        far there is left to go.
+        """
+        box = QGroupBox("Navigator")
+        layout = QVBoxLayout(box)
+
+        self.navigator = NavigatorWidget()
+        self.navigator.setToolTip(
+            "The whole frame, with the part on screen marked on it. Drag the "
+            "rectangle to move the view, or press anywhere to send it there."
+        )
+        self.navigator.viewCentreMoved.connect(self._on_view_centre_moved)
+        layout.addWidget(self.navigator)
+
+        hint = WrappedLabel(
+            "The picture here is the last whole frame the camera sent: while "
+            "you are magnified it cannot send the rest of it, so the picture "
+            "waits and only the rectangle moves."
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(hint)
+        return box
+
+    def _build_histogram_box(self) -> QGroupBox:
+        """The levels in the picture on screen, above the exposure controls.
+
+        Where it is is the point: it is read to decide what to do with the
+        controls immediately below it.
+        """
+        box = QGroupBox("Histogram")
+        layout = QVBoxLayout(box)
+
+        self.histogram = HistogramWidget()
+        self.histogram.setToolTip(
+            "How many pixels sit at each level, per channel, for the picture "
+            "on screen. The two end bins are left out of the height, so one "
+            "clipped highlight cannot flatten the rest of the curve; what is "
+            "clipped is written underneath instead."
+        )
+        layout.addWidget(self.histogram)
+
+        self.histogram_label = QLabel(self.histogram.describe())
+        self.histogram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.histogram_label.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.histogram_label)
+        return box
 
     def _build_focus_box(self) -> QGroupBox:
         box = QGroupBox("Focus")
@@ -640,9 +711,26 @@ class MainWindow(QMainWindow):
         self.af_before_shot = QCheckBox("Autofocus before shooting")
         layout.addWidget(self.af_before_shot)
 
+        self.save_to_card = QCheckBox("Write to the camera's card")
+        self.save_to_card.setToolTip(
+            "Off, the camera holds the picture in its own memory and hands it "
+            "straight to the computer -- no card needed, and nothing left on "
+            "one to clear out later. It is the same full-size file either way. "
+            "On, the shot is written to the card instead, and downloading it "
+            "afterwards becomes optional."
+        )
+        self.save_to_card.setChecked(
+            QSettings().value("capture/save_to_card", False, bool)
+        )
+        layout.addWidget(self.save_to_card)
+
         self.download_after_shot = QCheckBox("Download to computer")
         self.download_after_shot.setChecked(True)
         layout.addWidget(self.download_after_shot)
+        self._apply_card_coupling()
+        # Connected after the stored value is in place, so restoring it does
+        # not read as the user asking for anything.
+        self.save_to_card.toggled.connect(self._on_save_to_card_toggled)
 
         self.save_dir_label = WrappedLabel()
         self.save_dir_label.setStyleSheet("color: #888; font-size: 11px;")
@@ -652,11 +740,238 @@ class MainWindow(QMainWindow):
         choose.clicked.connect(self._choose_save_directory)
         layout.addWidget(choose)
 
+        layout.addWidget(self._build_naming())
+
+        layout.addWidget(self._build_shutter_delay())
+
         self.shoot_button = QPushButton("Take photo")
         self.shoot_button.setMinimumHeight(40)
         self.shoot_button.clicked.connect(self._shoot)
         layout.addWidget(self.shoot_button)
         return box
+
+    def _build_naming(self) -> QWidget:
+        """What downloaded pictures are called: a prefix and the next number.
+
+        Both are live, which is what makes them an override rather than a
+        setting: type over either between two shots and the next shot uses
+        what was typed, then carries on counting from there. Nothing has to be
+        switched off and on again, and there is no earlier sequence hiding
+        behind the override to come back.
+
+        The number shown is always the one the *next* shot will get, so the
+        same box is the readout: after each save the worker sends back where
+        the counter has reached, and this follows it.
+        """
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(4)
+
+        self.rename_downloads = QCheckBox("Number the files myself")
+        self.rename_downloads.setToolTip(
+            "Save each picture as the prefix and the next number instead of "
+            "under the camera's own name, so the folder comes out in the "
+            "order the pages were shot."
+        )
+        column.addWidget(self.rename_downloads)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.name_prefix = QLineEdit()
+        self.name_prefix.setMaxLength(_MAX_PREFIX)
+        self.name_prefix.setPlaceholderText("prefix")
+        self.name_prefix.setToolTip(
+            "The part before the number, exactly as typed -- the separator is "
+            "yours to include or leave out. The extension stays the camera's, "
+            "since it is what says whether the file is a NEF or a JPEG."
+        )
+        row.addWidget(self.name_prefix, 1)
+
+        self.name_number = QSpinBox()
+        self.name_number.setRange(1, MAX_NUMBER)
+        self.name_number.setToolTip(
+            "The number the next picture gets. Change it whenever you like: "
+            "counting carries on from whatever it is set to. A number a file "
+            "in the folder is already using is skipped, never overwritten."
+        )
+        row.addWidget(self.name_number, 0)
+        column.addLayout(row)
+
+        self.name_preview = WrappedLabel()
+        self.name_preview.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(self.name_preview)
+
+        settings = QSettings()
+        self.rename_downloads.setChecked(settings.value("save/rename", False, bool))
+        self.name_prefix.setText(str(settings.value("save/prefix", DEFAULT_PREFIX)))
+        self.name_number.setValue(self._stored_number())
+        self._apply_naming_enabled()
+        self._show_next_name()
+
+        # Connected once the stored values are in place, so restoring them
+        # does not read as an override being typed.
+        self.rename_downloads.toggled.connect(self._on_naming_changed)
+        self.name_prefix.textChanged.connect(self._on_naming_changed)
+        self.name_number.valueChanged.connect(self._on_naming_changed)
+        return holder
+
+    def _stored_number(self) -> int:
+        """Where the counter had reached when the program was last closed.
+
+        Remembered so that a scan spread over two sittings is one sequence:
+        the numbering the second session starts on is where the first one
+        stopped, and it is still the user's to type over.
+        """
+        try:
+            stored = int(QSettings().value("save/number", 1))
+        except (TypeError, ValueError):
+            return 1
+        return stored if 1 <= stored <= MAX_NUMBER else 1
+
+    def _apply_naming_enabled(self) -> None:
+        on = self.rename_downloads.isChecked()
+        self.name_prefix.setEnabled(on)
+        self.name_number.setEnabled(on)
+
+    def _show_next_name(self) -> None:
+        if self.rename_downloads.isChecked():
+            name = format_name(self.name_prefix.text(), self.name_number.value())
+            self.name_preview.setText(f"Next: {name} + the camera's extension")
+        else:
+            self.name_preview.setText("Keeping the names the camera gives.")
+
+    def _on_naming_changed(self) -> None:
+        """Hand an override to the worker, and remember it for the next run."""
+        self._apply_naming_enabled()
+        self._show_next_name()
+        if self._updating_naming:
+            return
+        settings = QSettings()
+        settings.setValue("save/rename", self.rename_downloads.isChecked())
+        settings.setValue("save/prefix", self.name_prefix.text())
+        settings.setValue("save/number", self.name_number.value())
+        self._request_naming()
+
+    def _request_naming(self) -> None:
+        self.requestNaming.emit(
+            self.rename_downloads.isChecked(),
+            self.name_prefix.text(),
+            self.name_number.value(),
+        )
+
+    @Slot(int)
+    def _on_next_number(self, number: int) -> None:
+        """Follow the counter once a shot has taken a number from it.
+
+        Guarded, because putting the value in the box is not the user typing
+        an override: sending it back would only hand the worker what it just
+        reported, and would stamp on a number typed while the picture was
+        still downloading.
+        """
+        self._updating_naming = True
+        try:
+            self.name_number.setValue(number)
+        finally:
+            self._updating_naming = False
+        QSettings().setValue("save/number", self.name_number.value())
+
+    def _build_shutter_delay(self) -> QWidget:
+        """The wait between the mirror lifting and the shutter firing.
+
+        Nikon's own exposure delay mode, driven from here for the shot and
+        handed back to the camera afterwards. What it is worth is spelled out
+        underneath: on a copy stand the mirror is the largest thing that moves,
+        and waiting for it to stop moving is free sharpness.
+        """
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("Mirror-up delay"))
+        self.shutter_delay = QComboBox()
+        self.shutter_delay.setToolTip(
+            "Lift the mirror, wait, and only then release the shutter, so the "
+            "vibration it made has died away before the exposure starts. This "
+            "is the camera's own exposure delay mode, set for each shot taken "
+            "from here and put back to whatever the camera had afterwards."
+        )
+        row.addWidget(self.shutter_delay, 1)
+        column.addLayout(row)
+
+        self.shutter_delay_hint = WrappedLabel()
+        self.shutter_delay_hint.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(self.shutter_delay_hint)
+
+        # What a D750 offers, until a camera says otherwise: the panel is built
+        # before anything is connected, and the control cannot be blank.
+        self._offer_shutter_delays(NikonCamera.SHUTTER_DELAYS, None)
+        self.shutter_delay.currentIndexChanged.connect(self._on_shutter_delay_changed)
+        return holder
+
+    def _offer_shutter_delays(self, delays, on_body) -> None:
+        """Offer exactly the delays the body takes, keeping the chosen one.
+
+        A body with no such setting sends nothing, and the control is disabled
+        rather than left offering a delay that would never happen.
+
+        Where the choice starts, on a camera never driven from here, is
+        whatever that camera is set to: this one arrived with three seconds on
+        it, and a scanning rig set up that way should not lose it just because
+        something else is now releasing the shutter. Once a delay has been
+        chosen here, that is what is remembered and used.
+        """
+        wanted = self._stored_shutter_delay()
+        if wanted is None:
+            wanted = 0 if on_body is None else int(on_body)
+        self.shutter_delay.blockSignals(True)
+        self.shutter_delay.clear()
+        for seconds in delays:
+            self.shutter_delay.addItem("Off" if not seconds else f"{seconds} s", seconds)
+        index = self.shutter_delay.findData(wanted)
+        self.shutter_delay.setCurrentIndex(max(index, 0))
+        self.shutter_delay.blockSignals(False)
+        self.shutter_delay.setEnabled(bool(delays))
+        # Whatever survived that -- the delay chosen here, or what the camera
+        # was already set to -- is what the worker is now told to use. Not
+        # stored, though: what is remembered between runs is what was chosen
+        # here, and a body that has no three seconds to offer today should not
+        # erase the three seconds that were asked for.
+        self._describe_shutter_delay()
+        self.requestShutterDelay.emit(self._chosen_shutter_delay())
+
+    def _stored_shutter_delay(self) -> "int | None":
+        """The delay chosen here last time, or None if none ever was."""
+        stored = QSettings().value("capture/shutter_delay", None)
+        try:
+            seconds = int(stored)
+        except (TypeError, ValueError):
+            return None
+        return seconds if seconds >= 0 else None
+
+    def _chosen_shutter_delay(self) -> int:
+        seconds = self.shutter_delay.currentData()
+        return 0 if seconds is None else int(seconds)
+
+    def _on_shutter_delay_changed(self) -> None:
+        seconds = self._chosen_shutter_delay()
+        QSettings().setValue("capture/shutter_delay", seconds)
+        self._describe_shutter_delay()
+        self.requestShutterDelay.emit(seconds)
+
+    def _describe_shutter_delay(self) -> None:
+        seconds = self._chosen_shutter_delay()
+        self.shutter_delay_hint.setText(
+            f"Each shot takes {seconds}s longer, and nothing moves in the "
+            "picture while it waits."
+            if seconds
+            else "The shutter fires as soon as it is asked to."
+            if self.shutter_delay.isEnabled()
+            else "This camera has no exposure delay mode."
+        )
 
     def _build_menu(self) -> None:
         camera_menu = self.menuBar().addMenu("&Camera")
@@ -707,6 +1022,7 @@ class MainWindow(QMainWindow):
         self.requestStopLiveView.connect(self.worker.stop_live_view)
         self.requestAutofocus.connect(self.worker.autofocus)
         self.requestMovePoint.connect(self.worker.move_point)
+        self.requestMovePointInFrame.connect(self.worker.move_point_in_frame)
         self.requestToggleZoom.connect(self.worker.toggle_zoom)
         self.requestZoom.connect(self.worker.set_zoom)
         self.requestZoomStep.connect(self.worker.step_zoom)
@@ -717,6 +1033,8 @@ class MainWindow(QMainWindow):
         self.requestShutdown.connect(self.worker.shutdown)
         self.requestResetZoom.connect(self.worker.reset_zoom)
         self.requestExposurePreview.connect(self.worker.set_exposure_preview)
+        self.requestSaveToCard.connect(self.worker.set_save_to_card)
+        self.requestShutterDelay.connect(self.worker.set_shutter_delay)
         self.requestPan.connect(self.worker.pan)
         self.requestIntegration.connect(self.worker.set_integration)
         self.requestSharpness.connect(self.worker.set_sharpness)
@@ -725,6 +1043,7 @@ class MainWindow(QMainWindow):
         self.requestFineTune.connect(self.worker.fine_tune)
         self.requestHuntCancel.connect(self.worker.cancel_hunt)
         self.requestDriveFocus.connect(self.worker.drive_focus)
+        self.requestNaming.connect(self.worker.set_naming)
 
         self.worker.connected.connect(self._on_connected)
         self.worker.disconnected.connect(self._on_disconnected)
@@ -737,6 +1056,9 @@ class MainWindow(QMainWindow):
         self.worker.sharpnessChanged.connect(self._on_sharpness)
         self.worker.huntChanged.connect(self._on_hunt_changed)
         self.worker.exposurePreviewChanged.connect(self._on_exposure_preview)
+        self.worker.saveToCardChanged.connect(self._on_save_to_card)
+        self.worker.shutterDelaysAvailable.connect(self._on_shutter_delays)
+        self.worker.nextNumber.connect(self._on_next_number)
         self.worker.status.connect(self.statusBar().showMessage)
         self.worker.failed.connect(self._on_failed)
 
@@ -755,6 +1077,9 @@ class MainWindow(QMainWindow):
         )
         self.requestSharpness.emit(self.measure_sharpness.isChecked())
         self._apply_measure_area()
+        self.requestSaveToCard.emit(self.save_to_card.isChecked())
+        self.requestShutterDelay.emit(self._chosen_shutter_delay())
+        self._request_naming()
 
     # -- slots -------------------------------------------------------------
 
@@ -764,13 +1089,13 @@ class MainWindow(QMainWindow):
         # Weight only, no colour: the window follows the system theme, and a
         # hardcoded light grey vanishes against a light background.
         self.camera_label.setStyleSheet("font-weight: 600;")
-        self.view.clear("Press Start live view")
+        self._clear_view("Press Start live view")
 
     @Slot()
     def _on_disconnected(self) -> None:
         self.camera_label.setText("No camera connected")
         self.camera_label.setStyleSheet("color: #888;")
-        self.view.clear("Not connected")
+        self._clear_view("Not connected")
 
     @Slot(bool)
     def _on_live_view_changed(self, active: bool) -> None:
@@ -779,8 +1104,19 @@ class MainWindow(QMainWindow):
         if active:
             self.view.setFocus()
         if not active:
-            self.view.clear("Live view stopped")
+            self._clear_view("Live view stopped")
             self.view.set_focus_state("idle")
+
+    def _clear_view(self, message: str) -> None:
+        """Take the picture away, and everything read off it with it.
+
+        A histogram or a navigator map left behind from the last session is
+        worse than an empty one: both look live, and neither is.
+        """
+        self.view.clear(message)
+        self.navigator.clear(message)
+        self.histogram.clear()
+        self.histogram_label.setText(self.histogram.describe())
 
     @Slot(int)
     def _on_zoom_changed(self, level: int) -> None:
@@ -800,7 +1136,18 @@ class MainWindow(QMainWindow):
         which case only the overlay and the level readout move.
         """
         self.view.show_frame(frame, image)
+        self.navigator.show_frame(frame, image)
+        self._on_frame_histogram(image)
         self._on_frame_level(frame)
+
+    def _on_frame_histogram(self, image) -> None:
+        """Count the levels in the picture, as often as the widget wants to.
+
+        It throttles itself, so the caption is only rewritten when there is
+        something new behind it.
+        """
+        if self.histogram.set_image(image):
+            self.histogram_label.setText(self.histogram.describe())
 
     def _on_frame_level(self, frame) -> None:
         """Show the level sensor, throttled -- 30 updates a second is unreadable."""
@@ -877,6 +1224,38 @@ class MainWindow(QMainWindow):
             f"{_reading(peak)}"
         )
 
+    def _on_save_to_card_toggled(self, enabled: bool) -> None:
+        QSettings().setValue("capture/save_to_card", enabled)
+        self._apply_card_coupling()
+        self.requestSaveToCard.emit(enabled)
+
+    @Slot(bool)
+    def _on_save_to_card(self, enabled: bool) -> None:
+        """Follow the camera, which may not have allowed what was asked of it."""
+        self.save_to_card.blockSignals(True)
+        self.save_to_card.setChecked(enabled)
+        self.save_to_card.blockSignals(False)
+        self._apply_card_coupling()
+
+    def _apply_card_coupling(self) -> None:
+        """With the card off, the picture only exists once it is downloaded."""
+        to_card = self.save_to_card.isChecked()
+        if not to_card:
+            self.download_after_shot.setChecked(True)
+        self.download_after_shot.setEnabled(to_card)
+        self.download_after_shot.setToolTip(
+            ""
+            if to_card
+            else "The camera is holding the picture in memory rather than "
+            "writing it to a card, and the next shot replaces it -- so it has "
+            "to come down to the computer."
+        )
+
+    @Slot(object, object)
+    def _on_shutter_delays(self, delays, on_body) -> None:
+        """The connected body's delays, which are not every body's."""
+        self._offer_shutter_delays(tuple(delays), on_body)
+
     @Slot(bool)
     def _on_exposure_preview(self, enabled: bool) -> None:
         self.exposure_preview.blockSignals(True)
@@ -941,6 +1320,11 @@ class MainWindow(QMainWindow):
     def _on_point_selected(self, nx: float, ny: float) -> None:
         if self._live:
             self.requestMovePoint.emit(nx, ny)
+
+    @Slot(float, float)
+    def _on_view_centre_moved(self, fx: float, fy: float) -> None:
+        if self._live:
+            self.requestMovePointInFrame.emit(fx, fy)
 
     @Slot()
     def _on_focus_requested(self) -> None:

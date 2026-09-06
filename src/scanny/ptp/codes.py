@@ -141,6 +141,14 @@ class Prop(IntEnum):
     STILL_CAPTURE_MODE = 0x5013
     FOCUS_METERING_MODE = 0x501C
 
+    #: Custom setting d4 on a D750: how long the body waits, mirror up,
+    #: before it releases the shutter. The value is the delay in seconds.
+    NIKON_EXPOSURE_DELAY_MODE = 0xD06A
+    #: Custom setting d5 on a D750: after an exposure of a second or longer
+    #: the body takes a second exposure of the same length with the shutter
+    #: closed, and subtracts that dark frame from the picture. It roughly
+    #: doubles how long a shot takes.
+    NIKON_LONG_EXPOSURE_NOISE_REDUCTION = 0xD06B
     NIKON_SHUTTER_SPEED = 0xD100
     NIKON_RECORDING_MEDIA = 0xD10B
     NIKON_EXPOSURE_INDEX_EX = 0xD149
