@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import comtypes
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
 
 from ..camera.nikon import CameraError, LiveViewFrame, NikonCamera
@@ -160,10 +160,22 @@ class CameraWorker(QObject):
 
     @Slot()
     def shutdown(self) -> None:
+        """Close the camera down, then end this thread's event loop.
+
+        The loop is ended from in here rather than from the window, because
+        quitting it from the outside races this slot: the exit flag is only
+        looked at between events, so a quit posted straight after the request
+        wins whenever the thread is busy with a frame grab, and the camera is
+        left with its mirror up and live view running after the program has
+        gone.
+        """
         self.disconnect_camera()
         if self._com_ready:
             comtypes.CoUninitialize()
             self._com_ready = False
+        thread = QThread.currentThread()
+        if thread is not None:
+            thread.quit()
 
     # -- connection --------------------------------------------------------
 

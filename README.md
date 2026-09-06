@@ -783,4 +783,3 @@ They need no camera attached.
 - don't write file to card, just to pc
 - histogram
 - preview of full frame, so i can orient when zoomed-in
-- stop live view on program exit

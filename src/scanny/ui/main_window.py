@@ -981,9 +981,17 @@ class MainWindow(QMainWindow):
     # -- shutdown ----------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Ask first and wait, rather than quitting the thread here: the worker
+        # has to put the camera's mirror back down and end live view before its
+        # event loop stops, or the body is left streaming after we are gone.
+        # The worker ends its own loop once it is done, so the wait returns as
+        # soon as the camera is closed.
         self.requestShutdown.emit()
-        self._thread.quit()
         if not self._thread.wait(5000):
-            self._thread.terminate()
-            self._thread.wait(1000)
+            # A camera command that never came back. Nothing left to do but
+            # stop waiting on it.
+            self._thread.quit()
+            if not self._thread.wait(1000):
+                self._thread.terminate()
+                self._thread.wait(1000)
         super().closeEvent(event)
