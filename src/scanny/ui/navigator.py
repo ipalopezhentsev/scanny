@@ -20,10 +20,11 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ..camera.nikon import LiveViewFrame
+from .orientation import Orientation
 
 __all__ = ["NavigatorWidget"]
 
@@ -40,6 +41,11 @@ _WHOLE = 1.01
 #: one per mouse move would queue up work the drag has already made obsolete.
 _MIN_INTERVAL = 0.1
 
+#: How big the rings marking the measured points are drawn here. Smaller than
+#: the ones on the picture: this is a thumbnail, and the ring is only being
+#: asked to say where in the frame the point is, not to be aimed at.
+_POINT_RADIUS = 6
+
 #: How tall the pane is. Fixed rather than derived from the frame's aspect,
 #: because a height that follows the width would make the sidebar's own layout
 #: depend on it -- the picture is letterboxed inside instead.
@@ -47,7 +53,14 @@ _HEIGHT = 168
 
 
 class NavigatorWidget(QWidget):
-    """The whole frame, the part of it on screen, and a handle to move it by."""
+    """The whole frame, the part of it on screen, and a handle to move it by.
+
+    Shown the same way round as the image is -- see
+    :mod:`scanny.ui.orientation`. It has to be: the two are read together, and
+    a map that disagrees with the picture about which way is up turns dragging
+    the rectangle into a puzzle. The rectangle and the drag are kept in the
+    frame's own coordinates, so only the drawing and the pointer change.
+    """
 
     #: Where the middle of the magnified view should go, in fractions of the
     #: whole frame. Not of the displayed image: the whole point of this widget
@@ -61,7 +74,11 @@ class NavigatorWidget(QWidget):
         # It is dragged, not typed into: it must never take the keyboard away
         # from the image.
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # The last whole frame as it arrived, and as it is shown; see
+        # LiveViewWidget for why both are kept.
+        self._source: "QImage | None" = None
         self._whole: "QPixmap | None" = None
+        self._orientation = Orientation()
         self._crop = (0.0, 0.0, 1.0, 1.0)
         self._target = QRect()
         self._dragging = False
@@ -69,6 +86,9 @@ class NavigatorWidget(QWidget):
         self._pending: "tuple[float, float] | None" = None
         self._sent_at = 0.0
         self._placeholder = "Not connected"
+        # The places being measured, in fractions of the whole frame -- which
+        # is the coordinate this widget is already in.
+        self._points: "list[tuple[float, float, int, QColor]]" = []
 
     # -- content -----------------------------------------------------------
 
@@ -82,7 +102,8 @@ class NavigatorWidget(QWidget):
         """
         self._crop = frame.crop_normalised
         if not image.isNull() and frame.magnification <= _WHOLE:
-            self._whole = QPixmap.fromImage(image)
+            self._source = image
+            self._redraw_picture()
         # A frame arriving after the drag has ended is the camera's answer to
         # it. Whether it landed exactly where the rectangle was let go or not,
         # it is now the truth, and holding the drawn rectangle anywhere else
@@ -92,11 +113,42 @@ class NavigatorWidget(QWidget):
         self.update()
 
     def clear(self, message: str = "Live view stopped") -> None:
+        self._source = None
         self._whole = None
         self._crop = (0.0, 0.0, 1.0, 1.0)
         self._pending = None
         self._dragging = False
         self._placeholder = message
+        self.update()
+
+    def set_orientation(self, orientation: Orientation) -> None:
+        """Show the map the same way round the picture is being shown."""
+        if orientation == self._orientation:
+            return
+        self._orientation = orientation
+        self._redraw_picture()
+        self.update()
+
+    def _redraw_picture(self) -> None:
+        self._whole = (
+            None
+            if self._source is None
+            else QPixmap.fromImage(self._orientation.apply(self._source))
+        )
+
+    def set_points(self, points) -> None:
+        """Mark the places being measured: (x, y, number, colour) each.
+
+        All of them, whatever the live view is showing, and that is the whole
+        reason they are here. Magnified onto one point the others are off
+        screen entirely, and this is the only place left that can say where
+        they went -- which matters most exactly then, since a scan magnified
+        onto each point in turn is the one that cannot show them together.
+        """
+        self._points = [
+            (float(x), float(y), int(number), QColor(colour))
+            for x, y, number, colour in points
+        ]
         self.update()
 
     @property
@@ -144,6 +196,44 @@ class NavigatorWidget(QWidget):
         painter.setPen(QPen(_RECT, 2))
         painter.drawRect(box)
 
+        if self._points:
+            self._draw_points(painter)
+
+    def _draw_points(self, painter: QPainter) -> None:
+        """The places being measured, numbered, over the whole frame.
+
+        Drawn after the dimming and over it, so that a point outside the
+        magnified view is still legible: being outside it is exactly what
+        someone is looking here to find out.
+        """
+        font = QFont(painter.font())
+        font.setPointSizeF(max(7.0, font.pointSizeF() - 1))
+        font.setBold(True)
+        painter.setFont(font)
+        for x, y, number, colour in self._points:
+            ring = QRect(0, 0, _POINT_RADIUS * 2, _POINT_RADIUS * 2)
+            ring.moveCenter(self._at(x, y))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 0, 160), 3))
+            painter.drawEllipse(ring)
+            painter.setPen(QPen(colour, 1))
+            painter.drawEllipse(ring)
+            painter.setPen(colour)
+            painter.drawText(ring, Qt.AlignmentFlag.AlignCenter, str(number))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _at(self, x: float, y: float) -> QPoint:
+        """A place in the frame as a pixel on the widget.
+
+        Through the arrangement, like every other overlay: the points arrive in
+        the frame's coordinates and the map under them is drawn turned.
+        """
+        vx, vy = self._orientation.to_view(x, y)
+        return QPoint(
+            self._target.x() + int(vx * self._target.width()),
+            self._target.y() + int(vy * self._target.height()),
+        )
+
     def _fitted_rect(self) -> QRect:
         """The largest centred rect of the frame's aspect that fits the widget."""
         assert self._whole is not None
@@ -155,7 +245,10 @@ class NavigatorWidget(QWidget):
         return QRect((self.width() - w) // 2, (self.height() - h) // 2, w, h)
 
     def _crop_rect(self) -> QRectF:
-        x, y, w, h = self.crop
+        # The rectangle is kept in the frame's coordinates and turned only for
+        # drawing, so the arithmetic that clamps and drags it never has to know
+        # which way round the map is being shown.
+        x, y, w, h = self._orientation.rect_to_view(self.crop)
         return QRectF(
             self._target.x() + x * self._target.width(),
             self._target.y() + y * self._target.height(),
@@ -251,6 +344,11 @@ class NavigatorWidget(QWidget):
 
         Dragging passes *clamped*: the pointer leaving the picture partway
         through a drag should pin the rectangle to the edge, not abandon it.
+
+        Clamped on the screen's axes before being turned back, not after: the
+        edge the pointer has gone past is a screen edge, and clamping in the
+        frame's coordinates instead would pin the rectangle to whichever edge
+        that happens to be once the picture is turned.
         """
         if self._target.isEmpty():
             return None
@@ -258,4 +356,6 @@ class NavigatorWidget(QWidget):
             return None
         fx = (point.x() - self._target.x()) / self._target.width()
         fy = (point.y() - self._target.y()) / self._target.height()
-        return (min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0))
+        return self._orientation.from_view(
+            min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)
+        )

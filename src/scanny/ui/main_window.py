@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from PySide6.QtCore import (
     QEvent,
@@ -41,15 +42,35 @@ from PySide6.QtWidgets import (
 )
 
 from ..camera.nikon import NikonCamera, Setting
+from .depth import LEVELS, as_steps_image, colourise, ramp_colour
+from .depthview import DepthView
 from .histogram import HistogramWidget
 from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES, source_fps
 from .liveview import LiveViewWidget
 from .naming import DEFAULT_PREFIX, MAX_NUMBER, format_name
 from .navigator import NavigatorWidget
+from .orientation import Orientation
+from .points import BOX, MAX_POINTS, MIN_BOX, Point, ordering, summarise
 from .trend import TrendGraph
 from .worker import _FRAME_INTERVAL_MS, CameraWorker
 
 __all__ = ["MainWindow", "WrappedLabel"]
+
+
+def _stored_int(
+    settings: QSettings, key: str, default: int, low: int, high: int
+) -> int:
+    """A remembered number, or the default when it is missing or out of range.
+
+    Settings come back as whatever was written last, which after an upgrade
+    may be a value the control no longer offers; a spin box given one of those
+    silently clamps and then saves the clamp.
+    """
+    try:
+        value = int(settings.value(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if low <= value <= high else default
 
 
 def _reading(value: float) -> str:
@@ -69,6 +90,16 @@ _SIDEBAR_WIDTH = 310
 #: lens -- and making the walk finer or coarser is a matter of changing what
 #: "minimum" means.
 _FINE_INCREMENT = "minimum"
+
+#: The grids the depth map offers, coarsest first. Level numbers are the
+#: pyramid's own; see :mod:`scanny.ui.depth`.
+#: How near a ctrl-click has to be to a point already placed before it means
+#: "take that one away" rather than "put another one here". The same reach
+#: the picture uses for its tooltips, so what you can hover is what you can
+#: remove.
+_POINT_REACH = 0.05
+
+_DEPTH_DETAIL = (("Coarse", 0), ("Medium", 1), ("Fine", LEVELS - 1))
 
 #: Where a freshly switched-on measurement area starts: a third of the frame,
 #: in the middle of it. Small enough to be worth having over the whole frame,
@@ -209,6 +240,19 @@ class MainWindow(QMainWindow):
     requestSharpnessArea = Signal(object)  # (x, y, w, h) fractions, or None
     requestFineTune = Signal(int)  # the one increment to walk in
     requestHuntCancel = Signal()
+    #: Sweep focus and map the depth of the scene: stops per pass, how many
+    #: passes, the smallest step this lens answers to, and whether to cover
+    #: only the stretch the last map found something in.
+    requestDepthMap = Signal(int, int, int, bool)
+    requestDepthCancel = Signal()
+    requestDepthDetail = Signal(int)  # which grid to draw the map at
+    #: The places on the picture to be measured, and how wide a box to read
+    #: around each. Sent whole on every change, since either may move.
+    requestFocusPoints = Signal(object, float)
+    #: Measure them: stops per pass, passes, the lens minimum, and whether to
+    #: cover only what the last scan found.
+    requestPointScan = Signal(int, int, int, bool, bool, int)
+    requestPointCancel = Signal()
     #: Naming for downloaded pictures: on, the prefix, and the next number.
     #: Sent whole on every change, since an override may touch any of them.
     requestNaming = Signal(bool, str, int)
@@ -229,9 +273,27 @@ class MainWindow(QMainWindow):
         self._sharpness_shown = 0.0
         self._hunting = False
         self._measure_area = _DEFAULT_MEASURE_AREA
+        self._mapping = False
+        self._depth_map = None
+        # The places someone ctrl-clicked, and what the last scan made of
+        # them. The points outlive a scan; the findings do not.
+        #
+        # Fractions of the **whole sensor frame**, not of the picture on
+        # screen: that is what keeps a point on the thing it was put on when
+        # the view is magnified. See scanny.ui.points.Point.
+        self._points: "list[tuple[float, float]]" = []
+        # What a measured position is counted from, which the magnified scan
+        # changes -- it never parks, so it has no near stop to count from.
+        self._points_datum = "the near stop"
+        self._found = None
+        self._scanning = False
         # Set while the counter is being written into the box by the worker
         # rather than by the user, so it is not mistaken for an override.
         self._updating_naming = False
+        # Which way round the picture is shown. Restored before anything is
+        # built, because the window opens at the shape of a frame and a rig
+        # mounted on its side is showing a portrait one.
+        self._orientation = self._stored_orientation()
 
         self._build_ui()
         self._restore_geometry()
@@ -258,10 +320,11 @@ class MainWindow(QMainWindow):
         screen = self.screen() or QApplication.primaryScreen()
         room = screen.availableGeometry() if screen else QRect(0, 0, 1280, 800)
         beside, above = self._chrome()
+        aspect = self._frame_aspect()
         picture_h = room.height() * _SCREEN_SHARE - above
         widest = room.width() * _SCREEN_SHARE - beside
-        if picture_h * _LIVE_VIEW_ASPECT > widest:
-            picture_h = widest / _LIVE_VIEW_ASPECT
+        if picture_h * aspect > widest:
+            picture_h = widest / aspect
         # Two floors the window cannot open under: the height the pinned panes
         # give the right-hand column, and the width the image insists on. Both
         # are answered in the picture's height, so that whichever of them wins
@@ -271,10 +334,20 @@ class MainWindow(QMainWindow):
         picture_h = max(
             picture_h,
             smallest.height() - above,
-            (smallest.width() - beside) / _LIVE_VIEW_ASPECT,
+            (smallest.width() - beside) / aspect,
         )
-        return QSize(
-            round(picture_h * _LIVE_VIEW_ASPECT + beside), round(picture_h + above)
+        return QSize(round(picture_h * aspect + beside), round(picture_h + above))
+
+    def _frame_aspect(self) -> float:
+        """The shape a picture is *shown* in, the view transform included.
+
+        A quarter turn swaps the frame's two sides, so a camera mounted on its
+        side wants a portrait window. Opening at the sensor's own shape would
+        put black strips down the sides that this whole calculation exists to
+        start at nothing.
+        """
+        return (
+            1 / _LIVE_VIEW_ASPECT if self._orientation.swaps_axes else _LIVE_VIEW_ASPECT
         )
 
     def _chrome(self) -> "tuple[int, int]":
@@ -298,6 +371,9 @@ class MainWindow(QMainWindow):
     # -- construction ------------------------------------------------------
 
     def _build_ui(self) -> None:
+        # Before the sidebar, because the tick box in it and the menu item are
+        # two faces of the same action and the panel is built first.
+        self._build_view_actions()
         self.view = LiveViewWidget()
         self.view.pointSelected.connect(self._on_point_selected)
         self.view.focusRequested.connect(self._on_focus_requested)
@@ -308,6 +384,7 @@ class MainWindow(QMainWindow):
         self.view.panStepped.connect(self.requestPan)
         self.view.focusStepped.connect(self._step_focus)
         self.view.measureAreaSelected.connect(self._on_measure_area_selected)
+        self.view.pointPlaced.connect(self._on_point_placed)
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -335,6 +412,43 @@ class MainWindow(QMainWindow):
         self.fps_label.setStyleSheet("color: #888;")
         self.statusBar().addPermanentWidget(self.fps_label)
         self._build_menu()
+        # Last, once all three panes and both controls exist: this is what
+        # puts the restored arrangement on the screen.
+        self._apply_orientation(self._orientation)
+
+    def _build_view_actions(self) -> None:
+        """The menu items for the view transform, and their shortcuts.
+
+        Chorded rather than bare letters. A bare I or R would be a window
+        shortcut, and window shortcuts are answered before the widget with the
+        keyboard sees them -- which would make the naming prefix impossible to
+        type an "r" into.
+        """
+        self.invert_action = QAction("&Invert colours", self)
+        self.invert_action.setCheckable(True)
+        self.invert_action.setShortcut(QKeySequence("Ctrl+I"))
+        self.invert_action.triggered.connect(self._on_invert_toggled)
+
+        self._view_actions = []
+        for label, shortcut, act in (
+            ("Rotate &right", "Ctrl+R", lambda: self._turn_view(1)),
+            ("Rotate &left", "Ctrl+Shift+R", lambda: self._turn_view(-1)),
+            ("Mirror left-right", "Ctrl+H", lambda: self._flip_view(False)),
+            ("Mirror top-bottom", "Ctrl+Shift+H", lambda: self._flip_view(True)),
+            # A separator's worth of distance from the four that compose: this
+            # is the one that throws the composition away.
+            (None, "", None),
+            ("Reset rotation and mirroring", "", self._reset_view_geometry),
+        ):
+            if label is None:
+                action = QAction(self)
+                action.setSeparator(True)
+            else:
+                action = QAction(label, self)
+                if shortcut:
+                    action.setShortcut(QKeySequence(shortcut))
+                action.triggered.connect(lambda _checked=False, a=act: a())
+            self._view_actions.append(action)
 
     def _build_right_column(self) -> QWidget:
         """The panes that stay put, above the controls that scroll.
@@ -402,7 +516,10 @@ class MainWindow(QMainWindow):
         column.addWidget(self.camera_label)
 
         column.addWidget(self._build_live_view_box())
+        column.addWidget(self._build_view_box())
         column.addWidget(self._build_focus_box())
+        column.addWidget(self._build_points_box())
+        column.addWidget(self._build_depth_box())
         column.addWidget(self._build_exposure_box())
         column.addWidget(self._build_capture_box())
         column.addStretch(1)
@@ -459,6 +576,78 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.exposure_preview)
 
         layout.addWidget(self._build_integration())
+        return box
+
+    def _build_view_box(self) -> QGroupBox:
+        """Which way round the picture is shown, and whether it is inverted.
+
+        A group of its own rather than more rows under Live view, because
+        these are the only controls in the panel that change nothing behind
+        the screen. A copy stand is built the way the room allows -- the body
+        on its side because that is how the frame fits the film, the film
+        emulsion-towards the lens because that is the way round it lies flat
+        -- and every one of those is a mismatch between what the sensor reads
+        and what a person is trying to look at. Nothing here touches the
+        camera, the focus coordinates, the readings or the saved picture.
+        """
+        box = QGroupBox("View")
+        column = QVBoxLayout(box)
+
+        self.invert_colours = QCheckBox("Invert colours")
+        self.invert_colours.setToolTip(
+            "Show the complement of what the camera sends, so a negative can "
+            "be judged as the picture it is going to be rather than as its "
+            "opposite. A straight inversion and nothing more: colour negative "
+            "carries an orange mask, so the result comes out cold until the "
+            "white balance is set for the light coming through the film."
+        )
+        self.invert_colours.toggled.connect(self._on_invert_toggled)
+        column.addWidget(self.invert_colours)
+
+        # Turns and mirrors are buttons and not tick boxes because they
+        # compose rather than switch: two mirrors are not a doubly mirrored
+        # picture, they are a picture turned through 180 degrees, and a pair of
+        # tick boxes cannot say that. Each button does the plain thing to what
+        # is on screen at the moment it is pressed; Orientation works out what
+        # arrangement that leaves.
+        #
+        # One to a row, and spelled out. Two to a row is the tempting layout
+        # and there is not the width for it: at half the panel every one of
+        # these labels is elided, and "Mirror left-ri..." on a control whose
+        # whole job is to say which axis it works in is worse than the row it
+        # saves.
+        for label, act in (
+            ("Rotate left", lambda: self._turn_view(-1)),
+            ("Rotate right", lambda: self._turn_view(1)),
+            ("Mirror left-right", lambda: self._flip_view(False)),
+            ("Mirror top-bottom", lambda: self._flip_view(True)),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(act)
+            column.addWidget(button)
+
+        self.reset_view_button = QPushButton("Reset the way up")
+        self.reset_view_button.setToolTip(
+            "Back to the way the camera sends the frame, turns and mirrors "
+            "both. Leaves the colours alone: inverting is its own switch above."
+        )
+        self.reset_view_button.clicked.connect(self._reset_view_geometry)
+        column.addWidget(self.reset_view_button)
+
+        self.orientation_label = WrappedLabel()
+        self.orientation_label.setToolTip(
+            "What is being done to the picture on its way to the screen."
+        )
+        column.addWidget(self.orientation_label)
+
+        hint = WrappedLabel(
+            "The image, the navigator and the depth map all follow. The "
+            "histogram, the readings and the pictures the camera saves do "
+            "not: this changes what you are looking at, not what is measured "
+            "or recorded."
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(hint)
         return box
 
     def _build_integration(self) -> QWidget:
@@ -525,6 +714,65 @@ class MainWindow(QMainWindow):
         self.integrate_frames.valueChanged.connect(self._on_integration_changed)
         self.deduplicate.toggled.connect(self._on_deduplicate_changed)
         return holder
+
+    # -- which way round the picture is shown -------------------------------
+
+    def _stored_orientation(self) -> Orientation:
+        """What was left set last time, or the camera's own way up."""
+        settings = QSettings()
+        try:
+            turns = int(settings.value("view/turns", 0)) % 4
+        except (TypeError, ValueError):
+            turns = 0
+        return Orientation(
+            turns=turns,
+            mirrored=bool(settings.value("view/mirrored", False, bool)),
+            inverted=bool(settings.value("view/inverted", False, bool)),
+        )
+
+    def _turn_view(self, steps: int) -> None:
+        self._apply_orientation(self._orientation.turned(steps))
+
+    def _flip_view(self, vertical: bool) -> None:
+        self._apply_orientation(self._orientation.flipped(vertical))
+
+    def _reset_view_geometry(self) -> None:
+        """Back to the camera's way up, with the inversion left as it is."""
+        self._apply_orientation(Orientation(inverted=self._orientation.inverted))
+
+    def _on_invert_toggled(self, inverted: bool) -> None:
+        self._apply_orientation(self._orientation.with_inversion(inverted))
+
+    def _apply_orientation(self, orientation: Orientation) -> None:
+        """Take the new arrangement and put every pane and control on it.
+
+        One way in and one way out: whatever changed it -- a button, the menu,
+        a shortcut, or the settings at startup -- lands here, and the controls
+        are then set *from* the arrangement rather than each of them tracking
+        it themselves. Two routes to the same picture cannot leave the tick
+        box, the menu and the readout disagreeing about what is being shown.
+        """
+        self._orientation = orientation
+        settings = QSettings()
+        settings.setValue("view/turns", orientation.turns)
+        settings.setValue("view/mirrored", orientation.mirrored)
+        settings.setValue("view/inverted", orientation.inverted)
+
+        self.view.set_orientation(orientation)
+        self.navigator.set_orientation(orientation)
+        self.depth_view.set_orientation(orientation)
+        # The histogram is deliberately not on that list. It is read to judge
+        # exposure and clipping in what the camera is recording, and inverting
+        # it would report a blown highlight as a blocked shadow -- the one
+        # thing the readout is there to catch, said backwards.
+
+        self.invert_colours.blockSignals(True)
+        self.invert_colours.setChecked(orientation.inverted)
+        self.invert_colours.blockSignals(False)
+        # triggered, not toggled, is what the menu item is connected to, so
+        # ticking it here cannot come back round as another request.
+        self.invert_action.setChecked(orientation.inverted)
+        self.orientation_label.setText(orientation.describe())
 
     def _on_deduplicate_changed(self, enabled: bool) -> None:
         QSettings().setValue("liveview/deduplicate", enabled)
@@ -809,6 +1057,581 @@ class MainWindow(QMainWindow):
         self._show_sharpness(0.0, 0.0)
         self.requestSharpness.emit(enabled)
         self._apply_measure_area()
+
+    def _build_points_box(self) -> QGroupBox:
+        """How far apart, in focus, are a few places you point at.
+
+        The depth map's question asked of five boxes instead of two thousand
+        zones, which is what makes it answerable: the boxes are large, and they
+        have something in them because a person looked before clicking.
+        """
+        box = QGroupBox("Distance between points")
+        column = QVBoxLayout(box)
+        column.setSpacing(4)
+
+        self.points_hint = WrappedLabel(
+            "Ctrl-click the picture to put a point where you want it measured, "
+            f"up to {MAX_POINTS}. Ctrl-click one again to take it away. Points "
+            f"stick to the sensor, so place them on the whole frame and they "
+            f"stay on the same subject however far you magnify."
+        )
+        self.points_hint.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(self.points_hint)
+
+        self.points_result = WrappedLabel("")
+        self.points_result.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.points_result.setToolTip(
+            "The points in order, nearest focus first, and how many drive steps "
+            "each is behind the nearest. Hover a point on the picture for the "
+            "whole of what was found there."
+        )
+        column.addWidget(self.points_result)
+
+        settings = QSettings()
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(6)
+        form.setVerticalSpacing(4)
+
+        self.points_box_size = QSpinBox()
+        self.points_box_size.setRange(int(MIN_BOX * 100), 40)
+        self.points_box_size.setSuffix("%")
+        self.points_box_size.setValue(
+            _stored_int(settings, "points/box", int(BOX * 100), int(MIN_BOX * 100), 40)
+        )
+        self.points_box_size.setToolTip(
+            "How much of the picture is read around each point, across. Wide "
+            "enough to hold some subject, narrow enough that two points do not "
+            "read the same thing. The box is square on screen, so this is its "
+            "width as a fraction of the frame's."
+        )
+        self.points_box_size.valueChanged.connect(self._on_points_changed)
+        self.points_box_size.editingFinished.connect(self.view.setFocus)
+        form.addRow("Box", self.points_box_size)
+
+        self.points_stops = QSpinBox()
+        self.points_stops.setRange(8, 200)
+        self.points_stops.setValue(_stored_int(settings, "points/stops", 40, 8, 200))
+        self.points_stops.setToolTip(
+            "How many places along the travel the sweep stops to read every "
+            "point. All of them are read off the same frame, so this is the "
+            "whole of what a scan costs -- about half a second a stop."
+        )
+        self.points_stops.editingFinished.connect(self.view.setFocus)
+        form.addRow("Stops per pass", self.points_stops)
+
+        self.points_passes = QSpinBox()
+        self.points_passes.setRange(1, 6)
+        self.points_passes.setValue(_stored_int(settings, "points/passes", 3, 1, 6))
+        self.points_passes.setToolTip(
+            "How many times it comes back over the stretch the last pass found "
+            "the points in, each time in a finer step. The magnified scan is "
+            "one pass by construction: its bracket is already fine, and a "
+            "second pass would have to reverse the lens."
+        )
+        self.points_passes.editingFinished.connect(self.view.setFocus)
+        form.addRow("Passes", self.points_passes)
+
+        self.points_around = QSpinBox()
+        self.points_around.setRange(20, 4000)
+        self.points_around.setSingleStep(50)
+        self.points_around.setSuffix(" steps")
+        self.points_around.setValue(
+            _stored_int(settings, "points/around", 400, 20, 4000)
+        )
+        self.points_around.setToolTip(
+            "How far either side of where autofocus landed the magnified scan "
+            "sweeps. It has to clear two things: how far apart in focus the "
+            "points really are, and the play in the focus gearing, which the "
+            "backing-off has to take up before the sweep starts. Too small and "
+            "the far points fall outside the bracket -- the sweep will drive on "
+            "to reach them, but a point nearer than the first one cannot be "
+            "reached at all without starting again."
+        )
+        self.points_around.editingFinished.connect(self.view.setFocus)
+        form.addRow("Around AF", self.points_around)
+        column.addLayout(form)
+
+        self.points_magnified = QCheckBox("Magnify onto each point")
+        self.points_magnified.setChecked(
+            settings.value("points/magnified", True, bool)
+        )
+        self.points_magnified.setToolTip(
+            "Measure at the body's strongest magnification, panning to each "
+            "point in turn at every stop of the sweep.\n\n"
+            "This is what makes a small difference readable: a step of focus "
+            "moves the picture in proportion to how much the view is "
+            "magnified, so two things a hundred steps apart that are lost in "
+            "the grain on a whole frame are obvious at 18.8x. Focus is not "
+            "touched while the camera pans, so every reading at a stop still "
+            "belongs to that one position on one drive -- which is what makes "
+            "the points comparable.\n\n"
+            "It starts by autofocusing on point 1 and sweeps a bracket around "
+            "that rather than parking and sweeping the whole travel, so the "
+            "positions it reports are counted from where the bracket began. "
+            "The gaps between the points, which are the answer, are the same "
+            "either way.\n\n"
+            "Turn it off to sweep the whole travel on the frame as it is: "
+            "faster, and the only thing to do when the points have no edges "
+            "for autofocus to lock onto."
+        )
+        self.points_magnified.toggled.connect(self._on_points_magnified)
+        column.addWidget(self.points_magnified)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        self.points_button = QPushButton("Measure points")
+        self.points_button.setToolTip(
+            "Sweep focus one way, once, reading every point off the same "
+            "stops. That is what makes the answers comparable: one pass "
+            "driving one way puts every reading in one coordinate, where five "
+            "separate hunts would each finish wherever the play in the gearing "
+            "left them."
+        )
+        self.points_button.clicked.connect(self._toggle_point_scan)
+        buttons.addWidget(self.points_button, 1)
+
+        self.points_clear = QPushButton("Clear")
+        self.points_clear.setToolTip("Take all the points off the picture")
+        self.points_clear.clicked.connect(self._clear_points)
+        buttons.addWidget(self.points_clear)
+        column.addLayout(buttons)
+
+        self._on_points_magnified(self.points_magnified.isChecked())
+        self._show_points()
+        return box
+
+    # -- placing and showing them ------------------------------------------
+
+    def _on_points_magnified(self, magnified: bool) -> None:
+        """Only one of the two shapes of scan is being described at a time."""
+        QSettings().setValue("points/magnified", magnified)
+        self.points_around.setEnabled(magnified)
+        self.points_passes.setEnabled(not magnified)
+
+    @property
+    def _crop(self) -> "tuple[float, float, float, float]":
+        """Which part of the frame is on screen, as the points' coordinates.
+
+        The whole of it when there is no frame yet, so that a click before the
+        first one arrives still means what it looks like it means.
+        """
+        frame = self.view.frame
+        return (0.0, 0.0, 1.0, 1.0) if frame is None else frame.crop_normalised
+
+    @Slot(float, float)
+    def _on_point_placed(self, x: float, y: float) -> None:
+        """A ctrl-click: add a point here, or take away the one already here.
+
+        In fractions of the picture on screen, which is all a click can be,
+        and stored in fractions of the sensor's frame, which is the only
+        coordinate that survives magnifying. Taking one away is judged on
+        screen rather than on the sensor, so that what can be clicked off is
+        exactly the ring that is under the pointer at whatever zoom.
+        """
+        left, top, width, height = self._crop
+        for index, (px, py) in enumerate(self._points):
+            seen = Point(px, py).seen_in((left, top, width, height))
+            if seen is not None and Point(*seen).near(x, y, _POINT_REACH):
+                del self._points[index]
+                self._on_points_changed()
+                return
+        if len(self._points) >= MAX_POINTS:
+            self.statusBar().showMessage(
+                f"That is as many points as it will measure at once "
+                f"({MAX_POINTS}). Ctrl-click one to take it away first.",
+                6000,
+            )
+            return
+        self._points.append((left + x * width, top + y * height))
+        self._on_points_changed()
+
+    def _clear_points(self) -> None:
+        self._points = []
+        self._on_points_changed()
+
+    def _on_points_changed(self) -> None:
+        """Tell the worker, and forget what the last scan said about them.
+
+        A point that moved is a different question, and a box that changed size
+        is a different one again: the readings either side of that are of
+        different parts of the picture.
+        """
+        QSettings().setValue("points/box", self.points_box_size.value())
+        self._found = None
+        self.requestFocusPoints.emit(
+            list(self._points), self.points_box_size.value() / 100.0
+        )
+        self._show_points()
+
+    def _show_points(self) -> None:
+        """Draw them on the picture and write the order out underneath."""
+        off = self._draw_points()
+        found = self._found
+        self.points_result.setText(
+            ordering(found) if found else
+            ("Ctrl-click at least two points, then measure" if len(self._points) < 2
+             else f"{len(self._points)} points placed, not yet measured")
+            + (
+                f" ({off} off screen at this magnification)"
+                if off and not found
+                else ""
+            )
+        )
+        self.points_button.setEnabled(len(self._points) >= 2 or self._scanning)
+        self.points_clear.setEnabled(bool(self._points) and not self._scanning)
+
+    def _draw_points(self) -> int:
+        """Put them on the picture and on the navigator; answer how many are off.
+
+        Called for every frame, because where a point falls on the picture is
+        a property of the frame and not of the point: the crop moves whenever
+        the view is magnified or panned, and a ring left where the last crop
+        put it is a ring pointing at the wrong thing.
+
+        The navigator gets all of them whatever the crop is doing, which is the
+        whole use of it here -- magnified, it is the only place the points that
+        are off screen can be seen at all.
+        """
+        found = self._found
+        crop = self._crop
+        drawn, whole, off = [], [], 0
+        for index, (x, y) in enumerate(self._points):
+            answer = found[index] if found is not None and index < len(found) else None
+            colour = self._point_colour(answer, found)
+            whole.append((x, y, index + 1, colour))
+            seen = Point(x, y).seen_in(crop)
+            if seen is None:
+                off += 1
+                continue
+            drawn.append(
+                (
+                    seen[0],
+                    seen[1],
+                    index + 1,
+                    colour,
+                    self._point_text(index, answer),
+                )
+            )
+        self.view.set_points(drawn)
+        self.navigator.set_points(whole)
+        return off
+
+    @staticmethod
+    def _point_colour(answer, found) -> str:
+        """White until it has an answer, then near-to-far along the depth ramp.
+
+        The same ramp the depth map uses, so near and far read the same way in
+        both places.
+        """
+        if answer is None or not answer.known:
+            return "#ebebeb"
+        placed = [one.steps for one in found if one.known]
+        near, far = min(placed), max(placed)
+        fraction = 0.0 if far <= near else (answer.steps - near) / (far - near)
+        red, green, blue = ramp_colour(fraction)
+        return f"#{red:02x}{green:02x}{blue:02x}"
+
+    def _point_text(self, index: int, answer) -> str:
+        if answer is None:
+            return (
+                f"Point {index + 1}: placed, not yet measured.\n"
+                f"Press Measure points, or ctrl-click here again to remove it."
+            )
+        return summarise(answer, index + 1, self._found, self._points_datum)
+
+    @Slot(object)
+    def _on_points_found(self, found) -> None:
+        self._found = found
+        self._show_points()
+
+    def _toggle_point_scan(self) -> None:
+        if self._scanning:
+            self.requestPointCancel.emit()
+            return
+        settings = QSettings()
+        settings.setValue("points/stops", self.points_stops.value())
+        settings.setValue("points/passes", self.points_passes.value())
+        settings.setValue("points/around", self.points_around.value())
+        magnified = self.points_magnified.isChecked()
+        # A magnified scan never parks, so what it counts from is where its
+        # bracket began. Saying "from the near stop" about those numbers would
+        # be saying something untrue; the gaps are the answer either way.
+        self._points_datum = (
+            "where the sweep began" if magnified else "the near stop"
+        )
+        self.requestPointScan.emit(
+            self.points_stops.value(),
+            self.points_passes.value(),
+            self._focus_steps[_FINE_INCREMENT].value(),
+            False,
+            magnified,
+            self.points_around.value(),
+        )
+
+    @Slot(bool)
+    def _on_point_scan_changed(self, scanning: bool) -> None:
+        self._scanning = scanning
+        self.points_button.setText("Stop" if scanning else "Measure points")
+        for control in (
+            self.points_stops,
+            self.points_box_size,
+            self.points_around,
+            self.points_magnified,
+        ):
+            control.setEnabled(not scanning)
+        self.points_passes.setEnabled(
+            not scanning and not self.points_magnified.isChecked()
+        )
+        if not scanning:
+            self._on_points_magnified(self.points_magnified.isChecked())
+        self._show_points()
+
+    def _build_depth_box(self) -> QGroupBox:
+        """Mapping how far away each part of the scene is, by sweeping focus.
+
+        It lives under the focus controls because it is made of them: the
+        number the sharpness meter reads, asked of every part of the picture
+        at once, at a series of focus positions.
+        """
+        box = QGroupBox("Depth map")
+        column = QVBoxLayout(box)
+        column.setSpacing(4)
+
+        self.depth_view = DepthView()
+        self.depth_view.setToolTip(
+            "Where each part of the picture was sharpest, in drive steps from "
+            "the near end of the lens's travel. Near is the left of the scale "
+            "and far the right; a zone with nothing in it to focus on is left "
+            "dark, and one that took its answer from the larger zone around it "
+            "is drawn dimmer."
+        )
+        column.addWidget(self.depth_view)
+
+        self.depth_label = WrappedLabel("")
+        self.depth_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.depth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(self.depth_label)
+
+        # Where the sweep decided to look, kept in front of you while it runs.
+        # In the status bar it is one message among all the others and scrolls
+        # away, and it is the line that says whether the sweep was pointed at
+        # the right part of the travel at all.
+        self.depth_sweeping = WrappedLabel("")
+        self.depth_sweeping.setStyleSheet("color: #888; font-size: 11px;")
+        self.depth_sweeping.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.depth_sweeping.setToolTip(
+            "Which stretch of the travel this sweep is covering, in drive steps "
+            "from the near stop, and the step it is covering it in. It is chosen "
+            "by driving the whole travel once and watching where the picture "
+            "answers focus at all."
+        )
+        column.addWidget(self.depth_sweeping)
+
+        settings = QSettings()
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(6)
+        form.setVerticalSpacing(4)
+
+        self.depth_samples = QSpinBox()
+        self.depth_samples.setRange(8, 400)
+        self.depth_samples.setValue(_stored_int(settings, "depth/samples", 40, 8, 400))
+        self.depth_samples.setToolTip(
+            "How many places each pass stops to read the picture. Every stop "
+            "is a focus move and a wait for live view to catch up, so this is "
+            "what the sweep costs -- about half a second each."
+            "\n\n"
+            "They are spread over the part of the travel the picture answers "
+            "focus in, not over the whole of it: on a macro lens most of the "
+            "travel is the first few centimetres, and a stop spent in that wash "
+            "measures nothing. Raise this for a subject whose depth of field is "
+            "a hair -- the first pass has to land near enough to focus "
+            "somewhere to have anything to refine."
+        )
+        self.depth_samples.editingFinished.connect(self.view.setFocus)
+        form.addRow("Stops per pass", self.depth_samples)
+
+        self.depth_passes = QSpinBox()
+        self.depth_passes.setRange(1, 6)
+        self.depth_passes.setValue(_stored_int(settings, "depth/passes", 3, 1, 6))
+        self.depth_passes.setToolTip(
+            "How many times the travel is swept. The first pass walks the whole "
+            "of it coarsely; each one after it sweeps only the stretch the last "
+            "one found anything in, in a step several times finer. It stops "
+            "early on its own once the step is down to the minimum increment."
+        )
+        self.depth_passes.editingFinished.connect(self.view.setFocus)
+        form.addRow("Passes", self.depth_passes)
+
+        self.depth_detail = QComboBox()
+        for name, level in _DEPTH_DETAIL:
+            self.depth_detail.addItem(name, level)
+        self.depth_detail.setToolTip(
+            "How finely the picture is divided. Costs nothing to change, before "
+            "or after a sweep: a coarse zone's numbers are the sum of the fine "
+            "zones inside it, so every grid was measured by the same pass. "
+            "Coarse is steadier, fine follows edges."
+        )
+        stored_detail = _stored_int(settings, "depth/detail", LEVELS - 1, 0, LEVELS - 1)
+        self.depth_detail.setCurrentIndex(
+            max(0, self.depth_detail.findData(stored_detail))
+        )
+        self.depth_detail.currentIndexChanged.connect(self._on_depth_detail_changed)
+        form.addRow("Detail", self.depth_detail)
+
+        self.depth_range = QComboBox()
+        self.depth_range.addItem("The whole travel", False)
+        self.depth_range.addItem("Where the last map found something", True)
+        self.depth_range.setToolTip(
+            "The first run has to cover the whole travel, because nothing here "
+            "knows where in it the scene is -- and on a macro lens most of that "
+            "travel is the first few centimetres, where an ordinary scene has "
+            "nothing in focus at all."
+            "\n\n"
+            "Running it again over what the last one found is what produces a "
+            "map worth trusting, and not only because the stops are not wasted. "
+            "A lens changes how big the picture is as it focuses, and a "
+            "defocused highlight is a big disc that shrinks as focus comes to "
+            "it. Both slide the scene about underneath the zones, both are "
+            "worst over a wide sweep, and both are small over a narrow one."
+        )
+        self.depth_range.setEnabled(False)
+        form.addRow("Sweep", self.depth_range)
+        column.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        self.depth_button = QPushButton("Map depth")
+        self.depth_button.setToolTip(
+            "Park focus against its near stop, find which part of the travel "
+            "the picture answers focus in at all, and sweep that -- reading the "
+            "whole picture at every stop. Nothing else may touch focus or the "
+            "view while it runs: doing so stops it, because readings either "
+            "side of that are not comparable."
+        )
+        self.depth_button.clicked.connect(self._toggle_depth_map)
+        buttons.addWidget(self.depth_button, 1)
+
+        self.depth_save_button = QPushButton("Save...")
+        self.depth_save_button.setEnabled(False)
+        self.depth_save_button.setToolTip(
+            "Write the map out twice: the colour picture as you see it, scaled "
+            "to the live-view frame, and a sixteen-bit greyscale beside it at "
+            "the grid's own size, where the level is the focus position and "
+            "black means no answer."
+        )
+        self.depth_save_button.clicked.connect(self._save_depth_map)
+        buttons.addWidget(self.depth_save_button)
+        column.addLayout(buttons)
+
+        hint = WrappedLabel(
+            "The map is in drive steps, not metres: nothing here knows the "
+            "lens, so it can say which parts are nearer than which and by how "
+            "much, in the only unit there is.\n\n"
+            "The first run covers the whole travel and is reconnaissance. Run "
+            "it again over what it found: the lens breathes and defocused "
+            "highlights swell into discs, and both slide the scene under the "
+            "zones over a wide sweep and hardly at all over a narrow one."
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(hint)
+        return box
+
+    def _toggle_depth_map(self) -> None:
+        if self._mapping:
+            self.requestDepthCancel.emit()
+            return
+        settings = QSettings()
+        settings.setValue("depth/samples", self.depth_samples.value())
+        settings.setValue("depth/passes", self.depth_passes.value())
+        self.requestDepthMap.emit(
+            self.depth_samples.value(),
+            self.depth_passes.value(),
+            self._focus_steps[_FINE_INCREMENT].value(),
+            bool(self.depth_range.currentData()),
+        )
+
+    def _on_depth_detail_changed(self) -> None:
+        level = self.depth_detail.currentData()
+        QSettings().setValue("depth/detail", level)
+        self.requestDepthDetail.emit(int(level))
+        # The combo needed the keyboard for its popup; give it back to the
+        # image, as every other combo here does.
+        self.view.setFocus()
+
+    @Slot(bool)
+    def _on_depth_changed(self, mapping: bool) -> None:
+        self._mapping = mapping
+        self.depth_button.setText("Stop" if mapping else "Map depth")
+        if not mapping:
+            self.depth_sweeping.setText("")
+        # The two that decide the shape of the sweep are settled before it
+        # starts; the detail is not, and is worth changing while watching.
+        for control in (self.depth_samples, self.depth_passes, self.depth_range):
+            control.setEnabled(not mapping and self._can_narrow(control))
+
+    def _can_narrow(self, control) -> bool:
+        """Whether *control* has anything to offer yet.
+
+        Only the range does: there is nothing to narrow to until a map has
+        been made, and offering the choice before then invites picking it and
+        getting the whole travel anyway.
+        """
+        return control is not self.depth_range or self._depth_map is not None
+
+    @Slot(object)
+    def _on_depth_map(self, depth_map) -> None:
+        self._depth_map = depth_map
+        self.depth_view.show_map(depth_map)
+        self.depth_label.setText(
+            depth_map.describe() if depth_map is not None else ""
+        )
+        self.depth_save_button.setEnabled(depth_map is not None)
+        if not self._mapping:
+            self.depth_range.setEnabled(depth_map is not None)
+
+    def _save_depth_map(self) -> None:
+        """Write the map out, as a picture to look at and as one to read.
+
+        Two files, because they are wanted for different things and no one
+        format does both: the colour one is the readout, and the greyscale one
+        is the measurement, at the grid's own resolution and with the two ends
+        of its scale in the status line and in its name.
+        """
+        depth_map = self._depth_map
+        if depth_map is None:
+            return
+        near, far = depth_map.range
+        stem = f"depth-{time.strftime('%Y%m%d-%H%M%S')}-{near:.0f}-{far:.0f}"
+        directory = self.worker.save_directory
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Save the depth map", str(directory / f"{stem}.png"), "PNG (*.png)"
+        )
+        if not chosen:
+            return
+        picture = Path(chosen)
+        steps = picture.with_name(f"{picture.stem}-steps.png")
+        frame = self.view.frame
+        drawn = colourise(
+            depth_map,
+            frame.width if frame is not None else 0,
+            frame.height if frame is not None else 0,
+        )
+        if not drawn.save(str(picture), "PNG") or not as_steps_image(depth_map).save(
+            str(steps), "PNG"
+        ):
+            self.statusBar().showMessage(f"Could not write {picture}", 8000)
+            return
+        self.statusBar().showMessage(
+            f"Saved {picture.name} and {steps.name}: level 1 is {near:.0f} steps "
+            f"and 65535 is {far:.0f}, level 0 no answer",
+            12000,
+        )
 
     def _build_manual_focus(self) -> QWidget:
         """A column per increment: its name, its two buttons, and its size.
@@ -1215,6 +2038,14 @@ class MainWindow(QMainWindow):
             )
             camera_menu.addAction(action)
 
+        # Everything under here changes the picture on the screen and nothing
+        # else, which is exactly why it is not in the Camera menu.
+        view_menu = self.menuBar().addMenu("&View")
+        view_menu.addAction(self.invert_action)
+        view_menu.addSeparator()
+        for action in self._view_actions:
+            view_menu.addAction(action)
+
     # -- worker wiring -----------------------------------------------------
 
     def _start_worker(self) -> None:
@@ -1250,6 +2081,12 @@ class MainWindow(QMainWindow):
         self.requestSharpnessArea.connect(self.worker.set_sharpness_area)
         self.requestFineTune.connect(self.worker.fine_tune)
         self.requestHuntCancel.connect(self.worker.cancel_hunt)
+        self.requestDepthMap.connect(self.worker.start_depth_map)
+        self.requestDepthCancel.connect(self.worker.cancel_depth_map)
+        self.requestDepthDetail.connect(self.worker.set_depth_detail)
+        self.requestFocusPoints.connect(self.worker.set_focus_points)
+        self.requestPointScan.connect(self.worker.start_point_scan)
+        self.requestPointCancel.connect(self.worker.cancel_point_scan)
         self.requestDriveFocus.connect(self.worker.drive_focus)
         self.requestNaming.connect(self.worker.set_naming)
 
@@ -1263,6 +2100,11 @@ class MainWindow(QMainWindow):
         self.worker.fpsChanged.connect(self._on_fps)
         self.worker.sharpnessChanged.connect(self._on_sharpness)
         self.worker.huntChanged.connect(self._on_hunt_changed)
+        self.worker.depthChanged.connect(self._on_depth_changed)
+        self.worker.depthMapReady.connect(self._on_depth_map)
+        self.worker.pointsFound.connect(self._on_points_found)
+        self.worker.pointScanChanged.connect(self._on_point_scan_changed)
+        self.worker.sweeping.connect(self.depth_sweeping.setText)
         self.worker.exposurePreviewChanged.connect(self._on_exposure_preview)
         self.worker.saveToCardChanged.connect(self._on_save_to_card)
         self.worker.shutterDelaysAvailable.connect(self._on_shutter_delays)
@@ -1286,6 +2128,8 @@ class MainWindow(QMainWindow):
         self.requestDeduplicate.emit(self.deduplicate.isChecked())
         self.requestSharpness.emit(self.measure_sharpness.isChecked())
         self._apply_measure_area()
+        self.requestDepthDetail.emit(int(self.depth_detail.currentData()))
+        self._on_points_changed()
         self.requestSaveToCard.emit(self.save_to_card.isChecked())
         self.requestShutterDelay.emit(self._chosen_shutter_delay())
         self._request_naming()
@@ -1350,6 +2194,10 @@ class MainWindow(QMainWindow):
         """
         self.view.show_frame(frame, image)
         self.navigator.show_frame(frame, image)
+        if self._points:
+            # Where a point falls on the picture depends on the crop, and the
+            # crop arrives with the frame.
+            self._draw_points()
         self._on_frame_histogram(image)
         self._on_frame_level(frame)
 

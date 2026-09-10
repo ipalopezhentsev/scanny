@@ -57,12 +57,14 @@ __all__ = [
     "grain_reading",
     "variance_between",
     "Area",
+    "ABOVE_THE_GRAIN",
+    "SCALE",
     "MIN_AREA_PIXELS",
 ]
 
 #: Readings are only meaningful against each other, so the scale is chosen to
 #: put an ordinary subject in the tens rather than at three decimal places.
-_SCALE = 1000.0
+SCALE = 1000.0
 
 #: The area to measure, as (x, y, width, height) fractions of the displayed
 #: picture. Fractions of what is on screen rather than sensor coordinates: it
@@ -74,7 +76,7 @@ Area = "tuple[float, float, float, float]"
 #: Below this the picture cannot be told from its own noise, and a number that
 #: is really noise is worse than no number: a hunt will chase it, lock onto
 #: whichever grain read highest, and drive somewhere with nothing in it.
-_ABOVE_THE_GRAIN = 0.2
+ABOVE_THE_GRAIN = 0.2
 
 #: An area smaller than this is not measured but clamped up to it. A handful
 #: of pixels is all noise and no subject, and the reading from one jumps about
@@ -107,12 +109,12 @@ def measure(
     # contributes four times it to the energy, whatever the subject is.
     grain = 4.0 * max(noise_variance, 0.0)
     signal = energy - grain
-    if signal <= _ABOVE_THE_GRAIN * grain:
+    if signal <= ABOVE_THE_GRAIN * grain:
         # Nothing here that can be told from the grain. Nothing is the honest
         # answer, and it is the useful one: a hunt reads it as "no hill here"
         # and goes back where it came from rather than chasing the noise.
         return 0.0
-    return _SCALE * signal / (level * level)
+    return SCALE * signal / (level * level)
 
 
 def grain_reading(
@@ -133,7 +135,7 @@ def grain_reading(
     level = float(pixels.mean())
     if level <= 0.0:
         return 0.0
-    return _SCALE * 4.0 * noise_variance / (level * level)
+    return SCALE * 4.0 * noise_variance / (level * level)
 
 
 def variance_between(earlier: np.ndarray, later: np.ndarray) -> "float | None":

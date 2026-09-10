@@ -96,8 +96,12 @@ trusting that number anywhere:
 | `ui/sharpness.py` | Scoring the contrast in the displayed picture, to focus against |
 | `ui/trend.py` | The plot of recent readings that focus is driven against |
 | `ui/hunt.py` | Walking focus to the top of that reading, without counting steps |
+| `ui/depth.py` | Sweeping the travel once and reading every part of the picture: a depth map |
+| `ui/depthview.py` | That map drawn, with the scale to read it by |
+| `ui/points.py` | The same sweep asked about a few places you point at, in order |
 | `ui/navigator.py` | The whole frame, with the magnified view marked on it and draggable |
-| `ui/histogram.py` | The levels in the picture on screen, per channel |
+| `ui/orientation.py` | Turning, mirroring and inverting the picture on its way to the screen |
+| `ui/histogram.py` | The levels in the frame the camera sends, per channel |
 | `ui/pixels.py` | Getting at a QImage's bytes as numpy, shared by everything that reads them |
 | `ui/naming.py` | The prefix-and-counter names that downloaded pictures are saved under |
 
@@ -559,6 +563,472 @@ mean the next reading would be of a different picture from the last one, and
 comparing across that is exactly the mistake the hunt is made of. The button
 says **Stop hunting** while one is running.
 
+## Distance between a few points you pick
+
+The depth map asks how far away every part of the picture is. This asks it
+about five places someone chose, and almost everything that made the map
+fragile goes away with that choice. The boxes are large where a grid zone is
+ten pixels across. They have subject in them, because a person looked before
+clicking, where most of a grid is sky and wall. And there are five of them
+rather than two thousand, so a test that has to hold for every one can be
+strict without throwing most of the answer away.
+
+Ctrl-click the picture to put a point down, ctrl-click it again to take it
+away. **Measure points** sweeps, and then each point on the picture is drawn in
+its depth colour with a number on it, and hovering it says what was found:
+
+```
+Point 3: sharpest at 18,543 steps from the near stop
+3rd nearest: 4,544 steps behind point one, 2,254 behind the one before it
+Reading 156 at its best
+```
+
+The panel writes the order out underneath -- `1: nearest   2: +2,290   3: +4,544`
+-- and the status bar says the same when the scan finishes.
+
+### A point is a place on the sensor, not a place on the screen
+
+It was the other way round to begin with, in fractions of the picture on
+screen, on the same reasoning the sharpness meter's area uses: it is a place in
+the picture someone is looking at, so let it stay where they put it while the
+camera moves underneath. That is exactly wrong for this, and the failure is
+worth keeping.
+
+Put two points near opposite corners of the whole frame, then magnify to read
+the small gap between them -- which is the one thing that makes a small gap
+readable, and what the *too close to call* message tells you to go and do. At
+18.8x the screen is a hundredth of the frame. A point kept at "a tenth of the
+way across the screen" is now a tenth of the way across that hundredth: some
+other piece of the world entirely. Both points survive the zoom, both look
+right, and neither is on the thing it was put on.
+
+Points are kept in fractions of the whole sensor frame instead -- the
+coordinate the camera's own focus point lives in, which does not move when the
+view magnifies or pans. Every frame carries the crop rectangle in its header,
+so where a point falls on the picture *now* is worked out afresh for every
+frame; a point outside the crop is simply not drawn. The navigator keeps
+drawing all of them, which is the whole use of it here: magnified onto one
+point, it is the only place the others can be seen at all.
+
+Clicks stay in screen coordinates, because that is all a click can be, and are
+turned through the crop on the way in. Taking a point away is still judged on
+screen, so what you can click off is the ring that is under the pointer at
+whatever zoom.
+
+### It is one sweep, not a hunt per point
+
+Pointing `ui/hunt.py` at each box in turn is the obvious construction and it is
+worse in both directions at once.
+
+It costs five hunts of twenty to forty probes, where a sweep costs its stops
+once: every box is read off the same frame, so the fifth point is free.
+
+And **its answers would not compare**. A hunt walks out until the reading turns
+over and then walks back, and finishes wherever the reading told it to. What
+separates the resting places of two hunts is the focus difference *plus*
+whatever play the gearing took up on the way there -- and the play is precisely
+the thing nothing here can measure, which is why `ui/hunt.py` refuses to count
+steps at all. One pass driving one way from the near stop has every reading in
+one coordinate by construction. See *Steps mean something here* above.
+
+So the driving is the depth map's, unchanged and shared: park against the near
+stop, bracket the part of the travel the picture answers focus in, sweep it,
+come back over what was found in a finer step. What differs is a dozen lines --
+what each settled picture is read into, and what comes out at the end.
+
+### Every answer comes with the doubt on it, and that is the point
+
+The first version of this had none, and that made it worse than useless.
+Whether two things a hundred steps apart can be told apart is not a property
+of the arithmetic. It is a property of the lens, of how far the view is
+magnified, and of what happens to be in the boxes -- read an unmagnified scene
+and a hundred steps may move the reading less than the grain does. Asked
+anyway, the old code answered with the few steps of noise between two curves it
+could not separate, in whichever order the grain fell, and said it in the same
+voice it uses for an answer it is sure of. Tried on two points about a hundred
+steps apart, it called the nearer one further and put seven steps between them.
+
+So each peak now carries a standard deviation, worked out from the readings
+themselves: on a curve that is smooth apart from noise, each sample less the
+average of its two neighbours *is* the noise, and the median of those is a
+measure of it that a few wild samples cannot inflate. That is then carried
+through the arithmetic that found the peak. Two points whose gap does not clear
+two and a half of those are reported as **too close to call** -- joined by `=`
+in the readout rather than ordered, with the tooltip saying to magnify and
+measure again.
+
+(Splitting the samples in two and comparing the halves was tried first and is
+worth recording as wrong. Neighbouring samples of a broad peak read almost the
+same thing, so the two halves are not two looks at the curve but very nearly
+the same look twice. They agree beautifully and say nothing.)
+
+### Magnify onto each point, which is how the doubt is made small
+
+*Too close to call* says to magnify and measure again, and **Magnify onto each
+point** is that, done by the machine. It is on by default.
+
+Magnification is the whole of what makes a small gap readable: a step of focus
+moves the picture in proportion to how far the view is magnified, so a hundred
+steps that are lost in the grain on a whole frame are obvious at 18.8x. And it
+breaks the thing the section above is built on, because at 18.8x no two points
+worth comparing are on the screen together. What is kept and what is given up:
+
+**Kept: one sweep, one coordinate.** The camera is panned from point to point
+at every stop, and focus is not touched while it pans -- panning is moving the
+focus point, which is how the arrow keys and the navigator scroll the magnified
+view. So every reading taken at a stop still belongs to that one position, on
+one monotonic drive. Panning costs frames; it costs nothing in the coordinate,
+and the coordinate is the only thing the answer depends on. It costs about a
+quarter of a second a point a stop: magnified, the body draws sixteen frames a
+second and four redrawn ones are waited for, because a reading taken off a
+frame that still shows the last point is worse than no reading at all.
+
+**Given up: the near stop as the datum.** Parking and then sweeping the whole
+travel at a step fine enough to be worth magnifying for is thousands of stops.
+So this never parks. The camera's own autofocus is pointed at point 1, and the
+sweep is a bracket around where that landed: back off **Around AF** steps, then
+drive forward through twice that. Backing off first is not a detail -- it is
+what puts the play in the gearing *behind* the sweep instead of inside it, so
+every stop of the pass that follows is honest travel. The positions that come
+out are counted from where the bracket began rather than from the near stop,
+and the tooltips say so. The gaps between the points are the answer either way,
+and they are unaffected.
+
+The bracket can miss. A point whose focus is past the far end reads flat
+nothing rather than reading as still rising, so *having no answer for a point*
+counts as a reason to keep driving, and the pass takes up to twice its stops
+again reaching for it -- forward only, because forward is where the lens is
+already going and a reversal would take up play that nothing here can measure.
+A point *nearer* than the bracket cannot be reached that way at all, and is
+reported instead: raise **Around AF**, or put point 1 on the nearest of the
+subjects.
+
+It is one pass by construction, so **Passes** is greyed out while it is on: the
+bracket is already fine, and a second pass would have to reverse the lens. Turn
+the whole thing off to sweep the travel on the frame as it is -- faster, and
+the only thing to do when the points have no edges for autofocus to lock onto.
+The zoom and the focus point are put back wherever the scan ends, including the
+ways it ends badly.
+
+### Three things that were making the number worse
+
+All three were found by putting a lens with realistic faults into the
+simulation and watching a known hundred-step gap come back wrong.
+
+**The peak was found from three samples.** Argmax plus a parabola through its
+two neighbours is the textbook answer and it is the wrong one whenever the
+depth of field is broad, which on an ordinary lens it usually is. A broad peak
+finely sampled has a summit twenty samples wide, all of them within the noise
+of each other, so *which* is highest is the grain's choice and a fit through it
+inherits all of that. The peak is now the centroid of everything on the top
+half of the curve, weighted by height above it and by how much travel each
+sample stands for -- which divides that wander by the square root of how many
+samples are up there.
+
+**Refining narrowed inside the peak.** Each pass swept the stretch the last one
+found the points in, plus one step either side. Once the points were located,
+that stretch was narrower than the peak was wide -- so the finest pass was
+looking at a flat noisy plateau and answering with the grain on it, making the
+coarse answer worse instead of better. A pass now always reaches a peak-width
+and a half past the top on both sides, because a hill can only be placed by
+seeing it fall away.
+
+**The passes were merged.** Each pass parks against the stop again, and the
+play in the gearing gives back a little more or less each time, so positions
+from different passes are not quite the same coordinate. Against a modelled
+lens whose parking landed within forty steps of the same place, merging turned
+a hundred-step gap into a hundred and fifty. The answer now comes from the last
+pass alone, and falls back to everything only when that pass placed fewer
+points.
+
+With all three, that modelled lens reads the hundred-step gap as 103 to 110
+whether its parking is repeatable to nothing, to forty steps or to a hundred
+and twenty.
+
+### The one test that is turned off for points
+
+A grid zone whose best reading is fifty times below what the rest of the frame
+managed has nothing in it and has agreed with itself about where the nothing
+peaked; the map throws it away for that reason alone. A *point* whose reading
+is fifty times below the others is a dim thing someone pointed at on purpose,
+and throwing it away would be answering a question they did not ask. Everything
+else -- the grain floor, the prominence, the shoulders either side of the peak,
+the parabola through the three readings around it -- is the same code.
+
+Against a modelled 24000-step travel with a scene living in its far half, five
+points across it come back within about thirty steps of where they belong.
+
+## Mapping the depth of the scene
+
+The sharpness meter answers one question about one rectangle: how much contrast
+is in it now. Ask that of every part of the picture at once, at a series of
+focus positions, and each part answers with the position where it was sharpest
+-- which is how far away the thing in it is. That is **shape from focus**, and
+`ui/depth.py` is the whole of it.
+
+### One sweep, not a hunt per zone
+
+The obvious construction is to point the existing hunt at each zone in turn and
+write down where it stopped. It fails twice over. A hunt costs twenty to forty
+probes and every probe is a focus move and a settle, so even a 16x9 grid is
+thousands of camera round trips -- the better part of an hour. And a hunt
+*moves the lens*, so by the time the second zone has been measured the first
+zone's answer describes a lens position nothing else was measured against.
+
+Sweeping costs one probe per focus position however many zones there are,
+because every zone is read off the same frame, and every zone's answer is in
+the same coordinate.
+
+### Steps mean something here, because nothing ever reverses
+
+`ui/hunt.py` refuses to count drive steps at all, and it is right to: the
+gearing has play in it, so the same step count moves the optics differently
+depending on which way they were last driven. That argument is about
+*reversals*. Within one run in a single direction the play was taken up by the
+first move and stays taken up, so cumulative steps are a faithful -- if not
+linear -- stand-in for distance.
+
+So a pass drives one way only, and every pass begins by **parking the lens
+against its near stop**, which it finds by driving in chunks until `MfDrive`
+refuses one. A mechanical stop is the one position a lens returns to exactly,
+and it is what makes the second pass's numbers comparable with the first's.
+Each pass then jumps forward by at least one step before its first reading, so
+the play is taken up identically every time.
+
+The map is therefore in **drive steps from the near stop**, not in metres.
+Nothing here knows the lens, so nothing here can turn steps into distance; what
+it can say is which parts of the scene are nearer than which, and by how much,
+in the only unit available. (See *Focus distance is not available* below for
+why there is no better one.)
+
+### Where to sweep is measured, and it is not the travel
+
+This was got wrong twice, and both failures are worth recording because neither
+looks like a failure while it is happening.
+
+**First it was guessed.** The travel was assumed to be about 6000 steps -- the
+figure the manual-focus increments were measured against, on a zoom. An AF-S
+60mm micro has several times that, so a sweep asked for forty stops divided
+6000 by forty and stopped a quarter of the way along: on that lens, somewhere
+around 0.4m. Everything past that was never visited, and what came back was not
+an obviously broken map but a confident map of the quarter of the travel the
+guess reached.
+
+**Then it was measured, from the wrong thing.** `MfDrive` can answer `STEP_END`
+or `STEP_INSUFFICIENT`, so the obvious measurement is to drive stop to stop and
+count the refusals. A D750 refuses at the **near** stop and, driving past
+infinity, answers OK and moves nothing, for ever. A stop-finder that believes
+the OK never finds the far stop: it runs to whatever limit it is given, calls
+that the travel, and hands the sweep a step twelve times too big. The sweep
+reaches infinity a tenth of the way through its stops and then spends the rest
+of them -- minutes of them -- driving a lens that cannot move. **Nothing here
+may depend on being told about a stop.**
+
+What is measured instead is **not the travel at all**, and that turns out to be
+the better question. Most of a macro lens's travel is the first few centimetres
+in front of it, where an ordinary scene is a uniform wash that no focus
+position brings into anything; a stop spent there measures nothing whether or
+not the arithmetic that put it there was right. So before it reads anything,
+the sweep parks and then drives the whole way across in chunks, watching: the
+first chunk that changes the picture and the last one that does bracket **the
+part of the travel the picture answers focus in**, and that is what gets
+divided by the stops asked for.
+
+On a scene at 30-40cm, that skips the near half of a micro's travel outright
+and spends every stop where something is coming into focus. The bracket goes in
+the status line when a map starts.
+
+Three details of that make it work:
+
+- **The frame it compares against only moves when the picture does.** A
+  reference that follows every chunk asks "did *this* chunk change anything",
+  which a chunk that moved the optics a little answers no to -- and three
+  little moves in a row then read as a lens that has stopped. Holding the
+  reference asks the question that matters: has the picture changed since the
+  last place it demonstrably changed? Small moves add up until it has.
+- **The chunk is large, and that is not about saving round trips.** The near
+  end of the travel is where the scene is most thoroughly defocused, so it is
+  exactly where the picture changes least per step -- the worst place to be
+  asking whether it changed at all. Against a modelled lens, a chunk of 500
+  steps left the last real move reading 1.5 times the grain against 1.5 for no
+  move at all; a chunk of 1000 left it reading 5.3 against 0.9.
+- **Quiet before the picture has spoken once ends nothing.** That quiet is the
+  wash in front of the lens, not the end of the travel. Only quiet *after* a
+  change means the far end has been passed, and it takes six chunks of it,
+  because a scene with something close and something far has a quiet stretch
+  between them.
+
+Parking is the one thing that needs no measurement: drive further than any lens
+can go, in the near direction, and it ends against the stop whether or not it
+says so. That is the datum, and it is why it is the near stop rather than the
+far one -- the near stop is a mechanical limit, and past infinity there may not
+be one.
+
+### The sweep has a backstop under all of that, and it counts steps
+
+However well the bracket is measured, a pass must never count out four hundred
+stops against a lens that cannot move -- that is the failure above, and it costs
+minutes of watching a status line advance. So each stop's picture is compared
+with the last one that differed, by the same held-reference rule.
+
+**What it counts is how far it has driven since then, not how many stops ago it
+was**, and getting that wrong is the third mistake worth recording, because it
+went wrong in proportion to how good the rest of the machinery got. Counting
+five stops of silence is fine when a stop is worth a big slice of the travel.
+But a sweep's step is the range it was given divided by the stops asked for, so
+once the range finder started handing it a *narrow* range the step became
+small: a range of 12000 steps over 400 stops is a step of 30, five of those is
+150 steps of driving, and 150 steps changes nothing anywhere on any lens. The
+backstop fired six stops into every pass -- and the next pass, narrowed to what
+those six stops found, fired sooner still.
+
+A distance is scale-free. The one used is the same distance the range finder
+sits through before it decides the far end has gone by, and nothing inside the
+bracket it found can be quieter than that, because quieter than that is how the
+bracket was defined. The backstop also says nothing until the picture has
+changed once in the pass, since a pass starts inside the margin the bracket has
+either side of it, where quiet is expected.
+
+### Resolution is free across the picture and costly along focus
+
+Splitting the frame into four times as many zones is the same single pass over
+the same array: the numbers kept per frame are *sums* -- of the level and of
+the squared differences to the right and downwards -- and a coarse zone's sums
+are the sums of the fine zones inside it. So the picture is read at the finest
+useful grid from the first frame and every coarser grid is derived from it for
+nothing. Changing the **Detail** control after a sweep costs no driving at all.
+
+What costs time is focus positions: each is a move and a wait for live view to
+settle, about half a second. That is the only axis worth iterating on, and it
+is where coarse-then-fine earns its keep:
+
+- the first pass walks the whole travel in big steps, which finds roughly where
+  in the travel the scene lives but is far too coarse to place a zone;
+- each pass after it sweeps only the stretch the last one found anything in, in
+  a step several times finer.
+
+It stops early on its own once the stretch left is short enough that dividing
+it by the stop count lands on the lens's minimum increment -- there is nothing
+finer to refine to. A deep scene therefore converges to its own depth divided
+by the stops per pass, which is the honest limit: resolving a 3000-step-deep
+scene to 50 steps needs 60 stops however many passes it is given.
+
+It also stops when the answers it has are spread over as much of the travel as
+it just swept, because a finer pass would not fit -- and it **says so**, which
+is the whole of the value. A map that quit after one pass because it had
+converged on nothing used to look exactly like one that had converged.
+
+### The coarse grids vet the fine ones
+
+A zone's reading is a mean over its pixels, so a ten-pixel zone's curve wanders
+where a forty-pixel zone's is steady. A fine zone that clears its grain at one
+stop out of twenty has produced noise, not a peak -- and noise passes a "does
+it stand above the rest of the curve" test *easily*, precisely because the rest
+of the curve is noisy too. So the grids are used as a hierarchy: coarse decides
+**where there is a subject**, fine decides **where in the travel it peaked**.
+
+- A fine zone is believed only where the zone containing it found something.
+- Where a fine zone found nothing it borrows the containing zone's answer, and
+  is drawn dimmer to say so.
+- A peak needs **shoulders**: the stops either side of it have to have read
+  something as well. Sharpness against focus is continuous, so a peak with
+  nothing either side of it is a zone's grain having a good day. This is the
+  test that does the most work, because the wander it catches is not Gaussian
+  and so cannot be thresholded away -- live view arrives as JPEG, and the
+  blocking in a flat area is real contrast that comes and goes with the frame.
+  What it does not do is land on two stops in a row.
+
+How far above its grain a zone's signal has to be before it is a reading at all
+depends on the zone's size for the same reason. The mean of *n* squared
+differences wanders by about the square root of two over *n* of itself: under
+three per cent for a forty-pixel zone, where the flat twenty per cent that
+`ui/sharpness.py` uses is the binding test, but ten per cent for a ten-pixel
+one, where twenty per cent is a two-sigma event and happens hundreds of times
+over a few thousand zones and a few dozen stops.
+
+Two of those tests are local to a zone, and between them they cannot see a
+whole *region* of nothing agreeing with itself: every zone in it wanders, every
+wander has a largest value, and no amount of looking at one zone tells that
+value from a subject. So there is a third that is not local -- a peak more than
+about fifty times below what the better-lit ninth of the picture managed is not
+a reading -- and a floor under the grain that no measurement of it may go
+below.
+
+That floor matters more than it sounds. The grain is *measured*, from how much
+two consecutive frames differ, and a thoroughly defocused live view is a smooth
+one, which JPEG returns almost identically twice. The measured grain then falls
+towards zero and takes the whole "nothing here" test down with it, because
+anything at all is above nothing -- which is exactly how a sweep through the
+macro end of a travel came back sure it had found depth in a part of the scene
+that was nowhere near focus. An eight-bit picture cannot be flatter than its
+own levels: rounding puts a twelfth of a level of variance into every pixel,
+and the grain is never taken as less than that.
+
+Everything left over is drawn blank, which is the honest answer for a patch of
+clear sky or a blank wall: it has no contrast to peak, and the position of the
+largest of its noise readings would draw as convincing terrain. Zones
+straddling a depth edge often come out blank too, and correctly so -- they
+contain two depths and have no single answer.
+
+### Two things about lenses that put a limit on how wide a sweep can be
+
+Neither can be corrected for from here, and both are the reason the first pass
+should be treated as reconnaissance rather than as a map.
+
+**Focus breathing.** A lens changes how big the picture is as it focuses, so
+the scene slides underneath the zones as the sweep runs -- a zone is a
+rectangle of the *screen*. Over the minimum step the hunt walks in this is
+about a pixel and is rightly ignored (see *Focus breathing, and why the area is
+left alone* above); over a whole travel it is a good fraction of the frame,
+worst at the edges and nothing at the centre. A zone near the edge is simply
+not looking at the same part of the scene at both ends of a full-travel pass.
+
+**Bokeh.** A point of light out of focus is not a faint point, it is a large
+bright disc, and the disc shrinks as focus comes towards it. Its edge is
+contrast, and that edge sweeps *across* zones as it closes -- so a zone with
+nothing of its own in it can read a rising and falling response from a
+highlight belonging to somewhere else entirely, and place itself at a depth
+that is not its own.
+
+Both get worse the wider the range swept and are small over a narrow one, which
+is what the **Sweep** control is for: *the whole travel* for the first run, and
+*where the last map found something* for the one after it. The second run
+starts a fresh survey over a fraction of the travel, and that is the map worth
+trusting. A zone whose best reading sat at an end of what was swept is counted
+separately in the readout for the same reason -- what that says is not "it is
+the furthest thing here" but "the sweep did not contain its peak", which is
+also what reading somebody else's bokeh looks like.
+
+### Between the samples
+
+The sweep only stopped where it stopped, so a zone's answer would otherwise be
+quantised to the step, which on a coarse pass is most of the depth of the
+scene. Three readings around a maximum fix a parabola, and its top is a better
+answer than the middle sample by about the amount the curve is not a straight
+line. A fit landing outside the two samples either side is discarded -- that is
+three noisy points making a shape they should not.
+
+### What comes out
+
+The panel draws the map with a colour ramp, near at one end and far at the
+other, scaled to the span the map actually covers rather than to the whole
+travel that was swept -- most of a sweep is empty air either side of the scene,
+and scaling to that would put every zone within a shade of the same colour.
+
+**Save...** writes two files. The colour picture as you see it, scaled up to
+the live-view frame; and beside it `<name>-steps.png`, sixteen-bit greyscale at
+the grid's own size, where level 0 means "no answer here" and 1 to 65535 run
+linearly from the nearest answer to the furthest. Both ends are in the status
+line and in the file's name, so the drive-step positions can be read back out.
+
+### What stops it
+
+The same list as the hunt: taking the focus by hand, magnifying, panning,
+changing the integration, changing any camera setting, or stopping live view.
+Each one means the readings after it are not comparable with the ones before,
+which is the whole basis of the map. What was already swept is kept, so half a
+map is still worth looking at and can still be redrawn at another grid.
+
 ## How the click gestures fit together
 
 | Gesture | Action |
@@ -568,6 +1038,7 @@ says **Stop hunting** while one is running.
 | Right click | Magnify fully, or back to the whole frame if already magnified |
 | Drag | Magnify onto the dragged region |
 | Shift-drag | Mark out the area whose sharpness is measured |
+| Ctrl-click | Put down a point to be measured, or take away the one there |
 | Arrow keys | Pan the magnified view |
 | Scroll | Step magnification |
 | Enter | Autofocus |
@@ -575,6 +1046,9 @@ says **Stop hunting** while one is running.
 | `,` `.` | Manual focus, fine increment |
 | `<` `>` | Manual focus, coarse increment |
 | Esc or 0 | Back to the whole frame, whatever the current state |
+| Ctrl+I | Invert the colours |
+| Ctrl+R / Ctrl+Shift+R | Turn the view right / left |
+| Ctrl+H / Ctrl+Shift+H | Mirror the view left-right / top-bottom |
 
 Aiming, magnifying and focusing are three separate acts, which is what makes
 the ordering work out. Qt delivers a double click as **press, release,
@@ -615,6 +1089,83 @@ Two things will otherwise give you a confident false negative:
   so the click misses the widget — or the window. Multiply by
   `devicePixelRatio()`, and assert `WindowFromPoint` really is your window
   before clicking.
+
+## Turning, mirroring and inverting the view
+
+A copy stand is built the way the room allows, not the way the sensor is wired.
+The body ends up on its side because that is how the frame fits a strip of
+film; the film ends up emulsion-towards the lens because that is the way round
+it lies flat. Negative film adds a third mismatch that is not geometry at all —
+what reaches the screen is the complement of what was in front of the lens, and
+judging a face, a sky or a skin tone by its negative is guesswork.
+
+So the View panel turns the picture by right angles, mirrors it in either axis,
+and inverts its colours. All of it is a **display transform** and nothing else:
+
+| Follows the view | Does not |
+| --- | --- |
+| The image, and every overlay on it — focus box, measured area, points | The focus coordinates sent to the camera |
+| The navigator map and its crop rectangle | The histogram |
+| The depth map pane, turned but never inverted | The sharpness reading and the depth sweep |
+| | The pictures the camera saves, and the saved depth-map files |
+
+The **histogram** is the deliberate one. It is read to judge exposure and
+clipping in what the camera is actually recording, and an inverted copy would
+report a blown highlight as a blocked shadow — the one thing the readout exists
+to catch, said backwards. The **depth map** is the other: it is false colour
+whose ramp is the whole of its meaning, so it is turned to match the image and
+never inverted, or near would be painted in far's colour with the scale
+underneath still saying otherwise.
+
+Inverting is a straight complement and nothing more. Colour negative carries an
+orange mask, so an inverted frame comes out cold until the white balance is set
+for the light coming through the film — which is what the custom white balance
+input is for.
+
+### The widget is where the transform stops
+
+Everything the panes hand back is in the frame's own coordinates, turned back
+before it leaves. That boundary is the point: a click on a picture being shown
+upside down still asks the camera to focus on the thing under the pointer, and
+nothing behind the screen — not the worker, not the sharpness meter, not the
+depth sweep — has to know the view has been touched at all.
+
+The price is that the widget drawing a turned picture has to turn the overlays
+*with* it. They arrive in the frame's coordinates: the focus box comes off the
+camera's own header, and a box drawn without the turn applied would sit in the
+wrong corner of a picture that otherwise looks perfectly right. One other thing
+falls out of this — a right angle swaps which corner of a dragged rectangle is
+the top left one, so a rectangle mapped by subtracting its corners comes back
+with a negative width, which draws as nothing and contains nothing. Both
+rectangles are mapped corner-wise and put back the right way round.
+
+The window's opening size follows the transform too. It opens at the shape of a
+live-view frame so the black strips start at nothing, and a quarter turn swaps
+the frame's two sides, so a sideways rig opens a portrait window.
+
+### Eight arrangements, not three switches
+
+Right angles and mirrors generate eight arrangements in all, and three
+independent flags cannot name them: mirror left-to-right and then top-to-bottom
+and you have not got a doubly mirrored picture, you have got a picture turned
+through 180°. The state kept is therefore the eight arrangements themselves,
+written canonically as *a mirror across the vertical middle, then some number
+of quarter turns*. Every arrangement has exactly one such spelling, so two
+routes to the same picture cannot leave the readout and the controls disagreeing
+about what is on the screen.
+
+That is also why turning and mirroring are buttons rather than tick boxes: they
+compose. Each one does the plain thing to what is on the screen at the moment it
+is pressed — *rotate right* turns whatever is showing a quarter turn clockwise,
+*mirror left-right* mirrors whatever is showing about the screen's vertical
+middle — and that has to hold when the picture is **already** turned. Mirroring
+the screen is not the same as mirroring the frame once a turn is in the way, so
+a mirror rewrites the turns as well as the flag, out of `H·Rᵏ = R⁻ᵏ·H`. Get that
+wrong and the button still works from the camera's own way up, which is the one
+arrangement in which the mistake does not show.
+
+The arrangement is remembered between sessions, because a copy stand is not
+rebuilt between them.
 
 ## Manual focus
 
@@ -836,6 +1387,18 @@ Switched off, the camera's own names are kept, and a collision is decorated
   drives autofocus.
 - **Exposure preview** is on by default, so aperture, shutter and ISO changes
   are visible in live view, depth of field included.
+- **Invert colours** shows the complement of what the camera sends, so a
+  negative can be judged as the picture it is going to be rather than as its
+  opposite. Set the white balance for the light coming through the film as
+  well, or the result stays cold: colour negative carries an orange mask, and
+  inverting alone does nothing about it.
+- **Rotate** and **mirror** turn the view by right angles and flip it in either
+  axis, for a body mounted on its side or film lying emulsion-up. Each button
+  does the plain thing to what is on the screen, so they can be pressed in any
+  order until the picture looks right. Nothing behind the screen moves with
+  them: clicks still aim at what is under the pointer, the readings are
+  unchanged, and the saved pictures come off the card as the camera took them.
+  What is set is remembered for next time.
 - **Integrate** averages several frames into each displayed image, which cancels
   the noise at the cost of frame rate: eight frames is about four frames a
   second and roughly three times less grain. The panel says what the count you
@@ -855,6 +1418,34 @@ Switched off, the camera's own names are kept, and a collision is decorated
   for tidying up, not for finding focus from nowhere. It counts no drive steps
   at all, so it does not care how much play the lens has. Anything you do to
   the focus, the view or the exposure stops it.
+- **Ctrl-click** the picture to put down a point to be measured, up to five,
+  and ctrl-click one again to take it away. **Measure points** then sweeps
+  focus once and reports which of them is nearest, and how many drive steps
+  the others are behind it. Hover a point for what was found there. It is
+  the depth map's question asked about places you chose rather than about a
+  grid, which is why it is the one to reach for first. **Magnify onto the
+  subject first if the points are close together**: a step of focus moves the
+  picture far more when the view is magnified, and that is the whole of what
+  makes a small gap readable. Two points it cannot separate are reported as
+  too close to call rather than put in an order.
+- **Map depth** reports where each part of the picture was sharpest, as a
+  colour map of the scene's depth in drive steps. It parks against the near
+  stop, drives the whole way across watching for where the picture answers
+  focus at all, and sweeps that; the bracket it found goes in the status line.
+  It takes over the lens for a minute or two, and nothing else may touch focus
+  or the view while it runs. **Stops per pass** is what it costs -- about half
+  a second each -- and **Passes** is how many times it comes back over the
+  stretch it found something in, each time in a finer step. **Detail** changes
+  the grid the map is drawn at, before or after a sweep, and costs no driving
+  at all. Raise the stops for a subject whose depth of field is a hair: the
+  first pass has to land near enough to focus somewhere to have anything to
+  refine.
+- **Run it twice.** The first run brackets the whole travel and is
+  reconnaissance. Then set **Sweep** to *where the last map found something*
+  and go again. That is not only about not wasting the stops: the lens
+  breathes and defocused highlights swell into discs, both slide the scene
+  about underneath the zones over a wide sweep, and both are small over a
+  narrow one.
 - The status bar shows the live-view frame size and the rate it is arriving at
   (about 44fps, or 44/N while integrating N frames). It drops to 16fps when
   the view is magnified past 4.7x, which is the camera and not the connection.
@@ -907,9 +1498,5 @@ The tests cover the byte-level work — PTP encoding, the live-view header
 geometry, and the value formatting — against data the camera actually sent.
 They need no camera attached.
 
-
-## TODO
-
-- focus sweep - find&visualize depth map
 
 
