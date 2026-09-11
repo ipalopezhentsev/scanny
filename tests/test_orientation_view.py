@@ -452,7 +452,7 @@ def window(app, monkeypatch):
 
 
 def panes(window):
-    return (window.view, window.navigator, window.depth_view)
+    return (window.view, window.navigator)
 
 
 def test_every_pane_that_draws_the_picture_is_shown_the_same_arrangement(window):
@@ -462,19 +462,6 @@ def test_every_pane_that_draws_the_picture_is_shown_the_same_arrangement(window)
     assert not wanted.is_identity
     for pane in panes(window):
         assert pane._orientation == wanted.geometry
-
-
-def test_the_depth_map_is_turned_but_never_inverted(window):
-    """It is false colour, and its ramp is the whole of the readout.
-
-    Inverting it would paint near in far's colour with the scale underneath
-    still saying otherwise -- a readout that is confidently backwards.
-    """
-    window.invert_colours.setChecked(True)
-    window._turn_view(1)
-    assert window.view._orientation.inverted
-    assert window.depth_view._orientation.turns == 1
-    assert not window.depth_view._orientation.inverted
 
 
 def test_the_histogram_reads_the_frame_and_not_the_inverted_picture(window):

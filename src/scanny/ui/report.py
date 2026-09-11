@@ -16,6 +16,10 @@ because they are to be compared with the picture on screen and with each
 other, and a negative judged as a negative is guesswork. They are scaled up
 by whole numbers only, pixel for pixel: a smoothed enlargement would blur
 the very thing the report exists to show.
+
+The last page is what was said while the calibration ran, from the activity
+log. The whole report, that included, can be saved as a document and opened
+again later (:mod:`scanny.ui.reportfile`).
 """
 
 from __future__ import annotations
@@ -24,13 +28,14 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QTabWidget,
@@ -42,6 +47,8 @@ from .film import FilmView, Mark
 from .orientation import Orientation
 from .regionchart import RegionChart
 from .regions import CalibrationReport, Look, RegionResult, describe_depth
+from .reportfile import REPORT_FILTER, SUFFIX, ReportFileError, save_report
+from .sharpness import format_reading
 
 __all__ = ["CalibrationReportDialog", "enlarged"]
 
@@ -129,14 +136,16 @@ def _wrapped(
 
 
 class CalibrationReportDialog(QDialog):
-    """What a calibration found, on three pages.
+    """What a calibration found, on four pages.
 
     **Regions**: every region at its best and at the compromise, side by side,
     with the numbers. **Film**: the shape the regions' depths make, in three
     dimensions over the sensor, with the lean of its edges and how far it bows
     between them -- what levelling needs. **Search**: every region's sharpness
     through the search, one line each, which is what makes the compromise it
-    arrived at make sense.
+    arrived at make sense. **Activity log**: what was said while it ran.
+
+    *source* is the file the report was opened from, if it was.
     """
 
     def __init__(
@@ -146,9 +155,15 @@ class CalibrationReportDialog(QDialog):
         save_to: Path,
         parent: "QWidget | None" = None,
         aspect: float = 1.5,
+        source: "Path | None" = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Focus calibration")
+        self._source = Path(source) if source is not None else None
+        self.setWindowTitle(
+            f"Focus calibration - {self._source.name}"
+            if self._source is not None
+            else "Focus calibration"
+        )
         self._report = report
         self._orientation = orientation
         self._save_to = save_to
@@ -198,11 +213,27 @@ class CalibrationReportDialog(QDialog):
         ))
         search.addStretch(1)
         self._tabs.addTab(self._search_page, "The search")
+
+        self._log_text = QPlainTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self._log_text.setFont(font)
+        self._tabs.addTab(self._log_text, "Activity log")
         layout.addWidget(self._tabs, 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        save = QPushButton("Save as picture...")
+        keep = QPushButton("Save report...")
+        keep.setToolTip(
+            "Write the whole report out as one file -- every region's pictures "
+            "and numbers, the film's shape, the search and the activity log -- "
+            "to open again later with File > Open focus report."
+        )
+        keep.clicked.connect(self._save_report)
+        buttons.addWidget(keep)
+        save = QPushButton("Save page as picture...")
         save.setToolTip(
             "Write the page on show out as a PNG, the way it looks here, to keep "
             "alongside the scans it was made for."
@@ -261,12 +292,18 @@ class CalibrationReportDialog(QDialog):
     def _fill(self) -> None:
         report = self._report
         self._summary.setText(report.describe())
-        self._cost.setText(report.cost())
-        self._cost.setVisible(bool(report.cost()))
+        cost = report.cost()
+        if report.began > 0.0:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(report.began))
+            cost = f"Calibrated {when}" + (f". {cost}" if cost else "")
+        self._cost.setText(cost)
+        self._cost.setVisible(bool(cost))
         self._fill_regions()
         self._fill_film()
         self._chart.set_combined_name(report.objective)
         self._chart.set_history(report.history_regions, report.history)
+        self._log_text.setPlainText("\n".join(report.log))
+        self._log_text.setPlaceholderText("Nothing was logged with this report.")
 
     def _fill_regions(self) -> None:
         report = self._report
@@ -419,7 +456,7 @@ class CalibrationReportDialog(QDialog):
     def _caption(look: "Look | None", kind: str, fraction: "float | None") -> str:
         if look is None:
             return "no compromise found" if kind == "compromise" else "not tuned"
-        reading = f"{look.reading:.0f}" if look.reading >= 100 else f"{look.reading:.1f}"
+        reading = format_reading(look.reading)
         if kind == "compromise" and fraction is not None:
             return f"sharpness {reading}, {fraction:.0%} of its best"
         return f"sharpness {reading}"
@@ -434,20 +471,55 @@ class CalibrationReportDialog(QDialog):
             return self._content, "regions"
         if page is self._film_page:
             return self._film_page, "film"
+        if page is self._log_text:
+            return self._log_text, "log"
         return self._search_page, "search"
 
-    def _save(self) -> None:
-        widget, word = self._page_to_save()
-        stem = f"focus-report-{time.strftime('%Y%m%d-%H%M%S')}-{word}.png"
+    def _stem(self) -> str:
+        """What a file saved from this report is called, by when it was made."""
+        when = self._report.began if self._report.began > 0.0 else time.time()
+        return f"focus-report-{time.strftime('%Y%m%d-%H%M%S', time.localtime(when))}"
+
+    def _folder(self) -> Path:
+        """Where to offer to save: beside the file it came from, or the pictures."""
+        if self._source is not None:
+            return self._source.parent
         try:
             self._save_to.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
+        return self._save_to
+
+    def _save(self) -> None:
+        widget, word = self._page_to_save()
         chosen, _ = QFileDialog.getSaveFileName(
-            self, "Save the report", str(self._save_to / stem), "PNG (*.png)"
+            self,
+            "Save the page as a picture",
+            str(self._folder() / f"{self._stem()}-{word}.png"),
+            "PNG (*.png)",
         )
         if not chosen:
             return
         picture = QWidget.grab(widget)
         if not picture.save(chosen, "PNG"):
             self._summary.setText(f"Could not write {chosen}")
+
+    def _save_report(self) -> None:
+        """The whole report, as a document that can be opened again."""
+        suggested = (
+            self._source
+            if self._source is not None
+            else self._folder() / f"{self._stem()}{SUFFIX}"
+        )
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Save the report", str(suggested), REPORT_FILTER
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix.lower() != SUFFIX:
+            path = path.with_name(path.name + SUFFIX)
+        try:
+            save_report(path, self._report, self._aspect)
+        except ReportFileError as exc:
+            self._summary.setText(str(exc))

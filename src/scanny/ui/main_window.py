@@ -44,9 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..camera.nikon import NikonCamera, Setting
-from .depth import LEVELS, as_steps_image, colourise
 from .activity import ActivityLog, ActivityWindow
-from .depthview import DepthView
 from .histogram import HistogramWidget
 from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES, source_fps
 from .liveview import LiveViewWidget
@@ -65,6 +63,8 @@ from .regions import (
     summarise,
 )
 from .report import CalibrationReportDialog
+from .reportfile import REPORT_FILTER, ReportFileError, load_report
+from .sharpness import format_reading
 from .trend import TrendGraph
 from .worker import _FRAME_INTERVAL_MS, CameraWorker
 
@@ -87,9 +87,10 @@ def _stored_int(
     return value if low <= value <= high else default
 
 
-def _reading(value: float) -> str:
-    """A reading, with a decimal only while it is small enough to want one."""
-    return f"{value:.0f}" if value >= 100 else f"{value:.1f}"
+def _yes(on: bool) -> str:
+    return "yes" if on else "no"
+
+
 
 #: The slider steps through the levels the body accepts, not a raw 0-7 range,
 #: so every position is reachable.
@@ -104,10 +105,6 @@ _SIDEBAR_WIDTH = 310
 #: lens -- and making the walk finer or coarser is a matter of changing what
 #: "minimum" means.
 _FINE_INCREMENT = "minimum"
-
-#: The grids the depth map offers, coarsest first. Level numbers are the
-#: pyramid's own; see :mod:`scanny.ui.depth`.
-_DEPTH_DETAIL = (("Coarse", 0), ("Medium", 1), ("Fine", LEVELS - 1))
 
 #: Where a freshly switched-on measurement area starts: a third of the frame,
 #: in the middle of it. Small enough to be worth having over the whole frame,
@@ -259,19 +256,14 @@ class MainWindow(QMainWindow):
     requestSharpnessArea = Signal(object)  # (x, y, w, h) fractions, or None
     requestFineTune = Signal(int)  # the one increment to walk in
     requestHuntCancel = Signal()
-    #: Sweep focus and map the depth of the scene: stops per pass, how many
-    #: passes, the smallest step this lens answers to, and whether to cover
-    #: only the stretch the last map found something in.
-    requestDepthMap = Signal(int, int, int, bool)
-    requestDepthCancel = Signal()
-    requestDepthDetail = Signal(int)  # which grid to draw the map at
     #: The focus regions, as fractions of the whole frame. Sent whole on every
     #: change, since any of them may move.
     requestFocusRegions = Signal(object)
     #: Calibrate them, walking in this many drive steps -- the lens minimum --
-    #: aiming for one of scanny.ui.regions.OBJECTIVES, and turning a walk back
-    #: once it has fallen below this percentage of its best.
-    requestCalibration = Signal(int, str, int, bool)
+    #: aiming for one of scanny.ui.regions.OBJECTIVES, turning a walk back
+    #: once it has fallen below this percentage of its best, measuring depths
+    #: or not -- and the settings only the panel knows, for the log.
+    requestCalibration = Signal(int, str, int, bool, object)
     requestCalibrationCancel = Signal()
     #: Naming for downloaded pictures: on, the prefix, and the next number.
     #: Sent whole on every change, since an override may touch any of them.
@@ -293,8 +285,6 @@ class MainWindow(QMainWindow):
         self._sharpness_shown = 0.0
         self._hunting = False
         self._measure_area = _DEFAULT_MEASURE_AREA
-        self._mapping = False
-        self._depth_map = None
         # The rectangles someone ctrl-dragged, and what the last calibration
         # made of them. The regions outlive a calibration; the report does not.
         #
@@ -309,6 +299,12 @@ class MainWindow(QMainWindow):
         # Which region the calibration is fine tuning, drawn dashed, or -1.
         self._active_region = -1
         self._report_dialog: "CalibrationReportDialog | None" = None
+        # Reports opened from files, each in a window of its own so that an
+        # old one can be set beside the one just made.
+        self._opened_reports: "list[CalibrationReportDialog]" = []
+        # Whether the calibration running now was asked to stop, which is the
+        # one way of ending it that does not want the bell.
+        self._stop_asked = False
         #: Everything the worker says, kept with the time: see scanny.ui.activity.
         self.activity = ActivityLog(self)
         self._activity_window: "ActivityWindow | None" = None
@@ -553,7 +549,6 @@ class MainWindow(QMainWindow):
         column.addWidget(self._build_view_box())
         column.addWidget(self._build_focus_box())
         column.addWidget(self._build_regions_box())
-        column.addWidget(self._build_depth_box())
         column.addWidget(self._build_exposure_box())
         column.addWidget(self._build_capture_box())
         column.addStretch(1)
@@ -675,8 +670,7 @@ class MainWindow(QMainWindow):
         column.addWidget(self.orientation_label)
 
         hint = WrappedLabel(
-            "The image, the navigator, the depth map and the focus report "
-            "all follow. The "
+            "The image, the navigator and the focus report all follow. The "
             "histogram, the readings and the pictures the camera saves do "
             "not: this changes what you are looking at, not what is measured "
             "or recorded."
@@ -795,9 +789,8 @@ class MainWindow(QMainWindow):
 
         self.view.set_orientation(orientation)
         self.navigator.set_orientation(orientation)
-        self.depth_view.set_orientation(orientation)
-        if self._report_dialog is not None:
-            self._report_dialog.set_orientation(orientation)
+        for dialog in self._report_dialogs():
+            dialog.set_orientation(orientation)
         # The histogram is deliberately not on that list. It is read to judge
         # exposure and clipping in what the camera is recording, and inverting
         # it would report a blown highlight as a blocked shadow -- the one
@@ -1263,7 +1256,8 @@ class MainWindow(QMainWindow):
         self.report_button = QPushButton("Report...")
         self.report_button.setToolTip(
             "Every region at its own best and at the compromise, side by side "
-            "with the numbers, shown the way the view is."
+            "with the numbers, shown the way the view is. Save it from there "
+            "as a document, and open it again with File > Open focus report."
         )
         self.report_button.clicked.connect(self._show_report)
         buttons.addWidget(self.report_button)
@@ -1428,6 +1422,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_calibration(self) -> None:
         if self._calibrating:
+            self._stop_asked = True
             self.requestCalibrationCancel.emit()
             return
         self.requestCalibration.emit(
@@ -1435,7 +1430,29 @@ class MainWindow(QMainWindow):
             str(self.regions_objective.currentData()),
             self.regions_turn_back.value(),
             self.regions_depths.isChecked(),
+            self._panel_settings(),
         )
+
+    def _panel_settings(self) -> "list[tuple[str, str, str]]":
+        """The settings only the panel knows, as (group, name, value).
+
+        For the calibration's log, which has everything else from the worker
+        and the camera. Every focus increment, not only the one the
+        calibration walks in, and the way the view is shown -- which the
+        pictures in its report are drawn by.
+        """
+        said = [
+            ("Focus", f"{name} increment", f"{spin.value()} steps")
+            for name, spin in self._focus_steps.items()
+        ]
+        said.append(("View", "shown", self._orientation.describe()))
+        said.append(
+            ("Capture", "autofocus before shooting", _yes(self.af_before_shot.isChecked()))
+        )
+        said.append(
+            ("Capture", "download to computer", _yes(self.download_after_shot.isChecked()))
+        )
+        return said
 
     def _on_objective_changed(self) -> None:
         QSettings().setValue("regions/objective", self.regions_objective.currentData())
@@ -1445,8 +1462,18 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _on_calibration_changed(self, calibrating: bool) -> None:
-        self._calibrating = calibrating
+        """A calibration began or ended.
+
+        One that ends by itself -- finished, or stopped by something going
+        wrong -- sounds the system bell: it takes minutes, and whoever
+        started it has usually gone to do something else. One stopped from
+        here does not; whoever stopped it is looking.
+        """
+        was_calibrating, self._calibrating = self._calibrating, calibrating
         self.calibrate_button.setText("Stop" if calibrating else "Calibrate")
+        if was_calibrating and not calibrating and not self._stop_asked:
+            QApplication.beep()
+        self._stop_asked = False
         if calibrating:
             self._calibration_began = time.monotonic()
             self._progress_said = ""
@@ -1523,6 +1550,42 @@ class MainWindow(QMainWindow):
         self._report_dialog.raise_()
         self._report_dialog.activateWindow()
 
+    def _report_dialogs(self) -> "list[CalibrationReportDialog]":
+        """Every report window: the last calibration's, and any opened from files."""
+        live = [self._report_dialog] if self._report_dialog is not None else []
+        return live + self._opened_reports
+
+    def _open_report_file(self) -> None:
+        """A report saved earlier, in a window of its own."""
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Open a focus report", str(self._save_directory()), REPORT_FILTER
+        )
+        if not chosen:
+            return
+        try:
+            saved = load_report(chosen)
+        except ReportFileError as exc:
+            self.statusBar().showMessage(str(exc), 8000)
+            return
+        dialog = CalibrationReportDialog(
+            saved.report,
+            self._orientation,
+            self._save_directory(),
+            self,
+            aspect=saved.aspect,
+            source=Path(chosen),
+        )
+        self._opened_reports.append(dialog)
+        dialog.finished.connect(lambda _result, d=dialog: self._forget_report(d))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _forget_report(self, dialog: CalibrationReportDialog) -> None:
+        if dialog in self._opened_reports:
+            self._opened_reports.remove(dialog)
+            dialog.deleteLater()
+
     def _frame_shape(self) -> float:
         """The sensor frame's width over its height, for drawing the film."""
         frame = self.view.frame
@@ -1545,252 +1608,6 @@ class MainWindow(QMainWindow):
             worker.save_directory
             if worker is not None
             else Path.home() / "Pictures" / "scanny"
-        )
-
-    def _build_depth_box(self) -> QGroupBox:
-        """Mapping how far away each part of the scene is, by sweeping focus.
-
-        It lives under the focus controls because it is made of them: the
-        number the sharpness meter reads, asked of every part of the picture
-        at once, at a series of focus positions.
-        """
-        box = QGroupBox("Depth map")
-        column = QVBoxLayout(box)
-        column.setSpacing(4)
-
-        self.depth_view = DepthView()
-        self.depth_view.setToolTip(
-            "Where each part of the picture was sharpest, in drive steps from "
-            "the near end of the lens's travel. Near is the left of the scale "
-            "and far the right; a zone with nothing in it to focus on is left "
-            "dark, and one that took its answer from the larger zone around it "
-            "is drawn dimmer."
-        )
-        column.addWidget(self.depth_view)
-
-        self.depth_label = WrappedLabel("")
-        self.depth_label.setStyleSheet("color: #888; font-size: 11px;")
-        self.depth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.addWidget(self.depth_label)
-
-        # Where the sweep decided to look, kept in front of you while it runs.
-        # In the status bar it is one message among all the others and scrolls
-        # away, and it is the line that says whether the sweep was pointed at
-        # the right part of the travel at all.
-        self.depth_sweeping = WrappedLabel("")
-        self.depth_sweeping.setStyleSheet("color: #888; font-size: 11px;")
-        self.depth_sweeping.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.depth_sweeping.setToolTip(
-            "Which stretch of the travel this sweep is covering, in drive steps "
-            "from the near stop, and the step it is covering it in. It is chosen "
-            "by driving the whole travel once and watching where the picture "
-            "answers focus at all."
-        )
-        column.addWidget(self.depth_sweeping)
-
-        settings = QSettings()
-        form = QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setHorizontalSpacing(6)
-        form.setVerticalSpacing(4)
-
-        self.depth_samples = QSpinBox()
-        self.depth_samples.setRange(8, 400)
-        self.depth_samples.setValue(_stored_int(settings, "depth/samples", 40, 8, 400))
-        self.depth_samples.setToolTip(
-            "How many places each pass stops to read the picture. Every stop "
-            "is a focus move and a wait for live view to catch up, so this is "
-            "what the sweep costs -- about half a second each."
-            "\n\n"
-            "They are spread over the part of the travel the picture answers "
-            "focus in, not over the whole of it: on a macro lens most of the "
-            "travel is the first few centimetres, and a stop spent in that wash "
-            "measures nothing. Raise this for a subject whose depth of field is "
-            "a hair -- the first pass has to land near enough to focus "
-            "somewhere to have anything to refine."
-        )
-        self.depth_samples.editingFinished.connect(self.view.setFocus)
-        form.addRow("Stops per pass", self.depth_samples)
-
-        self.depth_passes = QSpinBox()
-        self.depth_passes.setRange(1, 6)
-        self.depth_passes.setValue(_stored_int(settings, "depth/passes", 3, 1, 6))
-        self.depth_passes.setToolTip(
-            "How many times the travel is swept. The first pass walks the whole "
-            "of it coarsely; each one after it sweeps only the stretch the last "
-            "one found anything in, in a step several times finer. It stops "
-            "early on its own once the step is down to the minimum increment."
-        )
-        self.depth_passes.editingFinished.connect(self.view.setFocus)
-        form.addRow("Passes", self.depth_passes)
-
-        self.depth_detail = QComboBox()
-        for name, level in _DEPTH_DETAIL:
-            self.depth_detail.addItem(name, level)
-        self.depth_detail.setToolTip(
-            "How finely the picture is divided. Costs nothing to change, before "
-            "or after a sweep: a coarse zone's numbers are the sum of the fine "
-            "zones inside it, so every grid was measured by the same pass. "
-            "Coarse is steadier, fine follows edges."
-        )
-        stored_detail = _stored_int(settings, "depth/detail", LEVELS - 1, 0, LEVELS - 1)
-        self.depth_detail.setCurrentIndex(
-            max(0, self.depth_detail.findData(stored_detail))
-        )
-        self.depth_detail.currentIndexChanged.connect(self._on_depth_detail_changed)
-        form.addRow("Detail", self.depth_detail)
-
-        self.depth_range = QComboBox()
-        self.depth_range.addItem("The whole travel", False)
-        self.depth_range.addItem("Where the last map found something", True)
-        self.depth_range.setToolTip(
-            "The first run has to cover the whole travel, because nothing here "
-            "knows where in it the scene is -- and on a macro lens most of that "
-            "travel is the first few centimetres, where an ordinary scene has "
-            "nothing in focus at all."
-            "\n\n"
-            "Running it again over what the last one found is what produces a "
-            "map worth trusting, and not only because the stops are not wasted. "
-            "A lens changes how big the picture is as it focuses, and a "
-            "defocused highlight is a big disc that shrinks as focus comes to "
-            "it. Both slide the scene about underneath the zones, both are "
-            "worst over a wide sweep, and both are small over a narrow one."
-        )
-        self.depth_range.setEnabled(False)
-        form.addRow("Sweep", self.depth_range)
-        column.addLayout(form)
-
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 0, 0, 0)
-        self.depth_button = QPushButton("Map depth")
-        self.depth_button.setToolTip(
-            "Park focus against its near stop, find which part of the travel "
-            "the picture answers focus in at all, and sweep that -- reading the "
-            "whole picture at every stop. Nothing else may touch focus or the "
-            "view while it runs: doing so stops it, because readings either "
-            "side of that are not comparable."
-        )
-        self.depth_button.clicked.connect(self._toggle_depth_map)
-        buttons.addWidget(self.depth_button, 1)
-
-        self.depth_save_button = QPushButton("Save...")
-        self.depth_save_button.setEnabled(False)
-        self.depth_save_button.setToolTip(
-            "Write the map out twice: the colour picture as you see it, scaled "
-            "to the live-view frame, and a sixteen-bit greyscale beside it at "
-            "the grid's own size, where the level is the focus position and "
-            "black means no answer."
-        )
-        self.depth_save_button.clicked.connect(self._save_depth_map)
-        buttons.addWidget(self.depth_save_button)
-        column.addLayout(buttons)
-
-        hint = WrappedLabel(
-            "The map is in drive steps, not metres: nothing here knows the "
-            "lens, so it can say which parts are nearer than which and by how "
-            "much, in the only unit there is.\n\n"
-            "The first run covers the whole travel and is reconnaissance. Run "
-            "it again over what it found: the lens breathes and defocused "
-            "highlights swell into discs, and both slide the scene under the "
-            "zones over a wide sweep and hardly at all over a narrow one."
-        )
-        hint.setStyleSheet("color: #888; font-size: 11px;")
-        column.addWidget(hint)
-        return box
-
-    def _toggle_depth_map(self) -> None:
-        if self._mapping:
-            self.requestDepthCancel.emit()
-            return
-        settings = QSettings()
-        settings.setValue("depth/samples", self.depth_samples.value())
-        settings.setValue("depth/passes", self.depth_passes.value())
-        self.requestDepthMap.emit(
-            self.depth_samples.value(),
-            self.depth_passes.value(),
-            self._focus_steps[_FINE_INCREMENT].value(),
-            bool(self.depth_range.currentData()),
-        )
-
-    def _on_depth_detail_changed(self) -> None:
-        level = self.depth_detail.currentData()
-        QSettings().setValue("depth/detail", level)
-        self.requestDepthDetail.emit(int(level))
-        # The combo needed the keyboard for its popup; give it back to the
-        # image, as every other combo here does.
-        self.view.setFocus()
-
-    @Slot(bool)
-    def _on_depth_changed(self, mapping: bool) -> None:
-        self._mapping = mapping
-        self.depth_button.setText("Stop" if mapping else "Map depth")
-        if not mapping:
-            self.depth_sweeping.setText("")
-        # The two that decide the shape of the sweep are settled before it
-        # starts; the detail is not, and is worth changing while watching.
-        for control in (self.depth_samples, self.depth_passes, self.depth_range):
-            control.setEnabled(not mapping and self._can_narrow(control))
-
-    def _can_narrow(self, control) -> bool:
-        """Whether *control* has anything to offer yet.
-
-        Only the range does: there is nothing to narrow to until a map has
-        been made, and offering the choice before then invites picking it and
-        getting the whole travel anyway.
-        """
-        return control is not self.depth_range or self._depth_map is not None
-
-    @Slot(object)
-    def _on_depth_map(self, depth_map) -> None:
-        self._depth_map = depth_map
-        self.depth_view.show_map(depth_map)
-        self.depth_label.setText(
-            depth_map.describe() if depth_map is not None else ""
-        )
-        self.depth_save_button.setEnabled(depth_map is not None)
-        if not self._mapping:
-            self.depth_range.setEnabled(depth_map is not None)
-
-    def _save_depth_map(self) -> None:
-        """Write the map out, as a picture to look at and as one to read.
-
-        Two files, because they are wanted for different things and no one
-        format does both: the colour one is the readout, and the greyscale one
-        is the measurement, at the grid's own resolution and with the two ends
-        of its scale in the status line and in its name.
-        """
-        depth_map = self._depth_map
-        if depth_map is None:
-            return
-        near, far = depth_map.range
-        stem = f"depth-{time.strftime('%Y%m%d-%H%M%S')}-{near:.0f}-{far:.0f}"
-        directory = self.worker.save_directory
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        chosen, _ = QFileDialog.getSaveFileName(
-            self, "Save the depth map", str(directory / f"{stem}.png"), "PNG (*.png)"
-        )
-        if not chosen:
-            return
-        picture = Path(chosen)
-        steps = picture.with_name(f"{picture.stem}-steps.png")
-        frame = self.view.frame
-        drawn = colourise(
-            depth_map,
-            frame.width if frame is not None else 0,
-            frame.height if frame is not None else 0,
-        )
-        if not drawn.save(str(picture), "PNG") or not as_steps_image(depth_map).save(
-            str(steps), "PNG"
-        ):
-            self.statusBar().showMessage(f"Could not write {picture}", 8000)
-            return
-        self.statusBar().showMessage(
-            f"Saved {picture.name} and {steps.name}: level 1 is {near:.0f} steps "
-            f"and 65535 is {far:.0f}, level 0 no answer",
-            12000,
         )
 
     def _build_manual_focus(self) -> QWidget:
@@ -2164,6 +1981,16 @@ class MainWindow(QMainWindow):
         )
 
     def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+        open_report = QAction("&Open focus report...", self)
+        open_report.setShortcut(QKeySequence.StandardKey.Open)
+        open_report.setToolTip(
+            "A calibration's report saved earlier with Save report..., with "
+            "its pictures, the film's shape, the search and its activity log."
+        )
+        open_report.triggered.connect(self._open_report_file)
+        file_menu.addAction(open_report)
+
         camera_menu = self.menuBar().addMenu("&Camera")
 
         reconnect = QAction("&Reconnect", self)
@@ -2250,9 +2077,6 @@ class MainWindow(QMainWindow):
         self.requestSharpnessArea.connect(self.worker.set_sharpness_area)
         self.requestFineTune.connect(self.worker.fine_tune)
         self.requestHuntCancel.connect(self.worker.cancel_hunt)
-        self.requestDepthMap.connect(self.worker.start_depth_map)
-        self.requestDepthCancel.connect(self.worker.cancel_depth_map)
-        self.requestDepthDetail.connect(self.worker.set_depth_detail)
         self.requestFocusRegions.connect(self.worker.set_focus_regions)
         self.requestCalibration.connect(self.worker.start_calibration)
         self.requestCalibrationCancel.connect(self.worker.cancel_calibration)
@@ -2269,13 +2093,10 @@ class MainWindow(QMainWindow):
         self.worker.fpsChanged.connect(self._on_fps)
         self.worker.sharpnessChanged.connect(self._on_sharpness)
         self.worker.huntChanged.connect(self._on_hunt_changed)
-        self.worker.depthChanged.connect(self._on_depth_changed)
-        self.worker.depthMapReady.connect(self._on_depth_map)
         self.worker.calibrationReady.connect(self._on_calibration_report)
         self.worker.calibrationChanged.connect(self._on_calibration_changed)
         self.worker.calibrationProgress.connect(self._on_calibration_progress)
         self.worker.calibrationProbe.connect(self._on_calibration_probe)
-        self.worker.sweeping.connect(self.depth_sweeping.setText)
         self.worker.exposurePreviewChanged.connect(self._on_exposure_preview)
         self.worker.saveToCardChanged.connect(self._on_save_to_card)
         self.worker.shutterDelaysAvailable.connect(self._on_shutter_delays)
@@ -2310,7 +2131,6 @@ class MainWindow(QMainWindow):
         self.requestDeduplicate.emit(self.deduplicate.isChecked())
         self.requestSharpness.emit(self.measure_sharpness.isChecked())
         self._apply_measure_area()
-        self.requestDepthDetail.emit(int(self.depth_detail.currentData()))
         self.requestFocusRegions.emit(list(self._regions))
         self.requestSaveToCard.emit(self.save_to_card.isChecked())
         self.requestShutterDelay.emit(self._chosen_shutter_delay())
@@ -2460,11 +2280,11 @@ class MainWindow(QMainWindow):
             self.sharpness_label.setText("Waiting for a frame...")
             return
         if value >= peak:
-            self.sharpness_label.setText(f"{_reading(value)}   -   best so far")
+            self.sharpness_label.setText(f"{format_reading(value)}   -   best so far")
             return
         self.sharpness_label.setText(
-            f"{_reading(value)}   -   {100 * value / peak:.0f}% of best "
-            f"{_reading(peak)}"
+            f"{format_reading(value)}   -   {100 * value / peak:.0f}% of best "
+            f"{format_reading(peak)}"
         )
 
     def _on_save_to_card_toggled(self, enabled: bool) -> None:

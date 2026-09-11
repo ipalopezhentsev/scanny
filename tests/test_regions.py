@@ -55,10 +55,53 @@ from scanny.ui.regions import (  # noqa: E402
     summarise,
 )
 from scanny.ui.sharpness import measure  # noqa: E402
-from test_depth import _blur, _image, _texture  # noqa: E402
 
 #: The lens's minimum increment, as the panel has it by default.
 STEP = 6
+
+
+# -- pictures ----------------------------------------------------------------
+
+
+def _texture(height: int, width: int, seed: int = 1) -> np.ndarray:
+    """Detail that does not repeat, which is what real subjects look like."""
+    field = np.random.default_rng(seed).normal(0, 1, (height, width))
+    for _ in range(2):
+        field = (
+            field
+            + np.roll(field, 1, 0) + np.roll(field, -1, 0)
+            + np.roll(field, 1, 1) + np.roll(field, -1, 1)
+        ) / 5
+    return np.clip(128 + 55 * field / field.std(), 0, 255)
+
+
+def _blur(pixels: np.ndarray, passes: float) -> np.ndarray:
+    """Soften by a smooth number of passes, so the reading is not a staircase."""
+    stages = [pixels]
+    for _ in range(int(passes) + 1):
+        last = stages[-1]
+        stages.append(
+            (
+                last
+                + np.roll(last, 1, 0) + np.roll(last, -1, 0)
+                + np.roll(last, 1, 1) + np.roll(last, -1, 1)
+            ) / 5
+        )
+    whole = int(passes)
+    weight = passes - whole
+    return stages[whole] * (1 - weight) + stages[whole + 1] * weight
+
+
+def _image(pixels: np.ndarray) -> QImage:
+    height, width = pixels.shape
+    grey = np.clip(pixels, 0, 255).astype(np.uint8)
+    buffer = np.zeros((height, width, 4), np.uint8)
+    for channel in range(3):
+        buffer[:, :, channel] = grey
+    buffer[:, :, 3] = 255
+    return QImage(
+        buffer.tobytes(), width, height, width * 4, QImage.Format.Format_RGB32
+    ).copy()
 
 
 # -- regions, as places on the sensor ----------------------------------------
@@ -1687,7 +1730,7 @@ def test_the_report_has_the_film_and_the_search_on_pages_of_their_own(window):
     report = _levelled_report(lambda x, y: 30 * x + 10 * y, corners)
     dialog = CalibrationReportDialog(report, Orientation(), window._save_directory(), window)
     assert [dialog._tabs.tabText(i) for i in range(dialog._tabs.count())] == [
-        "Regions", "Film shape", "The search",
+        "Regions", "Film shape", "The search", "Activity log",
     ]
     assert dialog._film_view._surface is not None
     assert len(dialog._film_view._marks) == 4
@@ -1753,3 +1796,230 @@ def test_the_activity_window_follows_the_log_as_it_grows(window):
     worker.log.connect(window.activity.add)
     worker.log.emit("Compromise probe 4 (across): 1: 90%, 2: 71% -> 71%")
     assert "Compromise probe 4" in shown.text
+
+
+# -- the report as a document, and the bell ------------------------------------
+
+
+def _documented_report() -> CalibrationReport:
+    """A report with everything in it a file has to carry: pictures, depths,
+    an unknown doubt, a region never reached, the search and its log."""
+    from dataclasses import replace
+
+    pixels = np.zeros((10, 20))
+    pixels[:, 10:] = 255.0
+    picture = _image(pixels)
+    places = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
+    levelled = _levelled_report(lambda x, y: 30 * x + 10 * y, places)
+    results = list(levelled.results)
+    results[0] = replace(
+        results[0], best=Look(152.345, picture), compromise=Look(140.5, picture)
+    )
+    results[1] = replace(results[1], doubt=float("inf"), edge=True)
+    results[3] = replace(results[3], best=None, compromise=None, depth=None)
+    return replace(
+        levelled,
+        results=tuple(results),
+        probes=2,
+        objective="worst",
+        seconds=372.5,
+        tune_probes=(41, 37, 12),
+        autofocuses=3,
+        moves=90,
+        travel=540,
+        history=(("out", (0.9, 0.8, 0.7), 0.7), ("across", (0.95, 0.85, 0.75), 0.75)),
+        history_regions=(1, 2, 3),
+        depths_measured=True,
+        began=1_789_000_000.0,
+        log=("14:03:01  Calibration started", "14:03:02  !! the camera refused: busy"),
+    )
+
+
+def test_the_whole_report_can_be_saved_and_opened_again(app, tmp_path):
+    from scanny.ui.reportfile import load_report, save_report
+
+    report = _documented_report()
+    path = tmp_path / "levelling.focusreport"
+    save_report(path, report, aspect=1.5)
+    saved = load_report(path)
+    assert saved.report == report, "every number comes back as it went"
+    assert saved.aspect == pytest.approx(1.5)
+    best = saved.report.results[0].best.picture
+    assert (best.width(), best.height()) == (20, 10)
+    assert QImage(best).pixelColor(15, 5).red() == 255
+    assert saved.report.results[1].best.picture is None
+    assert saved.report.tilt() == report.tilt(), "and so does the film's shape"
+    assert not list(tmp_path.glob("*.part")), "nothing left over from writing it"
+
+
+def test_a_file_that_is_not_a_report_is_refused(app, tmp_path):
+    import zipfile
+
+    from scanny.ui.reportfile import ReportFileError, load_report
+
+    text = tmp_path / "notes.focusreport"
+    text.write_text("not a report", encoding="utf-8")
+    with pytest.raises(ReportFileError):
+        load_report(text)
+    other = tmp_path / "other.focusreport"
+    with zipfile.ZipFile(other, "w") as archive:
+        archive.writestr("readme.txt", "hello")
+    with pytest.raises(ReportFileError, match="not a focus report"):
+        load_report(other)
+    with pytest.raises(ReportFileError):
+        load_report(tmp_path / "missing.focusreport")
+
+
+def test_the_report_window_saves_the_whole_document(window, tmp_path, monkeypatch):
+    from scanny.ui import report as module
+    from scanny.ui.report import CalibrationReportDialog
+    from scanny.ui.reportfile import load_report
+
+    report = _documented_report()
+    dialog = CalibrationReportDialog(report, Orientation(), tmp_path, window)
+    offered = []
+
+    def choose(parent, title, suggested, kinds):
+        offered.append(suggested)
+        return str(tmp_path / "kept"), kinds
+
+    monkeypatch.setattr(module.QFileDialog, "getSaveFileName", choose)
+    dialog._save_report()
+    assert offered[0].endswith(".focusreport")
+    assert "focus-report-" in offered[0]
+    # The suffix is put on when it was left off.
+    assert load_report(tmp_path / "kept.focusreport").report == report
+
+
+def test_a_report_opened_from_a_file_has_a_window_of_its_own(window, tmp_path, monkeypatch):
+    from scanny.ui.reportfile import save_report
+
+    path = tmp_path / "levelling.focusreport"
+    save_report(path, _documented_report(), aspect=1.5)
+    monkeypatch.setattr(
+        mw.QFileDialog, "getOpenFileName", lambda *args: (str(path), "")
+    )
+    window._open_report_file()
+    assert len(window._opened_reports) == 1
+    dialog = window._opened_reports[0]
+    assert "levelling.focusreport" in dialog.windowTitle()
+    assert "Calibration started" in dialog._log_text.toPlainText()
+    assert "Calibrated " in dialog._cost.text()
+    assert dialog._film_view._surface is not None
+    # It follows the view like the last calibration's report does.
+    window._turn_view(1)
+    assert dialog._orientation.turns == 1
+    dialog.close()
+    QApplication.processEvents()
+    assert window._opened_reports == []
+
+
+def test_a_file_that_will_not_open_is_said_so(window, tmp_path, monkeypatch):
+    broken = tmp_path / "broken.focusreport"
+    broken.write_text("nothing", encoding="utf-8")
+    monkeypatch.setattr(
+        mw.QFileDialog, "getOpenFileName", lambda *args: (str(broken), "")
+    )
+    window._open_report_file()
+    assert window._opened_reports == []
+    assert "broken.focusreport" in window.statusBar().currentMessage()
+
+
+def test_what_was_said_while_calibrating_goes_into_its_report(worker):
+    rig = _Rig(PLACES)
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+    said = "\n".join(report.log)
+    assert report.log[0].split("  ", 1)[1].startswith("   Calibration started")
+    assert "Region 1 of 3" in said
+    assert "Compromise probe 1" in said
+    assert "Calibration finished" in report.log[-1]
+    assert report.began > 0.0
+    assert worker._calibration_said is None, "and nothing after it is kept"
+
+
+def test_the_bell_sounds_when_a_calibration_ends_by_itself(window, monkeypatch):
+    rung = []
+    monkeypatch.setattr(QApplication, "beep", lambda: rung.append(True))
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._on_calibration_changed(True)
+    window._on_calibration_changed(False)
+    assert rung == [True]
+    # Stopped from here, whoever stopped it is looking.
+    window._on_calibration_changed(True)
+    window.calibrate_button.click()
+    window._on_calibration_changed(False)
+    assert rung == [True]
+    # And the next one that finishes rings again.
+    window._on_calibration_changed(True)
+    window._on_calibration_changed(False)
+    assert rung == [True, True]
+
+
+def test_every_setting_is_logged_when_a_calibration_starts(worker, monkeypatch):
+    """What a report was made under has to be readable off it later, all of
+    it: the calibration's own choices, the camera's, live view's, and the
+    panel's, one to a line."""
+    from scanny.camera.nikon import Setting
+
+    rig = _Rig(PLACES)
+    rig.model = "Nikon D750"
+    rig.exposure_preview = True
+    monkeypatch.setattr(
+        rig,
+        "settings",
+        lambda: [
+            Setting(0x500D, "Shutter speed", 60, "1/60", True, ()),
+            Setting(0x500E, "Exposure mode", 1, "Manual", False, ()),
+        ],
+        raising=False,
+    )
+    worker._camera = rig
+    worker.set_integration(True, 3)
+    for _ in range(4):
+        worker._grab()
+    worker.set_focus_regions(_regions_round(PLACES))
+    reports = []
+    worker.calibrationReady.connect(reports.append)
+    panel = [("Focus", "coarse increment", "500 steps"), ("View", "shown", "Rotated")]
+    worker.start_calibration(STEP, "worst", 65, True, panel)
+    worker.cancel_calibration()
+    said = [line.split("  ", 1)[1].strip() for line in reports[-1].log]
+    settings = [line for line in said if line.startswith("Setting  ")]
+    for wanted in (
+        "Setting  Calibration > regions: 3",
+        "Setting  Calibration > aim for: the best worst region",
+        "Setting  Calibration > turn back below: 65% of the best",
+        f"Setting  Calibration > walk in steps of: {STEP}",
+        "Setting  Calibration > measure depths for levelling: yes",
+        "Setting  Camera > model: Nikon D750",
+        "Setting  Exposure > Shutter speed: 1/60",
+        "Setting  Exposure > Exposure mode: Manual (set on the body)",
+        "Setting  Live view > exposure preview: yes",
+        "Setting  Live view > integrate: 3 frames",
+        "Setting  Live view > skip repeated frames: yes",
+        "Setting  Focus > coarse increment: 500 steps",
+        "Setting  View > shown: Rotated",
+        "Setting  Capture > mirror-up delay: off",
+    ):
+        assert wanted in settings, wanted
+    assert any(line.startswith("Setting  Calibration > region 3: x ") for line in settings)
+    # A body that cannot answer one of them does not stop the calibration.
+    assert any(
+        line.startswith("Setting  Camera > firmware: could not be read") for line in settings
+    )
+    assert f"Settings at the start, {len(settings)} of them:" in said
+
+
+def test_the_panel_sends_every_focus_increment_and_the_view_with_a_calibration(window):
+    asked = []
+    window.requestCalibration.connect(lambda *args: asked.append(args[4]))
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._turn_view(1)
+    window.calibrate_button.click()
+    sent = {(group, name): value for group, name, value in asked[0]}
+    for increment in ("minimum", "fine", "medium", "coarse"):
+        assert ("Focus", f"{increment} increment") in sent
+    assert sent[("View", "shown")] == window._orientation.describe()
+    assert ("Capture", "autofocus before shooting") in sent

@@ -59,10 +59,10 @@ from PySide6.QtCore import QRect
 from PySide6.QtGui import QImage
 
 from ..camera.nikon import LiveViewFrame
-from .depth import _spacing
 from .film import FilmSurface
 from .hunt import FineTune, Move
 from .orientation import Orientation
+from .sharpness import format_reading
 
 __all__ = [
     "MAX_REGIONS",
@@ -422,6 +422,10 @@ class CalibrationReport:
     #: Whether the calibration was asked to walk far enough to place every
     #: region's peak. Without it there are no depths, rather than some.
     depths_measured: bool = False
+    #: When it began, in seconds since the epoch, or 0 if not known.
+    began: float = 0.0
+    #: Everything that was said while it ran, as the activity log has it.
+    log: "tuple[str, ...]" = ()
 
     @property
     def stopped(self) -> bool:
@@ -596,12 +600,12 @@ def summarise(result: "RegionResult | None", number: int) -> str:
         )
         return "\n".join(lines)
     lines.append(
-        f"Best: {_reading(result.best.reading)} when fine tuned on its own"
+        f"Best: {format_reading(result.best.reading)} when fine tuned on its own"
         + _HOW.get(result.outcome, "")
     )
     if result.fraction is not None:
         lines.append(
-            f"At the compromise: {_reading(result.compromise.reading)}, "
+            f"At the compromise: {format_reading(result.compromise.reading)}, "
             f"{result.fraction:.0%} of its best"
         )
     if result.depth is not None:
@@ -633,10 +637,6 @@ _HOW = {
     "exhausted": " (fine tuning ran out of probes)",
     "lost": " (the reading was too unsteady to walk by)",
 }
-
-
-def _reading(value: float) -> str:
-    return f"{value:.0f}" if value >= 100 else f"{value:.1f}"
 
 
 def colour_for(result: "RegionResult | None") -> str:
@@ -1133,8 +1133,8 @@ def _middle_of_top(
     another hill that also clears the line is another answer, and averaging
     the two would put the result in the valley between.
 
-    Over that run, the two estimators :mod:`scanny.ui.depth` settled on for
-    the same job, and by the same rule. A top of several readings is found as
+    Over that run, one of two estimators, chosen by how many readings are on
+    the top. A top of several readings is found as
     their middle, weighted by how far above the line each stands, which
     divides the grain on them between them -- on a broad top every reading is
     within the grain of the others, and which is highest is the grain's
@@ -1207,6 +1207,7 @@ class Calibration:
         # What it has cost so far, for the report.
         self._clock = clock
         self._started = clock()
+        self._began = time.time()
         self._tune_probes: "list[int]" = []
         self._autofocuses = 0
         self._moves = 0
@@ -1301,6 +1302,11 @@ class Calibration:
     def turn_back(self) -> float:
         """The share of a walk's best below which the walk turns back."""
         return self._turn_back
+
+    @property
+    def objective(self) -> str:
+        """Which of :data:`OBJECTIVES` the compromise is sought by."""
+        return self._objective
 
     @property
     def elapsed(self) -> float:
@@ -1466,6 +1472,7 @@ class Calibration:
             history=tuple(self._history),
             history_regions=self.history_regions if search is not None else (),
             depths_measured=self._measure_depths,
+            began=self._began,
         )
 
 
@@ -1567,3 +1574,15 @@ def _doubt(where: np.ndarray, read: np.ndarray, level: float) -> float:
     middle = float((weight * xs).sum()) / total
     leverage = float(np.sqrt(((span * (xs - middle)) ** 2).sum()))
     return max(grain * leverage / total, least)
+
+
+def _spacing(where: np.ndarray) -> np.ndarray:
+    """How much travel each sample stands for: half way to either neighbour."""
+    if len(where) < 2:
+        return np.ones(len(where))
+    span = np.empty(len(where))
+    span[0] = where[1] - where[0]
+    span[-1] = where[-1] - where[-2]
+    if len(where) > 2:
+        span[1:-1] = (where[2:] - where[:-2]) / 2.0
+    return np.maximum(span, 1e-9)

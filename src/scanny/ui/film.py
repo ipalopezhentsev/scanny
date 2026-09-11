@@ -38,7 +38,6 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen, QPolygonF
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
-from .depth import ramp_colour
 from .orientation import Orientation
 
 __all__ = ["FilmSurface", "FilmView", "Mark"]
@@ -212,6 +211,30 @@ _GAP = 0.3
 
 _SENSOR = QColor(70, 74, 86)
 _SENSOR_EDGE = QColor(150, 155, 170)
+
+#: How the film is coloured by height: Turbo, at seven stops. A scale where
+#: neighbouring heights are obviously different colours, because the
+#: question asked of the drawing is "is that nearer than this".
+_RAMP = (
+    (48, 18, 59),
+    (70, 134, 251),
+    (39, 203, 158),
+    (170, 232, 58),
+    (249, 177, 50),
+    (223, 64, 17),
+    (122, 4, 3),
+)
+
+
+def ramp_colour(fraction: float) -> "tuple[int, int, int]":
+    """The colour a height *fraction* of the way from lowest to highest is drawn."""
+    place = min(max(float(fraction), 0.0), 1.0) * (len(_RAMP) - 1)
+    lower = min(int(place), len(_RAMP) - 2)
+    weight = place - lower
+    return tuple(
+        int(round(a * (1 - weight) + b * weight))
+        for a, b in zip(_RAMP[lower], _RAMP[lower + 1])
+    )
 
 
 class FilmView(QWidget):

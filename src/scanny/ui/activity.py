@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-__all__ = ["ActivityLog", "ActivityWindow"]
+__all__ = ["ActivityLog", "ActivityWindow", "stamped"]
 
 #: How many lines the window keeps. A calibration writes a line a probe, a
 #: few hundred at most, so this is many calibrations' worth.
@@ -38,6 +38,12 @@ _KEPT = 5000
 
 #: How big the file may grow before it is started afresh, the old one kept.
 _FILE_LIMIT = 2_000_000
+
+
+def stamped(text: str, kind: str = "") -> str:
+    """One line as the log shows it: the time, what kind of thing, what was said."""
+    mark = {"error": "!! ", "status": ""}.get(kind, "   ")
+    return f"{time.strftime('%H:%M:%S')}  {mark}{str(text).strip()}"
 
 
 class ActivityLog(QObject):
@@ -70,11 +76,9 @@ class ActivityLog(QObject):
 
     def add(self, text: str, kind: str = "") -> None:
         """One line: the time, what kind of thing it is, and what was said."""
-        text = str(text).strip()
-        if not text:
+        if not str(text).strip():
             return
-        mark = {"error": "!! ", "status": ""}.get(kind, "   ")
-        line = f"{time.strftime('%H:%M:%S')}  {mark}{text}"
+        line = stamped(text, kind)
         self._lines.append(line)
         self._append_to_file(line)
         self.added.emit(line)

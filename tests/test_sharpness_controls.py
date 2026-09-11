@@ -67,6 +67,17 @@ def test_the_numbers_say_where_the_reading_sits_against_the_best(window):
     assert "80%" in window.sharpness_label.text()
 
 
+def test_readings_are_shown_finely_enough_to_see_one_step_move_them(window):
+    """Near the top of focus a step moves the reading by a fraction of a per
+    cent, so two more decimals than a glance needs: three below a hundred and
+    two above."""
+    window.measure_sharpness.setChecked(True)
+    window._on_sharpness(81.23456, 123.45678)
+    text = window.sharpness_label.text()
+    assert "81.235" in text
+    assert "123.46" in text
+
+
 def test_a_new_best_says_so_rather_than_reading_a_hundred_percent(window):
     """While focus is improving every reading is the best one, and a bar
     pinned at the top is exactly the readout that says nothing."""

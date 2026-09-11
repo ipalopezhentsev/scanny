@@ -11,8 +11,9 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import comtypes
 import numpy as np
@@ -21,20 +22,20 @@ from PySide6.QtGui import QImage
 
 from ..camera.nikon import CameraError, LiveViewFrame, NikonCamera
 from ..wpd.device import MtpError, WpdCommandError
-from .depth import (
-    LEVELS,
-    QUANTISATION,
-    Survey,
-    Sweep,
-    tile_sums,
-    tiling_for,
-)
+from .activity import stamped
 from .hunt import FineTune
 from .integration import FrameIntegrator
 from .naming import NameSequence, unique
 from .pixels import green
 from .regions import OBJECTIVES, Calibration, Look, Region, View, cut_out
-from .sharpness import SharpnessMeter, grain_reading, measure, variance_between
+from .sharpness import (
+    QUANTISATION,
+    SharpnessMeter,
+    format_reading,
+    grain_reading,
+    measure,
+    variance_between,
+)
 
 __all__ = ["CameraWorker"]
 
@@ -72,7 +73,7 @@ _MAX_GRAB_ERRORS = 15
 #: seconds, when the body ends it. The body does end it: a D750 turns live
 #: view off after its own monitor-off delay for live view -- custom setting
 #: c4, ten minutes out of the box -- whoever is driving it, and a calibration
-#: or a depth map can take longer than that. Starting it again is harmless
+#: can take longer than that. Starting it again is harmless
 #: and puts back everything the readings depend on; but a body that ends it
 #: again straight away is refusing for some other reason, and saying so beats
 #: fighting it.
@@ -122,76 +123,9 @@ _MOVED = 0.25
 #: -- which would read as the picture changing, and as never being still.
 _READING_FLOOR = 0.05
 
-#: How the depth map drives the lens. It parks against the near stop before
-#: every pass, because that is the one place a lens comes back to exactly, and
-#: it is what makes one pass's step counts mean the same thing as another's.
-#: **A body may keep saying yes to a lens that is already against its stop.**
-#: `MfDrive` can answer `STEP_END` or `STEP_INSUFFICIENT`, and when it does
-#: that is the end of it -- but a D750 driving a lens past its infinity stop
-#: answers OK and moves nothing, over and over. A stop-finder that believes
-#: the OK never finds a stop: it runs to whatever limit it is given, calls
-#: that the travel, and hands the sweep a step twelve times too big. The
-#: sweep then reaches infinity a tenth of the way through its stops and
-#: spends the rest of them driving a lens that cannot move.
-#:
-#: So the picture is watched instead, which is the same answer
-#: :mod:`scanny.ui.hunt` reaches about step counts: a chunk of travel that
-#: does not change the picture at all is a chunk the optics did not make.
-#: The refusal is still taken when it comes -- it is free and it is quicker.
-#:
-#: The chunk is how far it drives between looks. It wants to be **large**,
-#: and that is not about saving round trips. The near end of the travel is
-#: where an ordinary scene is at its most thoroughly defocused, so it is
-#: exactly where the picture changes least per step -- which is the worst
-#: possible place to be asking whether the picture changed. Measured against
-#: a modelled lens, a chunk of 500 steps left the last real move reading 1.5
-#: times the grain against 1.5 for no move at all, and a chunk of 1000 left
-#: it reading 5.3 against 0.9. Twice the chunk is four times the margin.
-_STOP_CHUNK = 1000
-
-#: How much of the travel may go by with the picture not answering before
-#: the far end of the useful range is taken to have been passed. Generous,
-#: because a scene with something close and something far has a quiet
-#: stretch between them, and cutting the sweep short there loses the far
-#: half of it.
-_STOP_QUIET = 6
-
-#: How far a park drives at a time. Nothing is looked at while parking -- the
-#: lens only has to end up against the stop, and over-driving into it is how
-#: that is guaranteed -- so this is only about not asking the body for one
-#: enormous move.
-_PARK_CHUNK = 5000
-
-#: How far the sweep's own backstop has to see the picture hold still before
-#: it decides the lens has stopped moving. **In drive steps, not in stops**,
-#: and that distinction is the whole of it.
-#:
-#: Counting stops was wrong and wrong in the worst way, because it goes wrong
-#: in proportion to how good the rest of the machinery got. A sweep's step is
-#: the range it was given divided by the stops asked for, so once the range
-#: finder started handing it a narrow range the step became small -- a range
-#: of 12000 steps over 400 stops is a step of 30 -- and five stops of that is
-#: 150 steps of travel, which changes nothing anywhere. The backstop then
-#: fired six stops into every pass, and the pass after it, narrowed to what
-#: those six stops found, fired sooner still.
-#:
-#: A distance is scale-free, and this one is the same distance the range
-#: finder is willing to sit through before it decides the far end has gone
-#: by. Nothing inside the range it found can be quieter than that, because
-#: quieter than that is how the range was defined.
-_SWEEP_QUIET_STEPS = _STOP_QUIET * _STOP_CHUNK
-
 #: How much more than the grain two frames have to differ by before what is
-#: between them counts as the picture having changed.
-#:
-#: **The frame it is compared against only moves when the picture does.** A
-#: reference that follows every chunk asks "did this chunk change anything",
-#: which a chunk that moved the optics a little answers no to -- and three
-#: little moves in a row then read as the lens having stopped when it has
-#: travelled three chunks. Holding the reference asks the question that
-#: matters instead: has the picture changed since the last place it
-#: demonstrably changed? Small moves add up until it has, and a lens against
-#: its stop never gets there.
+#: between them counts as the picture having changed -- which is how the
+#: compromise tells the lens is still arriving after a move.
 _STOP_MOVED = 2.5
 
 #: How many new frames to wait for before believing that what is on screen is
@@ -200,21 +134,6 @@ _STOP_MOVED = 2.5
 #: a few of them behind the lens either way.
 _STOP_FRESH = 4
 _STOP_PATIENCE = 0.8  # seconds, in case the body has stopped drawing at all
-
-#: How far past the travel a park drives once the travel is known. One command
-#: instead of a chunked hunt, and more certain than one: the lens ends against
-#: the stop whether or not it says so.
-_STOP_MARGIN = 2000
-
-#: The most travel any of this will assume a lens has. A D750's kit zoom is
-#: about 6000 steps end to end and a micro several times that; this is a
-#: bound, not an estimate, and the only thing it costs when it is far too
-#: large is the parking drives, which are quick.
-_TRAVEL_LIMIT = 30000
-
-#: A range shorter than this many of the lens's minimum increments is not
-#: something a sweep can divide up.
-_LEAST_TRAVEL = 8
 
 #: Magnification of each live-view zoom level, measured on a D750.
 _MEASURED_MAGNIFICATION = {
@@ -259,18 +178,6 @@ class CameraWorker(QObject):
     sharpnessChanged = Signal(float, float)
     #: Whether the focus hunt is running.
     huntChanged = Signal(bool)
-    #: Whether a depth-map sweep is running.
-    depthChanged = Signal(bool)
-    #: The map as it stands, or None when there is not one. Emitted after every
-    #: sample as well as at the end, so the picture fills in while it is swept
-    #: rather than appearing a minute later.
-    depthMapReady = Signal(object)  # DepthMap | None
-    #: What the sweep is doing, in one line that stays put: which stretch of
-    #: the travel it decided to cover, in what step, and how far through it
-    #: is. The status bar carries this too, but the status bar is where every
-    #: other message lands as well, so the numbers that say whether the sweep
-    #: was pointed at the right place scroll away as it runs.
-    sweeping = Signal(str)
     #: Whether a calibration of the focus regions is running, and what it made
     #: of them: a :class:`scanny.ui.regions.CalibrationReport`, or None when
     #: there is nothing to report -- the regions changed, or one has begun.
@@ -339,22 +246,6 @@ class CameraWorker(QObject):
         self._settle_before: "float | None" = None
         self._settle_changed = False
         self._settle_moving = False
-        # Mapping the depth of the scene by sweeping focus and reading every
-        # part of the picture at each stop. The survey outlives the sweep, so
-        # the map can be redrawn at another grid without driving anything.
-        self._survey: "Survey | None" = None
-        self._sweep: "Sweep | None" = None
-        self._sweep_samples = 0
-        self._sweep_pass = 0
-        self._sweep_passes = 1
-        self._sweep_detail = LEVELS - 1
-        self._sweep_minimum = 1
-        # How many steps this lens has between its stops, measured rather
-        # than assumed, and the step the last pass used -- which is the
-        # margin to put either side of what it found when asked to go again.
-        self._sweep_travel = 0
-        self._sweep_last_step = 0
-        self._sweep_span = (0, 0)
         # The rectangles someone drew to be kept in focus together, and the
         # calibration finding the one focus position that serves them all.
         self._regions: "list[Region]" = []
@@ -365,19 +256,12 @@ class CameraWorker(QObject):
         # The zoom level and focus point to put back when a calibration ends,
         # since it pans and magnifies the view all over the frame.
         self._view_restore: "tuple[int, int, int] | None" = None
-        # Whether the body reported a stop rather than the picture having to
-        # say so, and how much two frames of a still picture differ, which is
-        # what the stop-finder judges a chunk of travel against.
-        self._stops_reported = False
-        self._stop_grain = QUANTISATION
-        # The picture at the last stop that differed from the one before it,
-        # how far has been driven since, and whether the picture has changed
-        # at all this pass. Together they stop a sweep that has run out of
-        # lens rather than let it count out the rest of its stops against a
-        # lens that cannot move.
-        self._sweep_pixels: "np.ndarray | None" = None
-        self._sweep_silent = 0
-        self._sweep_spoke = False
+        # Everything said while a calibration runs -- status, failures and
+        # the log -- as the activity log shows it, to go into its report.
+        self._calibration_said: "list[str] | None" = None
+        self.status.connect(lambda text: self._hear(text, "status"))
+        self.failed.connect(lambda text: self._hear(text, "error"))
+        self.log.connect(lambda text: self._hear(text, ""))
         # How many frames live view runs behind the lens, measured from the
         # first move of each hunt rather than assumed.
         self._pipeline_lag: "int | None" = None
@@ -599,8 +483,6 @@ class CameraWorker(QObject):
             self.frameReady.emit(frame, QImage())
             if self._hunt is not None:
                 self._advance_hunt(frame, None)
-            elif self._sweep is not None:
-                self._advance_sweep(frame, None)
             return
         # Every frame is published, so the focus box and the level readout stay
         # as responsive as the camera is; only the picture waits for its stack.
@@ -619,15 +501,13 @@ class CameraWorker(QObject):
         self.frameReady.emit(frame, image if image is not None else QImage())
         if self._hunt is not None:
             self._advance_hunt(frame, reading, image)
-        elif self._sweep is not None:
-            self._advance_sweep(frame, image)
 
     def _recover_live_view(self, camera: NikonCamera, why: object = None) -> bool:
         """Start live view again after the body ended it, and put the view back.
 
         What the body ends is live view, not anything that depends on the
-        lens: focus stays where it was, so a fine tune, a depth sweep or a
-        calibration running across the gap can carry on across it -- once the
+        lens: focus stays where it was, so a fine tune or a calibration
+        running across the gap can carry on across it -- once the
         view is what it was, the zoom level and the focus point that the
         magnified crop is centred on, and once the picture has been let settle
         again, so that no reading is taken off frames from before the gap.
@@ -678,7 +558,7 @@ class CameraWorker(QObject):
         self._grab_errors = 0
         self._last_digest = None
         self._integrator.reset()
-        if self._hunt is not None or self._sweep is not None:
+        if self._hunt is not None:
             self._settle()
         self.status.emit(
             "The camera turned live view off by itself -- its own monitor-off "
@@ -741,7 +621,7 @@ class CameraWorker(QObject):
         single frame, because at best focus the finest detail in the picture
         looks exactly like grain.
         """
-        if not (self._sharpness.enabled or self._sweep is not None):
+        if not self._sharpness.enabled:
             self._last_pixels = None
             return
         frame_image = self._integrator.last_frame
@@ -1226,8 +1106,7 @@ class CameraWorker(QObject):
         far more when the view is magnified**, so the same focus error that is
         lost in the grain at full frame is obvious at 18.8x -- which is the
         difference between a search that can tell one step from the next and
-        one reading its own noise. It is the same reason the depth map
-        magnifies before comparing two points that are close together.
+        one reading its own noise.
 
         As far as it will go *and still show the area*, rather than simply as
         far as it will go. Magnifying past the area would leave the reading
@@ -1278,16 +1157,13 @@ class CameraWorker(QObject):
     def _cancel_hunt(self, why: str = "") -> None:
         """Stop a hunt, if one is running. Silent when nothing is happening.
 
-        A depth-map sweep goes with it. Every caller of this is something that
+        A calibration goes with it. Every caller of this is something that
         changed what the camera is showing or where the lens is -- the view
-        magnified, the exposure altered, focus taken by hand -- and each of
-        those invalidates a sweep for exactly the reason it invalidates a
-        hunt: the readings after it are not comparable with the ones before.
-        A calibration goes too, for the same reason and one more: its peaks
-        are only worth anything while the lens is walked from where they
-        left it.
+        magnified, the exposure altered, focus taken by hand -- and after any
+        of those the readings are not comparable with the ones before; a
+        calibration's peaks, besides, are only worth anything while the lens
+        is walked from where they left it.
         """
-        self._cancel_sweep(why.replace("Focus hunt stopped", "Depth map stopped"))
         self._end_calibration(
             why.replace("Focus hunt stopped", "Calibration stopped"), stopped=True
         )
@@ -1358,7 +1234,7 @@ class CameraWorker(QObject):
         doing = "coming back to" if hunt.coming_back else "looking, best"
         self.status.emit(
             f"Fine tuning focus: {probes} probe{'' if probes == 1 else 's'} in "
-            f"steps of {hunt.step_size}, {doing} {hunt.best:.0f}"
+            f"steps of {hunt.step_size}, {doing} {format_reading(hunt.best)}"
         )
 
     def _watch_for_stillness(self, frame: LiveViewFrame) -> None:
@@ -1524,7 +1400,8 @@ class CameraWorker(QObject):
         self.status.emit(
             {
                 "found": (
-                    f"Focus found: {stopped_on:.0f} against {hunt.baseline:.0f} "
+                    f"Focus found: {format_reading(stopped_on)} against "
+                    f"{format_reading(hunt.baseline)} "
                     f"from the camera's own autofocus, after {hunt.probes} probes"
                 ),
                 "nothing": (
@@ -1532,69 +1409,24 @@ class CameraWorker(QObject):
                     "something with detail in it, or magnify further"
                 ),
                 "exhausted": (
-                    f"Stopped at {stopped_on:.0f} after {hunt.probes} probes, "
-                    f"the most it will take; the best it saw was {hunt.best:.0f}"
+                    f"Stopped at {format_reading(stopped_on)} after {hunt.probes} probes, "
+                    f"the most it will take; the best it saw was "
+                    f"{format_reading(hunt.best)}"
                 ),
                 "lost": (
-                    f"Stopped at {stopped_on:.0f} against the {hunt.best:.0f} it "
+                    f"Stopped at {format_reading(stopped_on)} against the "
+                    f"{format_reading(hunt.best)} it "
                     f"saw: it was sent back and forth {hunt.turns} times, so the "
                     f"reading is too unsteady to walk by -- integrate more "
                     f"frames, or measure a patch with more detail in it"
                 ),
                 "restored": (
-                    f"Nothing bettered the camera's own {hunt.baseline:.0f}, so "
+                    f"Nothing bettered the camera's own "
+                    f"{format_reading(hunt.baseline)}, so "
                     f"focus was put back where its autofocus had it"
                 ),
             }.get(hunt.outcome, "Fine tuning finished")
         )
-
-    # -- mapping the depth of the scene ------------------------------------
-
-    @Slot(int, int, int, bool)
-    def start_depth_map(
-        self, samples: int, passes: int, minimum: int, narrowed: bool = False
-    ) -> None:
-        """Sweep focus across the travel and read every part of the picture.
-
-        *samples* is how many stops each pass makes, *passes* how many times
-        the travel is swept -- each one over the stretch the last one found
-        something in, in a step that much finer -- and *minimum* the smallest
-        step this lens answers to, which is where refining has to stop. With
-        *narrowed*, the first pass covers only the stretch the last map found
-        something in rather than the whole travel.
-
-        Every pass parks against the near stop first and drives one way only.
-        See :mod:`scanny.ui.depth` for why that is the whole basis of the
-        positions meaning anything.
-        """
-        camera = self._require()
-        if camera is None:
-            return
-        if not camera.live_view_active:
-            self.failed.emit("Start live view before mapping depth.")
-            return
-        frame = self._last_frame
-        if frame is None:
-            self.failed.emit("Wait for a live-view frame before mapping depth.")
-            return
-        self._cancel_hunt("")
-        self._sweep_samples = max(4, int(samples))
-        self._sweep_passes = max(1, int(passes))
-        self._sweep_minimum = max(1, int(minimum))
-        self._sweep_pass = 0
-        # Where the first pass should look, before the old survey is thrown
-        # away: a second run over the stretch the first one found something
-        # in is how a scene that lives in a corner of the travel is mapped
-        # without spending most of the stops on empty air again.
-        again = (
-            self._survey.interesting(self._sweep_last_step or self._sweep_minimum)
-            if narrowed and self._survey is not None and len(self._survey)
-            else None
-        )
-        self._survey = Survey(tiling_for(frame.width, frame.height))
-        self.depthMapReady.emit(None)
-        self.depthChanged.emit(True)
-        self._sweep_over(camera, again)
 
     # -- focus regions: one focus position for several places --------------
 
@@ -1615,13 +1447,14 @@ class CameraWorker(QObject):
         )
         self.calibrationReady.emit(None)
 
-    @Slot(int, str, int, bool)
+    @Slot(int, str, int, bool, object)
     def start_calibration(
         self,
         step: int,
         objective: str = "average",
         turn_back: int = 80,
         depths: bool = False,
+        panel: object = None,
     ) -> None:
         """Find each region's best, then the one focus that does best by all.
 
@@ -1635,6 +1468,9 @@ class CameraWorker(QObject):
         compromise itself does not need. See
         :mod:`scanny.ui.regions` for the two phases, and why the second one
         walks rather than drives.
+
+        *panel* is the settings only the window knows, as ``(group, name,
+        value)``, for the log; see :meth:`_log_settings`.
         """
         if objective not in OBJECTIVES:
             self.failed.emit(f"There is no compromise called {objective!r}.")
@@ -1671,17 +1507,137 @@ class CameraWorker(QObject):
         self._sharpness = SharpnessMeter(enabled=True)
         self.calibrationReady.emit(None)
         self.calibrationChanged.emit(True)
+        self._calibration_said = []
         self._log(
             f"Calibration started: {len(self._regions)} regions, aiming for "
             f"{OBJECTIVES[objective].lower()}, turning back below "
             f"{self._calibration.turn_back:.0%}, in steps of {step}"
             + (", measuring depths" if depths else "")
         )
+        self._log_settings(camera, frame, panel)
         self._tune_region()
 
     @Slot()
     def cancel_calibration(self) -> None:
         self._end_calibration("Calibration stopped", stopped=True)
+
+    def _log_settings(
+        self, camera: NikonCamera, frame: LiveViewFrame, panel: object = None
+    ) -> None:
+        """Every setting the calibration runs under, one to a line, for its log.
+
+        All of them, not the ones thought to matter: a report looked at weeks
+        later is only comparable with another if what differed between them
+        can be read off it, and which of them mattered is not known when it
+        is written. The camera's are read from the body now rather than
+        remembered, and what only the window knows -- the focus increments,
+        the way the view is shown -- comes in *panel*. Nothing here may stop
+        the calibration: a setting that cannot be read says so and the rest
+        go on.
+        """
+        run = self._calibration
+        said: "list[tuple[str, str, object]]" = []
+
+        def put(group: str, name: str, value: object) -> None:
+            said.append((group, name, value))
+
+        if run is not None:
+            put("Calibration", "regions", len(run.regions))
+            for number, region in enumerate(run.regions, start=1):
+                put(
+                    "Calibration",
+                    f"region {number}",
+                    f"x {region.x:.4f}, y {region.y:.4f}, width {region.w:.4f}, "
+                    f"height {region.h:.4f} of the frame",
+                )
+            put("Calibration", "aim for", OBJECTIVES[run.objective].lower())
+            put("Calibration", "turn back below", f"{run.turn_back:.0%} of the best")
+            put("Calibration", "walk in steps of", run.step)
+            put("Calibration", "measure depths for levelling", _yes(run.measures_depths))
+
+        put("Camera", "model", _ask(lambda: camera.model))
+        put("Camera", "firmware", _ask(lambda: camera.firmware))
+        put("Camera", "battery", _ask(lambda: f"{camera.battery_level()}%"))
+        try:
+            settings = camera.settings()
+        except Exception as exc:  # noqa: BLE001 - a log line is not worth stopping for
+            put("Exposure", "settings", f"could not be read ({exc})")
+            settings = []
+        for setting in settings:
+            put(
+                "Exposure",
+                setting.name,
+                setting.label + ("" if setting.writable else " (set on the body)"),
+            )
+
+        put("Live view", "exposure preview", _ask(lambda: _yes(camera.exposure_preview)))
+        put("Live view", "frame", f"{frame.width}x{frame.height}")
+        put("Live view", "sensor", f"{frame.image_width}x{frame.image_height}")
+        magnification = self._zoom_magnification.get(self._zoom_level)
+        put(
+            "Live view",
+            "zoom level",
+            f"{self._zoom_level}"
+            + (f" ({magnification:.2f}x)" if magnification is not None else ""),
+        )
+        put(
+            "Live view",
+            "view",
+            f"{frame.crop_width}x{frame.crop_height} centred on "
+            f"({frame.crop_center_x}, {frame.crop_center_y})",
+        )
+        put("Live view", "focus point", f"({frame.af_x}, {frame.af_y})")
+        put(
+            "Live view",
+            "integrate",
+            f"{self._integrator.frames} frames" if self._integrator.enabled else "off",
+        )
+        put("Live view", "skip repeated frames", _yes(self._deduplicate))
+        put("Live view", "grain between frames", f"{self._noise_variance:.4f} (measured)")
+        put(
+            "Live view",
+            "level",
+            f"roll {frame.roll}, pitch {frame.pitch}"
+            if frame.roll is not None or frame.pitch is not None
+            else "no reading",
+        )
+
+        meter = self._calibration_meter or self._sharpness
+        put("Sharpness", "measure sharpness", _yes(meter.enabled))
+        area = meter.area
+        put(
+            "Sharpness",
+            "measured area",
+            "the whole picture"
+            if area is None
+            else "x {:.4f}, y {:.4f}, width {:.4f}, height {:.4f} of the frame".format(
+                *area
+            ),
+        )
+
+        for entry in panel or ():
+            try:
+                group, name, value = entry
+            except (TypeError, ValueError):
+                continue
+            put(str(group), str(name), value)
+
+        put("Capture", "write to the camera's card", _yes(self._save_to_card))
+        put(
+            "Capture",
+            "mirror-up delay",
+            f"{self._shutter_delay} s" if self._shutter_delay else "off",
+        )
+        put(
+            "Capture",
+            "number the files",
+            f"yes, next {self._namer.name()}" if self._namer.enabled else "no",
+        )
+        put("Capture", "saving to", self._save_dir)
+
+        self._log(f"Settings at the start, {len(said)} of them:")
+        for group, name, value in said:
+            self._log(f"Setting  {group} > {name}: {value}")
 
     def _tune_region(self) -> None:
         """Fine tune the next region on its own, to find what it reads at best.
@@ -1742,7 +1698,8 @@ class CameraWorker(QObject):
             look = _look_at(region, frame, image, reading)
             view = View.of(frame, self._zoom_level)
         self._log(
-            f"Region {run.index + 1}: best reading {reading:.1f} ({hunt.outcome}) "
+            f"Region {run.index + 1}: best reading {format_reading(reading)} "
+            f"({hunt.outcome}) "
             f"after {hunt.probes} probes, read at zoom level {self._zoom_level}"
         )
         if run.region_tuned(look, hunt.outcome, view, hunt.probes):
@@ -1948,7 +1905,9 @@ class CameraWorker(QObject):
         *not* put back. Standing on the compromise is the point of it.
 
         What was found is published even when it stopped part way: the
-        peaks of the regions it got to are still worth looking at.
+        peaks of the regions it got to are still worth looking at. It is
+        published last, once the last line about it has been said, so that
+        the report carries everything that was said while it ran.
         """
         run, self._calibration = self._calibration, None
         if run is None:
@@ -1963,9 +1922,6 @@ class CameraWorker(QObject):
             self.sharpnessChanged.emit(0.0, 0.0)
         self._restore_view()
         report = run.report(stopped=stopped)
-        self.calibrationReady.emit(report)
-        self.calibrationProgress.emit(-1, "")
-        self.calibrationChanged.emit(False)
         message = why if stopped else (why or report.describe())
         if message:
             self.status.emit(message)
@@ -1974,6 +1930,15 @@ class CameraWorker(QObject):
             f"{why or report.describe()}"
             + (f". {report.cost()}" if report.cost() else "")
         )
+        said, self._calibration_said = self._calibration_said or [], None
+        self.calibrationReady.emit(replace(report, log=tuple(said)))
+        self.calibrationProgress.emit(-1, "")
+        self.calibrationChanged.emit(False)
+
+    def _hear(self, text: str, kind: str) -> None:
+        """Keep a line for the calibration's report, while one is running."""
+        if self._calibration_said is not None and str(text).strip():
+            self._calibration_said.append(stamped(text, kind))
 
     def _restore_view(self) -> None:
         """Put the zoom and the focus point back where the calibration found them."""
@@ -2006,7 +1971,7 @@ class CameraWorker(QObject):
         say the lens has stopped.
         """
         self._look_again(camera, _STOP_FRESH)
-        grain = max(self._noise_variance, self._stop_grain, QUANTISATION)
+        grain = max(self._noise_variance, QUANTISATION)
         seen: "np.ndarray | None" = None
         still = 0
         for _ in range(_SETTLE_LIMIT):
@@ -2025,123 +1990,6 @@ class CameraWorker(QObject):
             still += 1
             if still >= 2:
                 return
-
-
-    def _sweep_over(
-        self, camera: NikonCamera, again: "tuple[int, int] | None"
-    ) -> None:
-        """Decide which stretch of travel to sweep, and start the first pass."""
-        try:
-            # A second run over what the first one found is following it
-            # immediately, on the same lens and the same scene, so the range
-            # the first one found still stands and is not looked for again.
-            span = again if again is not None else self._useful_range(camera)
-        except CameraError as exc:
-            self._finish_scan(f"Depth map stopped: {exc}")
-            return
-        if span is None:
-            self._finish_scan(
-                "Driving focus from one end of its travel to the other changed "
-                "nothing in the picture, so there is nothing here to measure. "
-                "Check that live view is showing the scene and that the lens is "
-                "on manual focus, or magnify onto something with detail in it."
-            )
-            return
-        low, high = max(0, span[0]), span[1]
-        if high - low < _LEAST_TRAVEL * self._sweep_minimum:
-            self._finish_scan(
-                f"Only {high - low} steps of the travel changed the picture at "
-                f"all, which is not a range a sweep can divide up. The scene may "
-                f"be flat enough that one focus position covers all of it."
-            )
-            return
-        step = max(self._sweep_minimum, (high - low) // self._sweep_samples)
-        # Whether the body owned up to a stop is worth saying: it is the one
-        # thing about a lens this cannot find out for itself, and a body that
-        # never does is what the whole picture-watching apparatus is for.
-        told = "" if self._stops_reported else ", which it never admitted to reaching"
-        self.status.emit(
-            f"The picture answers focus between {low} and {high} steps from the "
-            f"near stop{told}; sweeping that in {self._sweep_samples} stops of {step}"
-        )
-        self._sweep_span = (low, high)
-        self._begin_pass(camera, low, step)
-
-    @Slot()
-    def cancel_depth_map(self) -> None:
-        self._cancel_sweep("Depth map stopped")
-
-    @Slot(int)
-    def set_depth_detail(self, level: int) -> None:
-        """Redraw the map at a coarser or finer grid, without sweeping again.
-
-        Free, and that is the point of keeping the survey rather than the map:
-        a coarse zone's numbers are the sum of the fine zones inside it, so
-        every grid was already measured by the pass that ran.
-        """
-        self._sweep_detail = max(0, int(level))
-        survey = self._survey
-        if survey is not None and len(survey):
-            self.depthMapReady.emit(survey.map(self._sweep_detail))
-
-    def _cancel_sweep(self, why: str = "") -> None:
-        """Stop a sweep, if one is running. Silent when nothing is happening.
-
-        What was read is kept. Half a map is still worth looking at, the
-        detail control still works on it.
-        """
-        if self._sweep is None:
-            return
-        self._sweep = None
-        self._settling = False
-        self.depthChanged.emit(False)
-        if why:
-            self.status.emit(why)
-
-    def _begin_pass(self, camera: NikonCamera, low: int, step: int) -> None:
-        """Park, drive to where this pass starts, and begin sampling.
-
-        The jump forward is never shorter than one step, even for the pass
-        that starts at the stop. It is what takes the play in the gearing up
-        in the direction the pass will drive, and doing it identically at the
-        start of every pass is what makes the passes agree with each other.
-        """
-        try:
-            self._park(camera)
-            jump = max(int(low), int(step))
-            camera.drive_focus(jump)
-        except CameraError as exc:
-            self._finish_scan(f"Stopped: {exc}")
-            return
-        self._sweep = Sweep(jump, step, self._sweep_samples)
-        self._pipeline_lag = None
-        self._sweep_pixels = None
-        self._sweep_silent = 0
-        self._sweep_spoke = False
-        self._settle()
-        self.status.emit(
-            f"Depth map pass {self._sweep_pass + 1} of {self._sweep_passes}: "
-            f"{self._sweep_samples} stops in steps of {step}..."
-        )
-        self._say_sweeping(0)
-
-    def _park(self, camera: NikonCamera) -> None:
-        """Drive the lens against its near stop, which is the datum.
-
-        Blind, and that is the point: nothing is watched and no answer is
-        wanted, so there is nothing here to get wrong. Driving further than
-        the lens can go is what guarantees it arrives, whether or not the
-        body admits to the stop -- and a body that does admit to it ends the
-        parking early for nothing but speed.
-        """
-        self.status.emit("Parking focus against its near stop...")
-        far = (self._sweep_travel or _TRAVEL_LIMIT) + _STOP_MARGIN
-        driven = 0
-        while driven < far:
-            if not camera.drive_focus(-min(_PARK_CHUNK, far - driven)):
-                self._stops_reported = True
-                return
-            driven += _PARK_CHUNK
 
     def _look(self, camera: NikonCamera) -> "np.ndarray | None":
         """One frame's pixels, decimated, for telling whether it moved."""
@@ -2174,275 +2022,6 @@ class CameraWorker(QObject):
             if not seen or not np.array_equal(pixels, seen[-1]):
                 seen.append(pixels)
         return seen
-
-    def _measure_grain(self, camera: NikonCamera) -> float:
-        """How much two frames of a still picture differ, on this scene now.
-
-        The stop-finder needs it before a sweep has measured anything, and it
-        is the whole basis of the finder's one question: did that chunk of
-        travel change the picture by more than the picture changes anyway?
-        """
-        seen = self._look_again(camera, fresh=8)
-        pairs = [
-            variance_between(earlier, later)
-            for earlier, later in zip(seen, seen[1:])
-        ]
-        real = [value for value in pairs if value]
-        return min(real) if real else QUANTISATION
-
-    def _picture_moved(
-        self, earlier: "np.ndarray | None", later: "np.ndarray | None"
-    ) -> bool:
-        """Whether what is between two frames is more than the grain on them.
-
-        Not being able to tell counts as movement: a stop-finder that stops
-        because it could not read a frame stops in the middle of the travel
-        and calls it the end of it.
-        """
-        if earlier is None or later is None:
-            return True
-        variance = variance_between(earlier, later)
-        if variance is None:
-            return True
-        return variance > _STOP_MOVED * max(self._stop_grain, QUANTISATION)
-
-    def _useful_range(
-        self, camera: NikonCamera
-    ) -> "tuple[int, int] | None":
-        """Which part of the travel the picture answers focus at all in.
-
-        Not the mechanical travel. The mechanical travel is what the first
-        attempt at this went looking for, and it is both hard to measure and
-        not the thing wanted. Hard to measure, because a body will keep
-        saying yes to a drive it is not making -- a D750 refuses at the near
-        stop and accepts for ever past infinity -- so the refusal cannot be
-        relied on. And not the thing wanted, because most of a macro lens's
-        travel is the first few centimetres in front of it, where an
-        ordinary scene is a uniform wash that no amount of focusing brings
-        into anything. Stops spent there measure nothing.
-
-        So this drives from the near stop to the far one in chunks and
-        watches, and answers with the stretch between the first chunk that
-        changed the picture and the last one that did. Focus moves outside
-        that and the picture does not follow; inside it is the whole of what
-        there is to map, and dividing *it* by the stops asked for is what
-        makes a stop worth taking.
-
-        Silence before the first change is not the end of anything -- it is
-        the wash in front of the lens -- which is why the early finish waits
-        for the picture to have spoken once.
-        """
-        self.status.emit("Finding the part of the travel the picture answers in...")
-        self._stops_reported = False
-        self._stop_grain = self._measure_grain(camera)
-        self._park(camera)
-        # Waiting for redrawn frames rather than taking the next one: parking
-        # drove the whole travel and live view is still showing where the lens
-        # was, so the frame on the wire belongs to the other end of the range.
-        opening = self._look_again(camera)
-        seen = opening[-1] if opening else None
-        travelled = 0
-        first: "int | None" = None
-        last = 0
-        quiet = 0
-        while travelled < _TRAVEL_LIMIT:
-            if not camera.drive_focus(_STOP_CHUNK):
-                self._stops_reported = True
-                break
-            was, travelled = travelled, travelled + _STOP_CHUNK
-            fresh = self._look_again(camera)
-            now = fresh[-1] if fresh else None
-            if not self._picture_moved(seen, now):
-                # The reference stays where it last moved; see _STOP_MOVED.
-                quiet += 1
-                if first is not None and quiet >= _STOP_QUIET:
-                    break
-                continue
-            if first is None:
-                first = was
-            last = travelled
-            quiet = 0
-            seen = now
-        self._sweep_travel = travelled
-        self._park(camera)
-        if first is None:
-            return None
-        # A chunk of margin either side: the change was seen somewhere
-        # within the chunk, not at the end of it.
-        return max(0, first - _STOP_CHUNK), last + _STOP_CHUNK
-
-    def _advance_sweep(self, frame: LiveViewFrame, image: "QImage | None") -> None:
-        """Take one settled picture into the survey and drive to the next stop.
-
-        The same two refusals the hunt makes, for the same two reasons: a
-        frame caught while the lens is still moving belongs to no focus
-        position, and a half-filled integration stack is a blend of two.
-        """
-        sweep, camera = self._sweep, self._camera
-        if sweep is None or camera is None:
-            return
-        if self._settling:
-            self._watch_for_stillness(frame)
-            return
-        if image is None or image.isNull():
-            return
-        if not self._integrator.last_image_was_whole:
-            return
-        frames = self._integrator.frames if self._integrator.enabled else 1
-        if not self._record(sweep.position, image, frames):
-            return
-        if self._out_of_lens(image, sweep.step, frames):
-            sweep.blocked()
-        before = self._frame_reading(frame)
-        move = sweep.took_one() if not sweep.done else None
-        if move is not None:
-            try:
-                if not camera.drive_focus(move):
-                    # The far end of the travel: there is nowhere left to
-                    # sweep, and what was read up to here is the map.
-                    sweep.blocked()
-            except (CameraError, MtpError, WpdCommandError) as exc:
-                if not (
-                    self._recover_live_view(camera, exc)
-                    and self._drive_through(camera, move)
-                ):
-                    self._cancel_sweep(f"Depth map stopped: {exc}")
-                    return
-        if sweep.done:
-            self._finish_pass(camera, sweep)
-            return
-        self._settle(before)
-        self._say_sweeping(sweep.taken)
-
-    def _record(self, position: int, image: QImage, frames: int) -> bool:
-        """Read one settled picture into the survey.
-
-        Answers False when the sweep cannot go on, having said why.
-        """
-        noise = self._noise_variance / max(frames, 1)
-        survey = self._survey
-        if survey is None:
-            return False
-        try:
-            survey.add(position, tile_sums(image, survey.tiling), noise)
-        except ValueError:
-            self._cancel_sweep(
-                "Depth map stopped - the picture changed size under it"
-            )
-            return False
-        self.depthMapReady.emit(survey.map(self._sweep_detail))
-        return True
-
-    def _out_of_lens(self, image: QImage, step: int, frames: int) -> bool:
-        """Whether the picture has held still over a long stretch of driving.
-
-        Which means the lens is against a stop and the drives are going
-        nowhere. This is the backstop under the range the sweep was given
-        rather than a replacement for it: however wrong that range turns out
-        to be, a pass must not count out four hundred stops against a lens
-        that cannot move, which is what a body that answers OK to a drive it
-        did not make will otherwise have it do for several minutes.
-
-        What it counts is **how far it has driven** since the picture last
-        changed, not how many stops ago that was; see
-        :data:`_SWEEP_QUIET_STEPS`. And it says nothing until the picture has
-        changed once, because a pass begins in the margin the range finder
-        put either side of what it found, where quiet is expected.
-
-        It is judged on the stacked picture that was just read, so nothing is
-        grabbed for it, and against the grain divided by the stack depth,
-        because averaging frames divides their noise by as many.
-        """
-        pixels = green(image)[::2, ::2]
-        before = self._sweep_pixels
-        variance = variance_between(before, pixels) if before is not None else None
-        # Both estimates are of a single frame, and averaging a stack divides
-        # its noise by as many frames as went into it.
-        grain = max(self._noise_variance, self._stop_grain, QUANTISATION)
-        if variance is None or variance > _STOP_MOVED * grain / max(frames, 1):
-            # The reference only moves when the picture does; see _STOP_MOVED.
-            self._sweep_pixels = pixels
-            self._sweep_silent = 0
-            self._sweep_spoke = True
-            return False
-        if not self._sweep_spoke:
-            return False
-        self._sweep_silent += max(1, int(step))
-        if self._sweep_silent < _SWEEP_QUIET_STEPS:
-            return False
-        self.status.emit(
-            f"The picture has not changed in {self._sweep_silent} steps of "
-            f"driving - the lens is against a stop, so there is no more to sweep"
-        )
-        return True
-
-    def _say_sweeping(self, taken: int) -> None:
-        """The one line that says where the sweep was pointed and how far in."""
-        sweep = self._sweep
-        if sweep is None:
-            return
-        low, high = self._sweep_span
-        self.sweeping.emit(
-            f"Pass {self._sweep_pass + 1}/{self._sweep_passes}, "
-            f"stop {taken}/{sweep.samples} at {sweep.position}: "
-            f"{low} to {high} in steps of {sweep.step}"
-        )
-
-    def _finish_pass(self, camera: NikonCamera, sweep: Sweep) -> None:
-        """Plan the next pass over what this one found, or call the map done.
-
-        A pass is only worth running if it can be finer than the one before
-        it, and it can only be finer if the stretch worth sweeping is
-        narrower than what was just swept. When it is not, saying so is the
-        whole of the value: a map that stops after one pass because the
-        answers it found are spread over the entire travel has not converged
-        on anything, and looks exactly like one that has.
-        """
-        self._sweep = None
-        self._sweep_pass += 1
-        self._sweep_last_step = sweep.step
-        if self._sweep_pass >= self._sweep_passes:
-            self._finish_scan()
-            return
-        survey = self._survey
-        span = survey.interesting(sweep.step) if survey is not None else None
-        if span is None:
-            self._finish_scan(
-                "Nothing anywhere in the travel came into focus to refine"
-            )
-            return
-        low = max(0, span[0])
-        high = span[1]
-        self._sweep_span = (low, high)
-        step = max(self._sweep_minimum, (high - low) // self._sweep_samples)
-        if step >= sweep.step:
-            covered = sweep.step * self._sweep_samples
-            self._finish_scan(
-                f"Stopped after {self._sweep_pass} pass"
-                f"{'' if self._sweep_pass == 1 else 'es'}: the answers cover "
-                f"{high - low} steps of the {covered} just swept, so a finer "
-                f"pass would not fit. Raise the stops per pass, or run it "
-                f"again over what this one found."
-            )
-            return
-        self._begin_pass(camera, low, step)
-
-    def _finish_scan(self, why: str = "") -> None:
-        """Stop the sweep and publish the map it made."""
-        self._sweep = None
-        self._settling = False
-        passes = self._sweep_pass
-        spent = f"{passes} pass" + ("" if passes == 1 else "es")
-        self.depthChanged.emit(False)
-        survey = self._survey
-        if survey is None or not len(survey):
-            self.status.emit(why or "Depth map finished with nothing measured")
-            return
-        depth_map = survey.map(self._sweep_detail)
-        self.depthMapReady.emit(depth_map)
-        self.status.emit(
-            why or f"Depth map done in {spent}: {depth_map.describe()}"
-        )
 
     # -- settings ----------------------------------------------------------
 
@@ -2478,7 +2057,7 @@ class CameraWorker(QObject):
         if camera is None:
             return
         # Releasing the shutter takes the mirror down and, if it is asked to
-        # focus first, drives the lens. Neither a hunt nor a depth sweep
+        # focus first, drives the lens. Neither a hunt nor a calibration
         # survives that, and finding out afterwards is worse than being told.
         self._cancel_hunt("Focus hunt stopped - the shutter was released")
         # The wait is the camera's, and nothing arrives while it runs, so say
@@ -2642,3 +2221,15 @@ def _inside(
         and x + w <= left + width + slack
         and y + h <= top + height + slack
     )
+
+
+def _yes(on: bool) -> str:
+    return "yes" if on else "no"
+
+
+def _ask(question: "Callable[[], object]") -> str:
+    """What the camera answers, or why it did not, for a line of the log."""
+    try:
+        return str(question())
+    except Exception as exc:  # noqa: BLE001 - a log line is not worth stopping for
+        return f"could not be read ({exc})"

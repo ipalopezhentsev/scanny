@@ -60,6 +60,8 @@ __all__ = [
     "ABOVE_THE_GRAIN",
     "SCALE",
     "MIN_AREA_PIXELS",
+    "QUANTISATION",
+    "format_reading",
 ]
 
 #: Readings are only meaningful against each other, so the scale is chosen to
@@ -87,6 +89,24 @@ ABOVE_THE_GRAIN = 0.2
 #: of pixels is all noise and no subject, and the reading from one jumps about
 #: far too much to focus against.
 MIN_AREA_PIXELS = 16
+
+#: The variance a picture has when it has nothing in it at all. Rounding to
+#: whole levels puts a twelfth of a level of variance into every pixel, and
+#: no eight-bit picture can be flatter than that, so grain measured from how
+#: much consecutive frames differ is never taken as less. A thoroughly
+#: defocused live view is smooth enough that JPEG returns almost the same
+#: frame twice, and a grain measured from those falls towards nothing.
+QUANTISATION = 1.0 / 12.0
+
+
+def format_reading(value: float) -> str:
+    """A reading as text, with more decimals the smaller it is.
+
+    Readings are only compared with each other, and the steps a fine tune
+    walks in move them by a fraction of a per cent near the top of focus, so
+    the digits that change from one step to the next are kept on screen.
+    """
+    return f"{value:.2f}" if abs(value) >= 100 else f"{value:.3f}"
 
 
 def measure(
