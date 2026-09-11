@@ -1,0 +1,1755 @@
+"""Tests for focus regions: each one's best, and the one focus that serves all.
+
+Three parts. The bookkeeping has no camera in it and is run against readings
+made up to a known shape. The window's side is checked for the gestures -- a
+region is drawn with ctrl held and taken away the same way -- and for the
+report, which has to show the pictures the way the view is being shown. And
+then the whole of it through the worker against a simulated rig: regions at
+three different depths across the frame, a lens with play in its gearing,
+and a camera that has to be panned and magnified onto each region to read it.
+
+What is checked at the end is where the *optics* are, against the true
+compromise worked out from the model itself -- not against step counts,
+which on a lens with play in it are not the same thing.
+"""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+pytest.importorskip("PySide6.QtWidgets")
+
+from PySide6.QtCore import (  # noqa: E402
+    QBuffer,
+    QByteArray,
+    QPoint,
+    QPointF,
+    QSettings,
+    Qt,
+)
+from PySide6.QtGui import QImage, QMouseEvent  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from scanny.camera.nikon import CameraError, LiveViewFrame  # noqa: E402
+from scanny.ui import main_window as mw  # noqa: E402
+from scanny.ui.orientation import Orientation  # noqa: E402
+from scanny.ui.regions import (  # noqa: E402
+    MAX_REGIONS,
+    TURN_BACK,
+    Calibration,
+    CalibrationReport,
+    Look,
+    Region,
+    RegionResult,
+    View,
+    average_of_best,
+    clock,
+    colour_for,
+    combine,
+    cut_out,
+    describe_depth,
+    summarise,
+)
+from scanny.ui.sharpness import measure  # noqa: E402
+from test_depth import _blur, _image, _texture  # noqa: E402
+
+#: The lens's minimum increment, as the panel has it by default.
+STEP = 6
+
+
+# -- regions, as places on the sensor ----------------------------------------
+
+
+def test_a_region_on_the_whole_frame_is_where_it_was_drawn():
+    region = Region(0.2, 0.3, 0.1, 0.1)
+    assert region.seen_in((0.0, 0.0, 1.0, 1.0)) == pytest.approx((0.2, 0.3, 0.1, 0.1))
+
+
+def test_magnifying_onto_a_region_fills_the_picture_with_it():
+    region = Region(0.2, 0.3, 0.1, 0.1)
+    # A fifth of the frame, centred on the region.
+    shown = region.seen_in((0.15, 0.25, 0.2, 0.2))
+    assert shown == pytest.approx((0.25, 0.25, 0.5, 0.5))
+
+
+def test_a_region_off_the_view_is_not_on_the_picture():
+    assert Region(0.8, 0.8, 0.1, 0.1).seen_in((0.0, 0.0, 0.3, 0.3)) is None
+
+
+def test_a_region_half_on_the_view_is_clipped_to_it():
+    shown = Region(0.25, 0.25, 0.1, 0.1).seen_in((0.0, 0.0, 0.3, 0.3))
+    assert shown is not None
+    assert shown[0] + shown[2] == pytest.approx(1.0)
+
+
+def test_cutting_a_region_out_keeps_its_pixels():
+    pixels = np.zeros((40, 80))
+    pixels[10:20, 40:60] = 255.0
+    picture = cut_out(_image(pixels), (0.5, 0.25, 0.25, 0.25))
+    assert (picture.width(), picture.height()) == (20, 10)
+    assert QImage(picture).pixelColor(5, 5).red() == 255
+
+
+# -- the arithmetic of a compromise ------------------------------------------
+
+
+def test_the_average_is_of_each_region_against_its_own_best():
+    """A reading has no units: a region with ten times the texture must not
+    have ten times the say."""
+    assert average_of_best([90.0, 9.0], [100.0, 10.0]) == pytest.approx(0.9)
+    assert average_of_best([100.0, 5.0], [100.0, 10.0]) == pytest.approx(0.75)
+
+
+def test_a_region_with_no_peak_has_no_say():
+    assert average_of_best([90.0, 0.0], [100.0, 0.0]) == pytest.approx(0.9)
+    assert average_of_best([], []) == 0.0
+
+
+def _view(index: int) -> View:
+    return View(7, (1000 + 100 * index, 1000), (1000 + 100 * index, 1000, 320, 213))
+
+
+def _three() -> Calibration:
+    return Calibration(
+        [Region(0.1 * n, 0.2, 0.05, 0.05) for n in range(1, 4)], STEP
+    )
+
+
+def test_the_regions_are_tuned_one_after_another_then_the_compromise_begins():
+    run = _three()
+    assert run.phase == "peaks" and run.index == 0
+    assert run.region_tuned(Look(100.0), "found", _view(0))
+    assert run.region_tuned(Look(40.0), "found", _view(1))
+    assert not run.region_tuned(Look(70.0), "found", _view(2))
+    assert run.begin_compromise()
+    assert run.phase == "compromise"
+
+
+def test_the_compromise_walks_without_the_camera_s_autofocus():
+    """There is no one place for the camera to focus on, and the peaks are
+    only worth anything while the lens is walked from where they left it."""
+    run = _three()
+    for index in range(3):
+        run.region_tuned(Look(100.0), "found", _view(index))
+    run.begin_compromise()
+    move = run.take({index: Look(80.0) for index in range(3)})
+    assert move is not None and not move.autofocus
+    assert abs(move.steps) == STEP
+
+
+def test_the_region_on_screen_is_read_first_and_the_order_snakes():
+    """The region read last at one probe is read first at the next: it is
+    still on screen, and a pan saved is a quarter of a second."""
+    run = _three()
+    for index in range(3):
+        run.region_tuned(Look(100.0), "found", _view(index))
+    run.begin_compromise()
+    first = run.order()
+    assert first[0] == 2, "the one tuned last is the one on screen"
+    second = run.order()
+    assert second == list(reversed(first))
+
+
+def test_a_region_with_nothing_in_it_is_left_out_of_the_compromise():
+    run = _three()
+    run.region_tuned(Look(100.0), "found", _view(0))
+    run.region_tuned(Look(0.0), "nothing", _view(1))
+    run.region_tuned(Look(50.0), "found", _view(2))
+    assert run.begin_compromise()
+    assert sorted(run.order()) == [0, 2]
+
+
+def test_one_region_worth_focusing_on_is_nothing_to_compromise_between():
+    run = _three()
+    run.region_tuned(Look(100.0), "found", _view(0))
+    run.region_tuned(Look(0.0), "nothing", _view(1))
+    run.region_tuned(Look(0.0), "nothing", _view(2))
+    assert not run.begin_compromise()
+    report = run.report()
+    assert report.outcome == "single"
+    assert "Only region 1" in report.describe()
+
+
+def _walked(
+    curves,
+    start: float,
+    *,
+    slack: int = 0,
+    noise: float = 0.0,
+    seed: int = 0,
+    objective: str = "average",
+    places=None,
+    turn_back: float = TURN_BACK,
+    depths: bool = False,
+) -> "tuple[Calibration, float]":
+    """Run the compromise against modelled regions; answer it and where it ended.
+
+    *curves* is one function per region, reading against focus position. The
+    optics are carried between two faces of the driver, *slack* steps apart,
+    so a reversal moves nothing until the play is taken up -- and it is where
+    the optics end up that is answered, not where the steps say.
+    """
+    rng = np.random.default_rng(seed)
+    regions = places or [Region(0.2 * n, 0.2, 0.05, 0.05) for n in range(len(curves))]
+    run = Calibration(
+        regions, STEP, objective=objective, turn_back=turn_back, depths=depths
+    )
+    peaks = [max(curve(p) for p in range(-400, 400)) for curve in curves]
+    for index, peak in enumerate(peaks):
+        run.region_tuned(Look(peak), "found", _view(index))
+    run.begin_compromise()
+    optics = driver = start
+    for _ in range(1000):
+        looks = {
+            i: Look(curve(optics) * (1 + rng.normal(0, noise)) if noise else curve(optics))
+            for i, curve in enumerate(curves)
+        }
+        move = run.take(looks)
+        if move is None:
+            return run, optics
+        driver += move.steps
+        optics = min(max(optics, driver), driver + slack)
+    raise AssertionError("it has to stop on its own")
+
+
+def _best_average(curves) -> "tuple[float, float]":
+    """Where the average of the fractions is highest, by brute force, and its value."""
+    grid = np.arange(-300.0, 300.0)
+    peaks = [max(curve(p) for p in grid) for curve in curves]
+    truth = [average_of_best([c(p) for c in curves], peaks) for p in grid]
+    return float(grid[int(np.argmax(truth))]), max(truth)
+
+
+def _hill(peak: float, width: float = 60.0, height: float = 100.0):
+    return lambda p: height * float(np.exp(-((p - peak) / width) ** 2))
+
+
+def test_it_walks_from_one_region_s_peak_to_where_the_average_is_best():
+    curves = [_hill(-50, height=300.0), _hill(10, height=20.0), _hill(40)]
+    run, optics = _walked(curves, start=40.0)
+    best, value = _best_average(curves)
+    assert abs(optics - best) <= STEP, f"ended at {optics}, best is {best}"
+    report = run.report()
+    assert report.outcome == "found"
+    assert report.score == pytest.approx(value, abs=0.01)
+
+
+@pytest.mark.parametrize("start", [-40.0, 40.0])
+def test_a_broad_flat_top_is_met_in_the_middle_and_not_at_its_edge(start):
+    """What was wrong with walking home the way a fine tune does. Two regions
+    eighty steps apart add up to a top so flat that a per cent below its best
+    is eighteen steps from the middle -- where one region is at 85% of its
+    best and the other at 42%, against 64% each in the middle."""
+    curves = [_hill(-40), _hill(40)]
+    run, optics = _walked(curves, start=start)
+    assert abs(optics) <= STEP, f"ended at {optics}, not in the middle"
+    shares = [one.fraction for one in run.report().results]
+    assert abs(shares[0] - shares[1]) < 0.12, shares
+
+
+@pytest.mark.parametrize("start", [-60.0, 60.0])
+def test_of_several_hills_it_finds_the_one_that_serves_all_of_them_best(start):
+    """Regions further apart in focus than each is deep give the average a
+    hill per region. Started on an outside region's own peak, a climb stands
+    on that hill and calls it the compromise; the hill in the middle serves
+    all three better."""
+    curves = [_hill(-60, width=35), _hill(0, width=35), _hill(60, width=35)]
+    # Hills this far apart are reached through valleys deeper than the
+    # default turns back at; that is what lowering it is for.
+    run, optics = _walked(curves, start=start, turn_back=0.3)
+    best, value = _best_average(curves)
+    assert abs(best) < STEP, "the middle hill is the best one"
+    assert abs(optics - best) <= STEP, f"ended at {optics}, best is {best}"
+
+
+def test_a_top_one_increment_wide_is_still_come_home_to():
+    """Magnified onto a subject with no depth to it, one increment off the top
+    loses a quarter of the reading, and a way home that needs two readings on
+    the top to recognise it never recognises this one."""
+    curves = [_hill(-9, width=10), _hill(9, width=10)]
+    run, optics = _walked(curves, start=-9.0, slack=20)
+    best, value = _best_average(curves)
+    grid = np.arange(-300.0, 300.0)
+    peaks = [max(curve(p) for p in grid) for curve in curves]
+    achieved = average_of_best([curve(optics) for curve in curves], peaks)
+    assert achieved >= value - 0.05, f"ended at {optics}"
+
+
+@pytest.mark.parametrize("slack", [20, 50])
+def test_play_in_the_gearing_does_not_shift_where_it_comes_home_to(slack):
+    """The walk home counts steps only from the place the reading climbs back
+    onto the top, which is the same place on the lens whatever the play was."""
+    curves = [_hill(-40), _hill(40), _hill(10, height=30.0)]
+    run, optics = _walked(curves, start=-40.0, slack=slack)
+    best, _value = _best_average(curves)
+    assert abs(optics - best) <= STEP + 2, f"ended at {optics}, best is {best}"
+    assert run.report().outcome == "found"
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+def test_grain_on_the_readings_does_not_send_it_off_the_top(seed):
+    curves = [_hill(-40), _hill(40)]
+    run, optics = _walked(curves, start=-40.0, noise=0.01, seed=seed, slack=20)
+    best, value = _best_average(curves)
+    assert abs(optics - best) <= STEP, f"ended at {optics}"
+
+
+def _scenes(count: int, spread: float, widths=(12, 90), seed: int = 123):
+    """Made-up scenes: regions at random depths, of random depths of their
+    own, started on one region's peak as a search always is, through random
+    play and grain. Yields (curves, start, slack, noise, seed)."""
+    rng = np.random.default_rng(seed)
+    for trial in range(count):
+        regions = int(rng.integers(2, 6))
+        peaks = rng.uniform(-spread, spread, regions)
+        depth = rng.uniform(widths[0], widths[1], regions)
+        start = float(peaks[int(rng.integers(regions))]) + float(rng.uniform(-3, 3))
+        slack = int(rng.integers(0, 60))
+        noise = float(rng.choice([0.0, 0.01, 0.02]))
+        curves = [_hill(float(p), width=float(w)) for p, w in zip(peaks, depth)]
+        yield curves, start, slack, noise, trial
+
+
+def _loss(curves, optics: float, objective: str = "average") -> float:
+    """What the search's answer cost the thing it was asked to maximise."""
+    grid = np.arange(-500.0, 500.0)
+    tops = [max(curve(p) for p in grid) for curve in curves]
+    value = lambda p: combine([c(p) / t for c, t in zip(curves, tops)], objective)  # noqa: E731
+    return max(value(p) for p in grid) - value(optics)
+
+
+def test_across_many_made_up_scenes_it_gives_away_almost_nothing():
+    """Regions anywhere in 240 steps of focus, some of them further apart
+    than they are deep, with the walks let reach as far as they like: the
+    search's own arithmetic, held to what it can do. What is measured is
+    what it cost the thing it was asked to maximise -- the average share of
+    the regions' best, against the best any focus position gives."""
+    # Within 120 steps of each other and at least 25 deep: regions further
+    # apart than that, or narrower, have a flat valley of nothing between
+    # them -- every other region reads nought where one is sharp -- and
+    # nothing on the way says there is a hill beyond it. No walk that turns
+    # back, however late, sees across one; only a sweep of everything could.
+    losses = []
+    for curves, start, slack, noise, seed in _scenes(60, spread=60.0, widths=(25, 90)):
+        run, optics = _walked(
+            curves, start=start, slack=slack, noise=noise, seed=seed, turn_back=0.3
+        )
+        assert run.report().outcome == "found"
+        losses.append(_loss(curves, optics))
+    assert np.mean(losses) < 0.005, np.mean(losses)
+    assert max(losses) < 0.05, max(losses)
+
+
+def test_on_a_frame_of_film_turning_back_early_costs_nothing_but_saves_time():
+    """What the turn-back share is for. Regions on one frame of film are
+    within a few depths of field of each other, and there the compromise is
+    found as well by walks that turn back at four fifths of their best as by
+    walks that go on into the soft stretch -- in far fewer probes."""
+    early, late = [], []
+    for curves, start, slack, noise, seed in _scenes(40, spread=30.0, widths=(25, 90)):
+        for turn_back, kept in ((TURN_BACK, early), (0.3, late)):
+            run, optics = _walked(
+                curves, start=start, slack=slack, noise=noise, seed=seed, turn_back=turn_back
+            )
+            kept.append((_loss(curves, optics), run.probes))
+    assert np.mean([loss for loss, _probes in early]) < 0.004
+    assert max(loss for loss, _probes in early) < 0.03
+    assert np.mean([probes for _loss, probes in early]) < 0.8 * np.mean(
+        [probes for _loss, probes in late]
+    )
+
+
+@pytest.mark.parametrize("turn_back", [0.8, 0.6])
+def test_no_walk_goes_further_into_the_soft_stretch_than_it_is_let(turn_back):
+    """Once the number the search climbs has fallen below the turn-back share
+    of the best of the walk it is on, the walk turns -- waiting a few
+    increments at most for a region still climbing -- rather than walking on
+    through readings nothing is going to come of."""
+    from scanny.ui.regions import _CLIMB_PATIENCE
+
+    for curves, start, slack, noise, seed in _scenes(20, spread=30.0, widths=(25, 90)):
+        run, _optics = _walked(
+            curves, start=start, slack=slack, noise=noise, seed=seed, turn_back=turn_back
+        )
+        history = run.report().history
+        for leg in ("out", "across"):
+            scores = [combined for stage, _s, combined in history if stage == leg]
+            best, soft = 0.0, 0
+            for score in scores:
+                best = max(best, score)
+                soft = soft + 1 if score < turn_back * best else 0
+                assert soft <= _CLIMB_PATIENCE + 1, (leg, scores)
+
+def test_the_worst_region_is_the_least_of_the_shares():
+    assert combine([0.9, 0.5, 0.7], "worst") == pytest.approx(0.5)
+    assert combine([0.9, 0.5, 0.7], "average") == pytest.approx(0.7)
+    assert combine([], "worst") == 0.0
+
+
+def test_aiming_for_the_worst_region_sacrifices_none_of_them():
+    """A sharp region and a broad one: the best average leans towards the
+    sharp one's peak, which a broad region can afford to lose more of; the
+    best worst region leans the other way, until neither is softer than it
+    has to be."""
+    curves = [_hill(-30, width=20), _hill(30, width=60)]
+    grid = np.arange(-300.0, 300.0)
+    tops = [max(curve(p) for p in grid) for curve in curves]
+    softest = lambda p: min(c(p) / t for c, t in zip(curves, tops))  # noqa: E731
+    # Where the two curves cross is a point, and with no play the lens only
+    # stops a whole number of increments from where it started: the best it
+    # can be asked for is the best of those.
+    reachable = 30.0 + STEP * np.arange(-50, 50)
+    best = max(softest(p) for p in reachable)
+    by_average, at_average = _walked(curves, start=30.0)
+    by_worst, at_worst = _walked(curves, start=30.0, objective="worst")
+    assert softest(at_worst) >= best - 0.01
+    assert softest(at_worst) > softest(at_average) + 0.05
+    report = by_worst.report()
+    assert report.objective == "worst"
+    assert "every region at least" in report.describe()
+
+
+def test_across_many_made_up_scenes_the_worst_region_is_looked_after_too():
+    """The same made-up scenes, by the other objective. Its top is a point
+    where two regions' curves cross rather than a hill, so an increment off
+    it -- which the play can make unavoidable -- costs more than it does on
+    the average; this is held to what that allows."""
+    losses = []
+    for curves, start, slack, noise, seed in _scenes(40, spread=120.0, seed=7):
+        run, optics = _walked(
+            curves,
+            start=start,
+            slack=slack,
+            noise=noise,
+            seed=seed,
+            objective="worst",
+            turn_back=0.3,
+        )
+        losses.append(_loss(curves, optics, "worst"))
+    assert np.mean(losses) < 0.015, np.mean(losses)
+    assert max(losses) < 0.1, max(losses)
+
+
+# -- how far apart in focus the regions are ----------------------------------
+
+
+@pytest.mark.parametrize("slack", [0, 30])
+def test_the_walk_across_says_how_far_apart_in_focus_the_regions_are(slack):
+    """What levelling the film needs: not the compromise but the depths. The
+    walk across crosses every region's peak in one direction, so where each
+    peaked on it is honest against the others, however much play was taken
+    up at its start."""
+    curves = [_hill(-40), _hill(10), _hill(40)]
+    run, _optics = _walked(
+        curves, start=40.0, slack=slack, noise=0.01, seed=3, depths=True
+    )
+    report = run.report()
+    depths = [one.depth for one in report.results]
+    assert depths == pytest.approx([0.0, 50.0, 80.0], abs=3.0)
+    assert all(one.doubt < 5 for one in report.results)
+    assert not any(one.edge for one in report.results)
+    import re
+
+    assert re.fullmatch(
+        r"Depth, in drive steps: 1 nearest,  2 \+5\d ±\d,  3 \+[78]\d ±\d",
+        report.ordering(),
+    ), report.ordering()
+
+
+def test_a_region_a_little_outside_the_others_is_still_measured():
+    """A region the compromise can do without is still one the film has to be
+    levelled by, so the walk across waits a few increments for its peak."""
+    curves = [_hill(-40), _hill(10), _hill(75, width=40)]
+    run, _optics = _walked(curves, start=10.0, depths=True)
+    results = run.report().results
+    assert not any(one.edge for one in results)
+    assert results[2].depth - results[0].depth == pytest.approx(115.0, abs=4.0)
+
+
+def test_a_region_far_outside_the_others_is_not_chased_and_says_so():
+    """Not through the whole soft stretch, which is minutes of walking: its
+    depth is reported as a bound -- at least so far -- rather than measured,
+    and it is left out of the film's shape rather than bending it."""
+    curves = [_hill(-40), _hill(10), _hill(320, width=40)]
+    run, _optics = _walked(curves, start=10.0, depths=True)
+    report = run.report()
+    far = report.results[2]
+    assert far.depth is None or far.edge
+    if far.depth is not None:
+        assert "at least" in describe_depth(far)
+
+
+def _levelled(depth_at, orientation=None, corners=None):
+    """A report of four regions at the corners, their depths given by *depth_at*."""
+    corners = corners or [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)]
+    raw = [depth_at(x, y) for x, y in corners]
+    results = tuple(
+        RegionResult(
+            number + 1,
+            Region(x - 0.05, y - 0.05, 0.1, 0.1),
+            Look(100.0),
+            "found",
+            Look(90.0),
+            depth=value - min(raw),
+            doubt=1.0,
+        )
+        for number, ((x, y), value) in enumerate(zip(corners, raw))
+    )
+    return CalibrationReport(results, 0.9, "found").tilt(orientation)
+
+
+def test_the_regions_depths_are_fitted_with_a_plane_the_film_can_be_levelled_by():
+    tilt = _levelled(lambda x, y: 100 * x + 30 * y)
+    assert tilt.across == pytest.approx(100.0, abs=0.5)
+    assert tilt.down == pytest.approx(30.0, abs=0.5)
+    assert tilt.off_the_plane == pytest.approx(0.0, abs=0.1)
+    said = tilt.describe()
+    assert "right edge focuses 100 steps further than the left edge" in said
+    assert "bottom edge focuses 30 steps further than the top edge" in said
+
+
+def test_the_lean_is_said_the_way_the_picture_is_shown():
+    """Levelling is done looking at the picture as shown, so left and right
+    are the screen's, not the sensor's."""
+    mirrored = _levelled(lambda x, y: 100 * x + 30 * y, Orientation(mirrored=True))
+    assert mirrored.across == pytest.approx(-100.0, abs=0.5)
+    assert mirrored.down == pytest.approx(30.0, abs=0.5)
+    # A quarter turn right puts the frame's top on the screen's right.
+    turned = _levelled(lambda x, y: 100 * x + 30 * y, Orientation(turns=1))
+    assert turned.across == pytest.approx(-30.0, abs=0.5)
+    assert turned.down == pytest.approx(100.0, abs=0.5)
+
+
+def test_what_levelling_cannot_take_out_is_said_separately():
+    """Four corners on a tilted plane and a middle standing proud of it: the
+    tilt is still the plane's, and the middle is what is left over -- curl,
+    which no amount of levelling removes."""
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
+    tilt = _levelled(
+        lambda x, y: 60 * x + (20 if (x, y) == (0.5, 0.5) else 0), corners=corners
+    )
+    assert tilt.across == pytest.approx(60.0, abs=3.0)
+    assert tilt.off_the_plane > 5.0
+
+
+def test_a_lean_inside_the_doubt_is_called_level():
+    tilt = _levelled(lambda x, y: 1.5 * x)
+    assert "level" in tilt.describe().splitlines()[0]
+
+
+def test_a_lean_needs_three_regions_not_in_a_line():
+    assert _levelled(lambda x, y: 50 * x, corners=[(0.2, 0.5), (0.8, 0.5)]) is None
+    assert _levelled(lambda x, y: 50 * x, corners=[(0.2, 0.5), (0.5, 0.5), (0.8, 0.5)]) is None
+
+
+def test_the_report_says_what_each_region_gave_up():
+    curves = [_hill(-40), _hill(40)]
+    run, _optics = _walked(curves, start=-40.0)
+    report = run.report()
+    assert all(one.fraction is not None for one in report.results)
+    assert all(0.5 < one.fraction <= 1.01 for one in report.results)
+    assert report.worst in report.results
+    line = report.describe()
+    assert "Compromise" in line and "region" in line
+
+
+def test_a_calibration_stopped_part_way_keeps_the_peaks_it_found():
+    run = _three()
+    run.region_tuned(Look(100.0, _image(np.full((4, 4), 9.0))), "found", _view(0))
+    report = run.report(stopped=True)
+    assert report.stopped
+    assert report.results[0].best is not None and report.results[0].best.picture
+    assert report.results[1].best is None
+    assert all(one.compromise is None for one in report.results)
+    assert "stopped" in report.describe()
+
+
+def test_regions_are_coloured_by_what_the_compromise_left_them():
+    region = Region(0.1, 0.1, 0.1, 0.1)
+    near = RegionResult(1, region, Look(100.0), "found", Look(97.0))
+    fair = RegionResult(2, region, Look(100.0), "found", Look(88.0))
+    poor = RegionResult(3, region, Look(100.0), "found", Look(60.0))
+    empty = RegionResult(4, region, Look(0.0), "nothing", None)
+    colours = {colour_for(one) for one in (near, fair, poor, empty, None)}
+    assert len(colours) == 5, "each state its own colour"
+
+
+def test_a_region_s_tooltip_has_both_numbers():
+    result = RegionResult(2, Region(0.1, 0.1, 0.1, 0.1), Look(150.0), "found", Look(120.0))
+    said = summarise(result, 2)
+    assert "150" in said and "120" in said and "80%" in said
+
+
+# -- the window's side -------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def app():
+    made = QApplication.instance() or QApplication([])
+    QApplication.setOrganizationName("scanny-tests")
+    QApplication.setApplicationName("scanny-tests")
+    QSettings().clear()
+    yield made
+    QSettings().clear()
+
+
+@pytest.fixture
+def window(app, monkeypatch):
+    monkeypatch.setattr(mw.MainWindow, "_start_worker", lambda self: None)
+    QSettings().clear()
+    made = mw.MainWindow()
+    made.show()
+    QApplication.processEvents()
+    yield made
+    made.hide()
+    made.deleteLater()
+    QApplication.processEvents()
+
+
+def _whole_frame() -> LiveViewFrame:
+    return _frame(np.full((TALL, WIDE), 128.0), (3008, 2008, 6016, 4016), (3008, 2008))
+
+
+def _showing(window, frame: "LiveViewFrame | None" = None) -> None:
+    """Give the picture a frame, so its gestures have somewhere to land."""
+    frame = frame or _whole_frame()
+    window.view.show_frame(frame, QImage.fromData(frame.jpeg, "JPG"))
+    window.view.resize(640, 400)
+    window.view.repaint()
+
+
+def _at(view, x: float, y: float) -> QPoint:
+    return QPoint(
+        view._target.x() + int(x * view._target.width()),
+        view._target.y() + int(y * view._target.height()),
+    )
+
+
+def _ctrl_drag(view, one, other) -> None:
+    ctrl = Qt.KeyboardModifier.ControlModifier
+    left = Qt.MouseButton.LeftButton
+    start, end = _at(view, *one), _at(view, *other)
+    for kind, where in (
+        (QMouseEvent.Type.MouseButtonPress, start),
+        (QMouseEvent.Type.MouseMove, end),
+        (QMouseEvent.Type.MouseButtonRelease, end),
+    ):
+        event = QMouseEvent(
+            kind, QPointF(where), QPointF(view.mapToGlobal(where)), left,
+            left if kind != QMouseEvent.Type.MouseButtonRelease else Qt.MouseButton.NoButton,
+            ctrl,
+        )
+        {
+            QMouseEvent.Type.MouseButtonPress: view.mousePressEvent,
+            QMouseEvent.Type.MouseMove: view.mouseMoveEvent,
+            QMouseEvent.Type.MouseButtonRelease: view.mouseReleaseEvent,
+        }[kind](event)
+
+
+def _ctrl_click(view, x: float, y: float) -> None:
+    _ctrl_drag(view, (x, y), (x, y))
+
+
+def test_ctrl_dragging_the_picture_draws_a_numbered_region(window):
+    _showing(window)
+    _ctrl_drag(window.view, (0.2, 0.3), (0.4, 0.5))
+    assert len(window._regions) == 1
+    assert window._regions[0] == pytest.approx((0.2, 0.3, 0.2, 0.2), abs=0.01)
+    drawn = window.view._regions
+    assert len(drawn) == 1 and drawn[0][1] == 1, "drawn, and numbered one"
+
+
+def test_ctrl_clicking_inside_a_region_takes_it_away(window):
+    _showing(window)
+    _ctrl_drag(window.view, (0.2, 0.3), (0.4, 0.5))
+    _ctrl_drag(window.view, (0.6, 0.3), (0.8, 0.5))
+    _ctrl_click(window.view, 0.3, 0.4)
+    assert len(window._regions) == 1
+    assert window._regions[0][0] == pytest.approx(0.6, abs=0.01)
+
+
+def test_a_plain_drag_still_magnifies_and_draws_no_region(window):
+    _showing(window)
+    zoomed = []
+    window.view.regionSelected.connect(lambda *rect: zoomed.append(rect))
+    start, end = _at(window.view, 0.2, 0.3), _at(window.view, 0.4, 0.5)
+    left = Qt.MouseButton.LeftButton
+    none = Qt.KeyboardModifier.NoModifier
+    window.view.mousePressEvent(QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress, QPointF(start), QPointF(start), left, left, none))
+    window.view.mouseMoveEvent(QMouseEvent(
+        QMouseEvent.Type.MouseMove, QPointF(end), QPointF(end), left, left, none))
+    window.view.mouseReleaseEvent(QMouseEvent(
+        QMouseEvent.Type.MouseButtonRelease, QPointF(end), QPointF(end), left,
+        Qt.MouseButton.NoButton, none))
+    assert window._regions == []
+    assert zoomed, "an ordinary drag is still a magnification"
+
+
+def test_a_region_drawn_while_magnified_is_kept_where_the_sensor_is(window):
+    """So it stays on its subject when the view goes back out."""
+    magnified = _frame(np.full((TALL, WIDE), 128.0), (1504, 3012, 1504, 1004), (1504, 3012))
+    _showing(window, magnified)
+    _ctrl_drag(window.view, (0.25, 0.25), (0.75, 0.75))
+    # The middle half of a quarter-frame view centred at (0.25, 0.75).
+    assert window._regions[0] == pytest.approx((0.1875, 0.6875, 0.125, 0.125), abs=0.01)
+
+
+def test_it_will_not_take_more_regions_than_it_calibrates(window):
+    for index in range(MAX_REGIONS + 2):
+        window._on_region_drawn(0.05 + 0.13 * index, 0.1, 0.1, 0.1)
+    assert len(window._regions) == MAX_REGIONS
+
+
+def test_calibrating_takes_two_regions_and_sends_the_minimum_step(window):
+    asked = []
+    window.requestCalibration.connect(lambda step, aim: asked.append((step, aim)))
+    window._focus_steps["minimum"].setValue(18)
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    assert not window.calibrate_button.isEnabled()
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    assert window.calibrate_button.isEnabled()
+    window.calibrate_button.click()
+    assert asked == [(18, "average")]
+
+
+def test_what_to_aim_for_is_chosen_before_calibrating_and_remembered(window):
+    asked = []
+    window.requestCalibration.connect(lambda step, aim: asked.append(aim))
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window.regions_objective.setCurrentIndex(window.regions_objective.findData("worst"))
+    window.calibrate_button.click()
+    assert asked == ["worst"]
+    assert QSettings().value("regions/objective") == "worst"
+    # Settled before it starts: the search climbs it, and a report made by one
+    # cannot be read as if it had been made by the other.
+    window._on_calibration_changed(True)
+    assert not window.regions_objective.isEnabled()
+    window._on_calibration_changed(False)
+    assert window.regions_objective.isEnabled()
+
+
+def test_the_regions_are_sent_to_the_worker_and_a_change_forgets_the_report(window):
+    told = []
+    window.requestFocusRegions.connect(told.append)
+    window._report = object()
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    assert told[-1] == [(0.1, 0.1, 0.1, 0.1)]
+    assert window._report is None
+
+
+def test_the_regions_are_remembered_for_next_time(app, monkeypatch):
+    monkeypatch.setattr(mw.MainWindow, "_start_worker", lambda self: None)
+    QSettings().clear()
+    first = mw.MainWindow()
+    first._on_region_drawn(0.1, 0.2, 0.1, 0.1)
+    first._on_region_drawn(0.5, 0.6, 0.2, 0.1)
+    first.deleteLater()
+    second = mw.MainWindow()
+    assert second._regions == pytest.approx([(0.1, 0.2, 0.1, 0.1), (0.5, 0.6, 0.2, 0.1)])
+    second.deleteLater()
+
+
+def test_the_shape_of_a_calibration_is_settled_while_it_runs(window):
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._on_calibration_changed(True)
+    assert window.calibrate_button.text() == "Stop"
+    assert not window.regions_clear.isEnabled()
+    window._on_calibration_changed(False)
+    assert window.calibrate_button.text() == "Calibrate"
+
+
+def _report(inverted_left: bool = True) -> CalibrationReport:
+    """A report whose pictures are black on the left and white on the right."""
+    pixels = np.zeros((10, 20))
+    pixels[:, 10:] = 255.0
+    picture = _image(pixels)
+    region = Region(0.1, 0.1, 0.1, 0.1)
+    return CalibrationReport(
+        results=(
+            RegionResult(1, region, Look(150.0, picture), "found", Look(140.0, picture)),
+            RegionResult(2, region, Look(60.0, picture), "found", Look(51.0, picture)),
+        ),
+        score=0.89,
+        outcome="found",
+        probes=31,
+    )
+
+
+def test_a_report_colours_the_regions_and_opens_a_window_of_pictures(window):
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._on_calibration_report(_report())
+    assert window.report_button.isEnabled()
+    assert "89%" in window.regions_result.text()
+    window.report_button.click()
+    dialog = window._report_dialog
+    assert dialog is not None and dialog.isVisible()
+    # Two regions, a best and a compromise each.
+    assert len(dialog._pictures) == 4
+    assert all(not label.pixmap().isNull() for label in dialog._pictures)
+
+
+def test_no_line_of_the_report_is_cut_off(window):
+    """A wrapped label in a grid is given the height its text needs at the
+    wrong width, and the heading over the pictures came out half a line tall,
+    clipped top and bottom. Every wrapped line has to get the room its text
+    takes at the width it was actually given."""
+    from PySide6.QtWidgets import QLabel
+
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._on_calibration_report(_report())
+    window.report_button.click()
+    dialog = window._report_dialog
+    QApplication.processEvents()
+    wrapped = [
+        label
+        for label in dialog._content.findChildren(QLabel)
+        if label.wordWrap() and label.text()
+    ]
+    assert wrapped, "the headings and captions wrap"
+    for label in wrapped:
+        assert label.height() >= label.heightForWidth(label.width()), label.text()
+
+
+def test_the_report_says_how_far_apart_the_regions_are_and_how_the_frame_leans(window):
+    from PySide6.QtWidgets import QLabel
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8)]
+    for x, y in corners:
+        window._on_region_drawn(x - 0.05, y - 0.05, 0.1, 0.1)
+    picture = _image(np.full((10, 10), 128.0))
+    results = tuple(
+        RegionResult(
+            number + 1,
+            Region(x - 0.05, y - 0.05, 0.1, 0.1),
+            Look(100.0, picture),
+            "found",
+            Look(90.0, picture),
+            depth=depth,
+            doubt=1.0,
+        )
+        for number, ((x, y), depth) in enumerate(zip(corners, (0.0, 60.0, 20.0)))
+    )
+    window._on_calibration_report(CalibrationReport(results, 0.9, "found"))
+    assert "1 nearest" in window.regions_result.text()
+    window.report_button.click()
+    said = " ".join(
+        label.text() for label in window._report_dialog.findChildren(QLabel)
+    )
+    assert "Region 2: 60 steps further" in said
+    assert "right edge focuses 100 steps further than the left edge" in said
+    assert "bottom edge focuses 33 steps further than the top edge" in said
+    # Turned, the lean is said again the way the picture now is.
+    window._flip_view(False)
+    said = " ".join(
+        label.text() for label in window._report_dialog.findChildren(QLabel)
+    )
+    assert "left edge focuses 100 steps further than the right edge" in said
+
+
+def test_the_report_shows_the_pictures_the_way_the_view_is_shown(window):
+    """Mirrored, the white half of every picture is on the left -- the way the
+    picture on screen is being looked at, not the way the sensor sees it."""
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._on_calibration_report(_report())
+    window.report_button.click()
+    dialog = window._report_dialog
+
+    def left_is_white() -> bool:
+        shown = dialog._pictures[0].pixmap().toImage()
+        return shown.pixelColor(1, shown.height() // 2).red() > 200
+
+    assert not left_is_white()
+    window._flip_view(False)
+    assert left_is_white(), "the open report follows the view"
+    window._on_invert_toggled(True)
+    assert not left_is_white(), "and inverting it inverts the pictures too"
+
+
+# -- the whole thing, through the worker -------------------------------------
+
+
+WIDE, TALL = 160, 120
+FRAME = (6016, 4016)
+MAGNIFICATION = {0: 1.0, 2: 2.35, 3: 3.13, 4: 4.7, 5: 6.27, 6: 9.4, 7: 18.8}
+
+
+def _frame(pixels, crop, af) -> LiveViewFrame:
+    """One frame, reporting the crop the camera would be showing."""
+    data = QByteArray()
+    sink = QBuffer(data)
+    sink.open(QBuffer.OpenModeFlag.WriteOnly)
+    _image(pixels).save(sink, "JPG", 95)
+    cx, cy, w, h = crop
+    return LiveViewFrame(
+        jpeg=bytes(data.data()), width=pixels.shape[1], height=pixels.shape[0],
+        image_width=FRAME[0], image_height=FRAME[1],
+        crop_width=w, crop_height=h, crop_center_x=cx, crop_center_y=cy,
+        af_width=324, af_height=270, af_x=af[0], af_y=af[1],
+    )
+
+
+class _Rig:
+    """A body over a curled frame of film: places at different depths.
+
+    What the picture shows depends on where the camera is aimed and how far
+    it is magnified -- the view is a crop of the frame centred on the focus
+    point -- and it is softened by how far the optics are from the depth of
+    whichever place the view is over. The gearing has play in it, so the
+    first steps after a reversal move nothing; live view runs a frame behind
+    the lens; the picture has grain on it; and autofocus gets close to the
+    place it is aimed at rather than onto it.
+    """
+
+    live_view_active = True
+    exposure_preview = True
+
+    def __init__(self, places, start: int = 3000, softness: float = 30.0,
+                 slack: int = 0, noise: float = 1.5, af_error: int = 12,
+                 lag: int = 1) -> None:
+        #: (x, y, best) each: where on the frame, and where on the travel.
+        self.places = list(places)
+        self.optics = float(start)
+        self.position = float(start)
+        self.softness = softness
+        self.slack = slack
+        self.noise = noise
+        self.af_error = af_error
+        self.lag = lag
+        self.zoom = 0
+        self.af = (FRAME[0] // 2, FRAME[1] // 2)
+        self.zooms: "list[int]" = []
+        self.aimed: "list[tuple[int, int]]" = []
+        self.focused = 0
+        self._history = [self.optics] * (lag + 1)
+        self._textures: "dict[tuple, np.ndarray]" = {}
+        self._rng = np.random.default_rng(3)
+        #: After how many more frames the body ends live view by itself, as a
+        #: D750 does after its own monitor-off delay; None for never. And how
+        #: often it has been started again since.
+        self.ends_after: "int | None" = None
+        self.ended = False
+        self.restarts = 0
+        #: How many attempts at starting live view again it refuses, as a body
+        #: still putting its mirror down does, and how many commands after a
+        #: restart it answers busy to.
+        self.refuses_restart = 0
+        self.busy_after_restart = 0
+
+    # -- the camera's side ---------------------------------------------------
+
+    def _in_live_view(self, what: str) -> None:
+        """Refuse, as the body does, what cannot be done out of live view."""
+        if self.ended:
+            raise CameraError(f"{what} can only be done in live view")
+        if self.busy_after_restart:
+            self.busy_after_restart -= 1
+            raise CameraError(f"could not {what} (0x2019)")
+
+    def drive_focus(self, steps: int) -> bool:
+        self._in_live_view("drive focus")
+        self.position += int(steps)
+        # The optics are carried between two faces of the driver.
+        self.optics = min(max(self.optics, self.position), self.position + self.slack)
+        return True
+
+    def set_zoom_level(self, level: int) -> None:
+        self._in_live_view("zoom")
+        self.zoom = int(level)
+        self.zooms.append(int(level))
+
+    def zoom_level(self) -> int:
+        return self.zoom
+
+    def set_af_area(self, x: int, y: int) -> None:
+        self._in_live_view("move the focus point")
+        self.af = (int(x), int(y))
+        self.aimed.append(self.af)
+
+    def autofocus(self, timeout: float = 8.0) -> bool:
+        self._in_live_view("autofocus")
+        self.focused += 1
+        self.optics = float(self._place()[2] + self.af_error)
+        self.position = self.optics - self.slack // 2
+        return True
+
+    def live_view_frame(self) -> LiveViewFrame:
+        if self.ends_after is not None:
+            self.ends_after -= 1
+            if self.ends_after <= 0:
+                self.ended, self.ends_after = True, None
+        if self.ended:
+            raise CameraError("live view has ended")
+        self._history.append(self.optics)
+        shown = self._history[-(self.lag + 1)]
+        crop = self._crop()
+        pixels = self.picture(crop, shown) + self._rng.normal(0, self.noise, (TALL, WIDE))
+        return _frame(pixels, crop, self.af)
+
+    def stop_live_view(self) -> None:
+        self.live_view_active = False
+
+    def restart_live_view(self) -> None:
+        """Live view again -- at the whole frame, as a body starts it."""
+        if self.refuses_restart:
+            self.refuses_restart -= 1
+            raise CameraError("camera will not enter live view: busy")
+        self.restarts += 1
+        self.ended = False
+        self.live_view_active = True
+        self.zoom = 0
+
+    def set_setting(self, name, value) -> None:
+        pass
+
+    def settings(self) -> list:
+        return []
+
+    def set_exposure_preview(self, enabled: bool) -> None:
+        self.exposure_preview = enabled
+
+    # -- the scene -----------------------------------------------------------
+
+    def _crop(self, zoom: "int | None" = None, af=None):
+        magnification = MAGNIFICATION[self.zoom if zoom is None else zoom]
+        ax, ay = self.af if af is None else af
+        w, h = int(FRAME[0] / magnification), int(FRAME[1] / magnification)
+        cx = min(max(ax, w // 2), FRAME[0] - w // 2)
+        cy = min(max(ay, h // 2), FRAME[1] - h // 2)
+        return cx, cy, w, h
+
+    def _place(self, crop=None):
+        cx, cy, _w, _h = crop or self._crop()
+        here = (cx / FRAME[0], cy / FRAME[1])
+        return min(self.places, key=lambda p: (p[0] - here[0]) ** 2 + (p[1] - here[1]) ** 2)
+
+    def picture(self, crop, optics: float) -> np.ndarray:
+        """The view's own detail, softened by how far focus is off its depth.
+
+        The blur grows as the square of the distance near focus and in
+        proportion to it further out, which gives the reading the rounded top
+        and long tails a real lens does. Blur in proportion to the distance
+        all the way in makes the top a cusp, which no lens has and which
+        makes every increment the gearing's play leaves the lattice off by
+        look like a failure to find focus.
+        """
+        base = self._textures.get(crop)
+        if base is None:
+            base = _texture(TALL, WIDE, seed=abs(hash(crop)) % 9973)
+            self._textures[crop] = base
+        away = (optics - self._place(crop)[2]) / self.softness
+        return _blur(base, min(2.0 * (np.hypot(1.0, away) - 1.0), 7.99))
+
+
+def _regions_round(places, side: float = 0.06):
+    return [(x - side / 2, y - side / 2, side, side) for x, y, _best in places]
+
+
+@pytest.fixture
+def worker():
+    from scanny.ui.worker import CameraWorker
+
+    return CameraWorker()
+
+
+def _calibrated(
+    worker, rig, regions, *, frames: int = 2, limit: int = 20000, depths: bool = False
+):
+    worker._camera = rig
+    if frames:
+        worker.set_integration(True, frames)
+    for _ in range(8):
+        worker._grab()
+    worker.set_focus_regions(regions)
+    reports = []
+    worker.calibrationReady.connect(lambda report: reports.append(report))
+    worker.start_calibration(STEP, "average", 80, depths)
+    for _ in range(limit):
+        if worker._calibration is None:
+            break
+        worker._grab()
+    assert worker._calibration is None, "the calibration has to finish on its own"
+    assert reports and reports[-1] is not None
+    return reports[-1]
+
+
+def _true_average(rig, report, position: float) -> float:
+    """What the model says the average of each region's fraction is, there.
+
+    Read without grain, through each region's own view, against the best the
+    model can give that region anywhere -- the thing the walk was trying to
+    find, worked out by brute force.
+    """
+    shares = []
+    for result in report.results:
+        crop = rig._crop(7 if result.region.w < 0.05 else 6, _af_for(result.region))
+        shown = result.region.seen_in(_normalised(crop))
+        read = lambda p: measure(_image(rig.picture(crop, p)), shown)  # noqa: E731
+        best = rig._place(crop)[2]
+        shares.append(read(position) / read(best))
+    return float(np.mean(shares))
+
+
+def _af_for(region: Region) -> "tuple[int, int]":
+    return (
+        int(round((region.x + region.w / 2) * FRAME[0])),
+        int(round((region.y + region.h / 2) * FRAME[1])),
+    )
+
+
+def _normalised(crop):
+    cx, cy, w, h = crop
+    return ((cx - w / 2) / FRAME[0], (cy - h / 2) / FRAME[1], w / FRAME[0], h / FRAME[1])
+
+
+PLACES = [(0.2, 0.25, 3000), (0.8, 0.3, 3060), (0.5, 0.75, 3120)]
+
+
+@pytest.mark.parametrize("slack", [0, 40])
+def test_three_regions_at_three_depths_meet_at_the_best_compromise(worker, slack):
+    """The whole of what was asked for. Three places across a curled frame,
+    sixty steps apart in focus each: every one fine tuned on its own, then
+    one focus position walked to that does best by all three -- through the
+    play in the gearing, and panning between regions the camera can only
+    show one of at a time."""
+    rig = _Rig(PLACES, slack=slack)
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+
+    assert report.outcome == "found", report.describe()
+    assert all(one.usable for one in report.results)
+    # Every region was fine tuned on its own, magnified onto it.
+    assert rig.focused == 3, "one autofocus per region, and none for the compromise"
+    assert 6 in rig.zooms
+
+    grid = np.arange(2900, 3221, 10)
+    truth = [_true_average(rig, report, float(p)) for p in grid]
+    achieved = _true_average(rig, report, rig.optics)
+    assert achieved >= max(truth) - 0.03, (
+        f"it stood at {rig.optics:.0f} worth {achieved:.3f}; the best there is "
+        f"{max(truth):.3f} at {grid[int(np.argmax(truth))]}"
+    )
+    # And the middle one is where it should be: between the other two.
+    assert 3000 < rig.optics < 3120
+
+
+def test_each_region_s_best_is_remembered_with_its_picture(worker):
+    rig = _Rig(PLACES)
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+    for result in report.results:
+        assert result.best.reading > 0.0
+        assert result.best.picture is not None and not result.best.picture.isNull()
+        assert result.compromise.picture is not None
+        # The same view both times, so the same size of picture.
+        assert result.best.picture.size() == result.compromise.picture.size()
+        assert 0.0 < result.fraction <= 1.1
+    # These three are further apart in focus than each is deep, so the best
+    # average stands on the middle one and the outer two pay for it.
+    middle = report.results[1]
+    assert middle.fraction > 0.9
+    assert report.worst is not middle
+    assert report.score == pytest.approx(
+        np.mean([one.fraction for one in report.results]), abs=1e-6
+    )
+
+
+@pytest.mark.parametrize("slack", [0, 40])
+def test_the_rig_s_regions_come_back_at_their_depths(worker, slack):
+    """Three places across the frame, sixty steps apart in focus each, read
+    through a lens with play in it and a camera panned from one to the next:
+    the depths are the ones the rig was built with."""
+    rig = _Rig(PLACES, slack=slack)
+    report = _calibrated(worker, rig, _regions_round(PLACES), depths=True)
+    depths = [one.depth for one in report.results]
+    assert None not in depths
+    assert depths == pytest.approx([0.0, 60.0, 120.0], abs=6.0)
+    tilt = report.tilt()
+    assert tilt is not None
+    # The rig is a plane tilted mostly left to right: (0.2, 0.25) at 0,
+    # (0.8, 0.3) at 60 and (0.5, 0.75) at 120.
+    assert tilt.off_the_plane < 3.0
+
+
+def test_what_to_aim_for_reaches_the_search(worker):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(8):
+        worker._grab()
+    reports = []
+    worker.calibrationReady.connect(reports.append)
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP, "worst")
+    for _ in range(20000):
+        if worker._calibration is None:
+            break
+        worker._grab()
+    assert reports[-1].objective == "worst"
+    assert reports[-1].outcome == "found"
+
+
+def test_an_unknown_aim_is_refused(worker):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(4):
+        worker._grab()
+    failures = []
+    worker.failed.connect(failures.append)
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP, "sharpest")
+    assert worker._calibration is None
+    assert failures
+
+
+def test_it_puts_the_view_and_the_user_s_meter_back(worker):
+    """Leaving someone at 9.4x on the last region is leaving them somewhere
+    they did not ask to be; and the sharpness meter is theirs."""
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    worker.set_sharpness_area((0.4, 0.4, 0.2, 0.2))
+    was_af = rig.af
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+    assert report.outcome == "found"
+    assert rig.zoom == 0
+    assert rig.af == was_af
+    assert not worker._sharpness.enabled
+    assert worker._sharpness.area == (0.4, 0.4, 0.2, 0.2)
+
+
+def test_changing_the_regions_stops_a_calibration(worker):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(8):
+        worker._grab()
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP)
+    for _ in range(40):
+        worker._grab()
+    assert worker._calibration is not None
+    worker.set_focus_regions(_regions_round(PLACES[:2]))
+    assert worker._calibration is None
+    assert worker._hunt is None
+
+
+def test_taking_the_focus_by_hand_stops_a_calibration(worker):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(8):
+        worker._grab()
+    reports = []
+    worker.calibrationReady.connect(reports.append)
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP)
+    for _ in range(40):
+        worker._grab()
+    worker.drive_focus(50)
+    assert worker._calibration is None
+    assert reports[-1] is not None and reports[-1].stopped
+    assert rig.zoom == 0, "and it still put the view back"
+
+
+def test_fine_tuning_by_hand_during_the_compromise_stops_the_calibration(worker):
+    """Between the fine tunes no search of the button's own is running, so
+    there is nothing for it to collide with -- except the calibration, which
+    is walking the lens itself."""
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(8):
+        worker._grab()
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP)
+    for _ in range(20000):
+        if worker._calibration is None or worker._calibration.phase == "compromise":
+            break
+        worker._grab()
+    assert worker._calibration is not None and worker._calibration.phase == "compromise"
+    worker.fine_tune(STEP)
+    assert worker._calibration is None
+    assert worker._calibration_meter is None, "the user's meter is back"
+
+
+def test_it_refuses_fewer_than_two_regions(worker):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(4):
+        worker._grab()
+    failures = []
+    worker.failed.connect(failures.append)
+    worker.set_focus_regions(_regions_round(PLACES[:1]))
+    worker.start_calibration(STEP)
+    assert worker._calibration is None
+    assert failures and "two regions" in failures[0]
+
+
+# -- what it took ---------------------------------------------------------------
+
+
+def test_the_report_says_how_long_it_took_and_how_much_it_drove():
+    now = [100.0]
+    run = Calibration(
+        [Region(0.2 * n, 0.2, 0.05, 0.05) for n in range(2)],
+        STEP,
+        clock=lambda: now[0],
+    )
+    run.autofocused()
+    run.drove(6)
+    run.drove(-6)
+    run.region_tuned(Look(100.0), "found", _view(0), probes=41)
+    run.autofocused()
+    run.drove(12)
+    run.region_tuned(Look(100.0), "found", _view(1), probes=37)
+    now[0] += 372.0
+    report = run.report()
+    assert report.seconds == pytest.approx(372.0)
+    assert report.tune_probes == (41, 37)
+    assert (report.moves, report.travel, report.autofocuses) == (3, 24, 2)
+    said = report.cost()
+    assert said.startswith("Took 6 min 12 s")
+    assert "fine tuning 41, 37 probes" in said
+    assert "3 focus moves covering 24 drive steps" in said
+    assert "2 autofocuses" in said
+
+
+def test_a_running_clock_reads_like_one():
+    assert clock(7) == "0:07"
+    assert clock(252.9) == "4:12"
+    assert clock(3753) == "1:02:33"
+
+
+def test_turning_back_at_four_fifths_means_four_fifths():
+    """What was reported from a real calibration. The worst region started at
+    81% of its best and fell a few per cent a step, while three broad regions
+    around it stayed near theirs. Told to turn back at 80%, the walk out went
+    on to where the worst was at 38% -- because it was waiting, for the
+    depths, for the broad ones to fall as well, and they barely fell at all.
+
+    Without depths asked for, it turns at the first reading below four fifths
+    of the best of the walk. With them, it goes further, and says it will."""
+    curves = [_hill(-63, width=137), _hill(0, width=150), _hill(-5, width=150),
+              _hill(5, width=150)]
+
+    def out_leg(depths: bool) -> "list[float]":
+        run, _optics = _walked(
+            curves, start=0.0, objective="worst", turn_back=0.8, depths=depths
+        )
+        return [combined for stage, _s, combined in run.report().history if stage == "out"]
+
+    quick = out_leg(False)
+    assert quick[0] == pytest.approx(0.81, abs=0.02)
+    # One reading below the line, and it turns.
+    below = [value for value in quick if value < 0.8 * max(quick)]
+    assert len(below) == 1, quick
+    assert min(quick) > 0.6, "nowhere near a third of its best"
+    thorough = out_leg(True)
+    assert len(thorough) > len(quick), "depths walk further, when asked for"
+
+
+def test_without_depths_asked_for_the_report_has_none_and_says_how_to_get_them(window):
+    from PySide6.QtWidgets import QLabel
+
+    from scanny.ui.report import CalibrationReportDialog
+
+    run, _optics = _walked([_hill(-40), _hill(10), _hill(40)], start=40.0)
+    report = run.report()
+    assert not report.depths_measured
+    assert all(one.depth is None for one in report.results)
+    assert report.ordering() == ""
+    dialog = CalibrationReportDialog(report, Orientation(), window._save_directory(), window)
+    said = " ".join(label.text() for label in dialog.findChildren(QLabel))
+    assert "Measure depths for levelling" in said
+
+
+def test_measuring_depths_is_asked_for_before_calibrating_and_remembered(window):
+    asked = []
+    window.requestCalibration.connect(
+        lambda step, aim, turn, depths: asked.append(depths)
+    )
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    assert not window.regions_depths.isChecked(), "off, out of the box"
+    window.calibrate_button.click()
+    window.regions_depths.setChecked(True)
+    window.calibrate_button.click()
+    assert asked == [False, True]
+    assert QSettings().value("regions/depths", False, bool) is True
+    window._on_calibration_changed(True)
+    assert not window.regions_depths.isEnabled()
+    window._on_calibration_changed(False)
+
+
+def test_the_rig_s_calibration_is_timed_and_counted(worker):
+    rig = _Rig(PLACES)
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+    assert report.seconds > 0.0
+    assert len(report.tune_probes) == 3 and all(report.tune_probes)
+    assert report.autofocuses == 3
+    assert report.moves > report.probes
+    assert report.travel >= STEP * report.moves
+    assert report.cost().startswith("Took ")
+
+
+def test_the_panel_shows_how_long_the_calibration_has_run(window, monkeypatch):
+    started = [1000.0]
+    monkeypatch.setattr(mw.time, "monotonic", lambda: started[0])
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._on_calibration_changed(True)
+    window._on_calibration_progress(0, "Region 1 of 2: fine tuning it on its own")
+    started[0] += 125.0
+    window._show_progress()
+    assert window.regions_progress.text().startswith("2:05")
+    assert "Region 1 of 2" in window.regions_progress.text()
+    assert window._clock.isActive(), "it keeps ticking between messages"
+    window._on_calibration_changed(False)
+    assert not window._clock.isActive()
+
+
+# -- live view the body turns off ----------------------------------------------
+
+
+@pytest.fixture
+def quick_restarts(monkeypatch):
+    """No waiting between attempts at starting live view again."""
+    from scanny.ui import worker as module
+
+    monkeypatch.setattr(module, "_RESTART_WAITS", (0.0, 0.0, 0.0, 0.0))
+    monkeypatch.setattr(module, "_VIEW_BACK_PATIENCE", 0.5)
+
+
+def test_live_view_the_body_turns_off_is_started_again_and_the_view_put_back(
+    worker, quick_restarts
+):
+    """A D750 ends live view after its own monitor-off delay whoever is
+    driving it, and a calibration can take longer than the ten minutes it
+    comes set to. Focus does not move when it does, so the calibration goes
+    on once the view is back the way it was.
+
+    The body in this is the real one's kind: out of live view it refuses to
+    move the focus point, zoom or drive focus as well as to send frames, its
+    first attempt at starting again is refused, and the first command after
+    it is answered busy. A calibration between two probes meets the refusals
+    first, and that is the path that used to end it."""
+    rig = _Rig(PLACES)
+    rig.refuses_restart = 1
+    worker._camera = rig
+    for _ in range(8):
+        worker._grab()
+    said = []
+    worker.status.connect(said.append)
+    reports = []
+    worker.calibrationReady.connect(reports.append)
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP, "average", 80, True)
+    ended_in = []
+    for count in range(20000):
+        run = worker._calibration
+        if run is None:
+            break
+        # Once while a region is being fine tuned, once in the compromise.
+        early = count == 150 and not ended_in
+        later = run.phase == "compromise" and run.probes == 5 and len(ended_in) == 1
+        if early or later:
+            ended_in.append(run.phase)
+            rig.ends_after = 1
+            rig.refuses_restart = 1
+            rig.busy_after_restart = 1
+        worker._grab()
+    assert rig.restarts == 2
+    assert ended_in == ["peaks", "compromise"]
+    assert reports[-1].outcome == "found", reports[-1].describe()
+    assert any("turned live view off by itself" in line for line in said)
+    depths = [one.depth for one in reports[-1].results]
+    assert depths == pytest.approx([0.0, 60.0, 120.0], abs=6.0)
+
+
+def test_a_compromise_move_the_body_refused_is_made_once_live_view_is_back(
+    worker, quick_restarts
+):
+    """Live view going off as a move is sent loses the move, and the search
+    would then be one increment out about where it is for the rest of the
+    walk. The move is kept, and made first thing once live view is back."""
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(8):
+        worker._grab()
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP)
+    for _ in range(20000):
+        run = worker._calibration
+        if run is None or (run.phase == "compromise" and run.probes == 3):
+            break
+        worker._grab()
+    run = worker._calibration
+    assert run is not None
+    driven = run._moves
+    original = rig.drive_focus
+
+    def goes_off_as_it_drives(steps: int) -> bool:
+        rig.drive_focus = original
+        rig.ended = True
+        return original(steps)
+
+    rig.drive_focus = goes_off_as_it_drives
+    worker._grab()  # the probe, then the move -- refused
+    assert rig.restarts == 1
+    refused = run.pending
+    assert refused != 0, "the refused move is kept"
+    assert run._moves == driven, "and not counted as made"
+    drives = []
+    made = rig.drive_focus
+    rig.drive_focus = lambda steps: drives.append(steps) or made(steps)
+    worker._grab()
+    assert drives[0] == refused, "it is the first thing made once live view is back"
+    assert run.pending == 0
+
+
+def test_a_body_that_keeps_ending_live_view_is_not_fought(worker, quick_restarts):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(4):
+        worker._grab()
+    failures = []
+    worker.failed.connect(failures.append)
+    changed = []
+    worker.liveViewChanged.connect(changed.append)
+    for _ in range(5):
+        rig.ends_after = 1
+        for _ in range(20):
+            worker._grab()
+    assert rig.restarts == 3, "three in a couple of minutes, and no more"
+    assert changed == [False]
+    assert failures and "shut down" in failures[-1]
+
+
+def test_every_restart_is_in_the_activity_log_with_the_camera_s_own_words(
+    worker, quick_restarts
+):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(4):
+        worker._grab()
+    logged = []
+    worker.log.connect(logged.append)
+    rig.ends_after = 1
+    rig.refuses_restart = 1
+    for _ in range(20):
+        worker._grab()
+    said = "\n".join(logged)
+    assert "gone off" in said
+    assert "attempt 1: the camera refused: camera will not enter live view: busy" in said
+    assert "attempt 2: live view is back" in said
+
+
+# -- every region through the search ------------------------------------------
+
+
+def test_the_report_keeps_every_region_through_the_search():
+    curves = [_hill(-40), _hill(10), _hill(40)]
+    run, _optics = _walked(curves, start=40.0)
+    report = run.report()
+    assert report.history_regions == (1, 2, 3)
+    assert len(report.history) == report.probes
+    stages = [stage for stage, _shares, _combined in report.history]
+    assert stages[0] == "out" and "across" in stages and stages[-1] == "home"
+    # Region 3 is where it starts: at its own best on the first probe.
+    assert report.history[0][1][2] == pytest.approx(1.0)
+    for _stage, shares, combined in report.history:
+        assert combined == pytest.approx(np.mean(shares))
+
+
+def test_the_panel_charts_every_region_as_the_search_goes(window):
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    window._on_calibration_changed(True)
+    assert not window.regions_chart.isVisible()
+    window._on_calibration_probe((1, 2), "out", (1.0, 0.3), 0.65)
+    window._on_calibration_probe((1, 2), "out", (0.8, 0.5), 0.65)
+    assert window.regions_chart.isVisible()
+    assert window.regions_chart.probes == 2
+    window.regions_chart.repaint()
+
+
+def test_the_worker_hands_every_probe_to_the_chart(worker):
+    rig = _Rig(PLACES)
+    probes = []
+    worker.calibrationProbe.connect(lambda *probe: probes.append(probe))
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+    assert len(probes) == report.probes
+    regions, stage, shares, combined = probes[0]
+    assert tuple(regions) == (1, 2, 3) and stage == "out" and len(shares) == 3
+
+
+# -- the film's shape ----------------------------------------------------------
+
+
+def test_three_regions_make_a_plane_and_no_bulge():
+    from scanny.ui.film import FilmSurface
+
+    points = [(0.2, 0.2), (0.8, 0.3), (0.4, 0.8)]
+    surface = FilmSurface.fit(points, [100 * x + 30 * y for x, y in points])
+    assert surface.plane[0] == pytest.approx(100.0) and surface.plane[1] == pytest.approx(30.0)
+    assert abs(surface.bulge()[0]) < 1e-6
+
+
+def test_a_bowed_frame_bulges_between_edges_that_stay_on_their_plane():
+    """Four corners on a leaning plane and the middle standing proud of it:
+    the film passes through every measured depth, its edges keep the lean,
+    and all of the rest is bulge -- most in the middle, none at the edges."""
+    from scanny.ui.film import FilmSurface
+
+    points = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
+    depths = [60 * x + (20 if (x, y) == (0.5, 0.5) else 0) for x, y in points]
+    surface = FilmSurface.fit(points, depths, [1.0] * 5)
+    for (x, y), depth in zip(points, depths):
+        assert float(surface.at(x, y)) == pytest.approx(depth, abs=1e-6)
+    assert surface.plane[0] == pytest.approx(60.0, abs=0.5)
+    bulge, x, y = surface.bulge()
+    assert bulge > 20.0 and (x, y) == pytest.approx((0.5, 0.5), abs=0.05)
+    for edge in ((0.0, 0.5), (1.0, 0.5), (0.5, 0.0), (0.5, 1.0)):
+        assert float(surface.bulge_at(*edge)) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_bulge_says_which_way_the_film_bows():
+    report = _levelled_report(
+        lambda x, y: 50 * x - (15 if (x, y) == (0.5, 0.5) else 0),
+        corners=[(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)],
+    )
+    said = report.tilt().describe()
+    assert "nearer the camera than they are" in said
+    assert "right edge focuses 50 steps further than the left edge" in said
+
+
+def _levelled_report(depth_at, corners):
+    raw = [depth_at(x, y) for x, y in corners]
+    results = tuple(
+        RegionResult(
+            number + 1,
+            Region(x - 0.05, y - 0.05, 0.1, 0.1),
+            Look(100.0),
+            "found",
+            Look(90.0),
+            depth=value - min(raw),
+            doubt=1.0,
+        )
+        for number, ((x, y), value) in enumerate(zip(corners, raw))
+    )
+    return CalibrationReport(results, 0.9, "found")
+
+
+def test_the_film_is_drawn_over_the_sensor_and_can_be_turned_round(app):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    from scanny.ui.film import FilmView, Mark
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
+    report = _levelled_report(lambda x, y: 40 * x + (25 if x == 0.5 else 0), corners)
+    view = FilmView()
+    view.resize(500, 380)
+    view.set_scene(
+        report.surface(),
+        [Mark(one.number, one.region.rect, one.depth) for one in report.placed],
+        Orientation(turns=1, mirrored=True),
+    )
+    view.show()
+    QApplication.processEvents()
+    before = view.grab().toImage()
+    turned_from = view.angles
+    left = Qt.MouseButton.LeftButton
+    for kind, x in (
+        (QMouseEvent.Type.MouseButtonPress, 100),
+        (QMouseEvent.Type.MouseMove, 180),
+        (QMouseEvent.Type.MouseButtonRelease, 180),
+    ):
+        event = QMouseEvent(kind, QPointF(x, 150), QPointF(x, 150), left, left,
+                            Qt.KeyboardModifier.NoModifier)
+        {
+            QMouseEvent.Type.MouseButtonPress: view.mousePressEvent,
+            QMouseEvent.Type.MouseMove: view.mouseMoveEvent,
+            QMouseEvent.Type.MouseButtonRelease: view.mouseReleaseEvent,
+        }[kind](event)
+    assert view.angles != turned_from
+    after = view.grab().toImage()
+    assert after != before, "turning it round redraws it from the new side"
+
+
+def test_the_report_has_the_film_and_the_search_on_pages_of_their_own(window):
+    from scanny.ui.report import CalibrationReportDialog
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)]
+    report = _levelled_report(lambda x, y: 30 * x + 10 * y, corners)
+    dialog = CalibrationReportDialog(report, Orientation(), window._save_directory(), window)
+    assert [dialog._tabs.tabText(i) for i in range(dialog._tabs.count())] == [
+        "Regions", "Film shape", "The search",
+    ]
+    assert dialog._film_view._surface is not None
+    assert len(dialog._film_view._marks) == 4
+    dialog._tabs.setCurrentIndex(1)
+    widget, word = dialog._page_to_save()
+    assert word == "film"
+
+
+# -- the settings and the log --------------------------------------------------
+
+
+def test_how_far_a_walk_goes_is_set_before_calibrating_and_remembered(window):
+    asked = []
+    window.requestCalibration.connect(lambda step, aim, turn: asked.append(turn))
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    assert window.regions_turn_back.value() == 80, "four fifths, out of the box"
+    window.regions_turn_back.setValue(60)
+    window.calibrate_button.click()
+    assert asked == [60]
+    assert int(QSettings().value("regions/turn_back")) == 60
+    window._on_calibration_changed(True)
+    assert not window.regions_turn_back.isEnabled()
+    window._on_calibration_changed(False)
+    assert window.regions_turn_back.isEnabled()
+
+
+def test_the_turn_back_share_reaches_the_search(worker):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(4):
+        worker._grab()
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP, "worst", 65)
+    assert worker._calibration.turn_back == pytest.approx(0.65)
+    worker.cancel_calibration()
+
+
+def test_the_activity_log_keeps_what_was_said_with_the_time(tmp_path):
+    from scanny.ui.activity import ActivityLog
+
+    log = ActivityLog()
+    log.write_to(tmp_path / "activity.log")
+    log.add("Calibration started", "status")
+    log.add("attempt 1: the camera refused: busy")
+    log.add("Live view could not be started again", "error")
+    lines = log.lines
+    assert len(lines) == 3
+    assert lines[2].split("  ", 1)[1].startswith("!! Live view")
+    written = (tmp_path / "activity.log").read_text(encoding="utf-8").splitlines()
+    assert len(written) == 3 and "attempt 1" in written[1]
+
+
+def test_the_activity_window_follows_the_log_as_it_grows(window):
+    window._show_activity()
+    shown = window._activity_window
+    window.activity.add("Region 1 of 3: fine tuning it on its own")
+    assert "Region 1 of 3" in shown.text
+    # And what the worker says reaches it, when there is a worker.
+    from scanny.ui.worker import CameraWorker
+
+    worker = CameraWorker()
+    worker.log.connect(window.activity.add)
+    worker.log.emit("Compromise probe 4 (across): 1: 90%, 2: 71% -> 71%")
+    assert "Compromise probe 4" in shown.text

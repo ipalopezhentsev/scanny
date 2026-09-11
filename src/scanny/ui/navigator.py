@@ -41,10 +41,10 @@ _WHOLE = 1.01
 #: one per mouse move would queue up work the drag has already made obsolete.
 _MIN_INTERVAL = 0.1
 
-#: How big the rings marking the measured points are drawn here. Smaller than
-#: the ones on the picture: this is a thumbnail, and the ring is only being
-#: asked to say where in the frame the point is, not to be aimed at.
-_POINT_RADIUS = 6
+#: How big the number beside a focus region is drawn here, in pixels. The
+#: region's own rectangle is drawn to scale, which on a thumbnail can be a
+#: few pixels across -- the number is what says which one it is.
+_TAG = 11
 
 #: How tall the pane is. Fixed rather than derived from the frame's aspect,
 #: because a height that follows the width would make the sidebar's own layout
@@ -86,9 +86,9 @@ class NavigatorWidget(QWidget):
         self._pending: "tuple[float, float] | None" = None
         self._sent_at = 0.0
         self._placeholder = "Not connected"
-        # The places being measured, in fractions of the whole frame -- which
-        # is the coordinate this widget is already in.
-        self._points: "list[tuple[float, float, int, QColor]]" = []
+        # The focus regions, in fractions of the whole frame -- which is the
+        # coordinate this widget is already in.
+        self._regions: "list[tuple[tuple[float, ...], int, QColor]]" = []
 
     # -- content -----------------------------------------------------------
 
@@ -136,18 +136,18 @@ class NavigatorWidget(QWidget):
             else QPixmap.fromImage(self._orientation.apply(self._source))
         )
 
-    def set_points(self, points) -> None:
-        """Mark the places being measured: (x, y, number, colour) each.
+    def set_regions(self, regions) -> None:
+        """Mark the focus regions: ((x, y, w, h), number, colour) each.
 
         All of them, whatever the live view is showing, and that is the whole
-        reason they are here. Magnified onto one point the others are off
+        reason they are here. Magnified onto one region the others are off
         screen entirely, and this is the only place left that can say where
-        they went -- which matters most exactly then, since a scan magnified
-        onto each point in turn is the one that cannot show them together.
+        they went -- which matters most exactly then, since a calibration
+        magnified onto each region in turn is what cannot show them together.
         """
-        self._points = [
-            (float(x), float(y), int(number), QColor(colour))
-            for x, y, number, colour in points
+        self._regions = [
+            (tuple(float(v) for v in rect), int(number), QColor(colour))
+            for rect, number, colour in regions
         ]
         self.update()
 
@@ -196,13 +196,13 @@ class NavigatorWidget(QWidget):
         painter.setPen(QPen(_RECT, 2))
         painter.drawRect(box)
 
-        if self._points:
-            self._draw_points(painter)
+        if self._regions:
+            self._draw_regions(painter)
 
-    def _draw_points(self, painter: QPainter) -> None:
-        """The places being measured, numbered, over the whole frame.
+    def _draw_regions(self, painter: QPainter) -> None:
+        """The focus regions, numbered, over the whole frame.
 
-        Drawn after the dimming and over it, so that a point outside the
+        Drawn after the dimming and over it, so that a region outside the
         magnified view is still legible: being outside it is exactly what
         someone is looking here to find out.
         """
@@ -210,23 +210,30 @@ class NavigatorWidget(QWidget):
         font.setPointSizeF(max(7.0, font.pointSizeF() - 1))
         font.setBold(True)
         painter.setFont(font)
-        for x, y, number, colour in self._points:
-            ring = QRect(0, 0, _POINT_RADIUS * 2, _POINT_RADIUS * 2)
-            ring.moveCenter(self._at(x, y))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(0, 0, 0, 160), 3))
-            painter.drawEllipse(ring)
-            painter.setPen(QPen(colour, 1))
-            painter.drawEllipse(ring)
-            painter.setPen(colour)
-            painter.drawText(ring, Qt.AlignmentFlag.AlignCenter, str(number))
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        for rect, number, colour in self._regions:
+            x, y, w, h = self._orientation.rect_to_view(rect)
+            box = QRectF(
+                self._target.x() + x * self._target.width(),
+                self._target.y() + y * self._target.height(),
+                max(w * self._target.width(), 3.0),
+                max(h * self._target.height(), 3.0),
+            )
+            painter.setPen(QPen(QColor(0, 0, 0, 160), 3))
+            painter.drawRect(box)
+            painter.setPen(QPen(colour, 1))
+            painter.drawRect(box)
+            # Beside the rectangle rather than in it, which on a thumbnail may
+            # be too small to hold a number.
+            label = QRectF(box.right() + 1, box.top() - _TAG / 2, _TAG, _TAG)
+            painter.setPen(colour)
+            painter.drawText(label, Qt.AlignmentFlag.AlignCenter, str(number))
 
     def _at(self, x: float, y: float) -> QPoint:
         """A place in the frame as a pixel on the widget.
 
-        Through the arrangement, like every other overlay: the points arrive in
-        the frame's coordinates and the map under them is drawn turned.
+        Through the arrangement, like every other overlay: they arrive in the
+        frame's coordinates and the map under them is drawn turned.
         """
         vx, vy = self._orientation.to_view(x, y)
         return QPoint(

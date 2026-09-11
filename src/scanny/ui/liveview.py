@@ -17,20 +17,16 @@ _AF_FOCUSED = QColor(80, 220, 120)
 _AF_BUSY = QColor(250, 190, 70)
 _SELECTION = QColor(120, 190, 255)
 _MEASURE = QColor(255, 120, 200)
-#: A placed point that has not been measured yet. The measured ones are drawn
-#: in the depth ramp's colours instead, so near and far read the same way they
-#: do on the map -- and both ends of that ramp are dark, which is why the
-#: number on a point picks its ink from what it is sitting on rather than
-#: having one.
-_POINT = QColor(235, 235, 235)
-_POINT_DARK_INK = QColor(20, 20, 24)
-_POINT_LIGHT_INK = QColor(250, 250, 252)
+#: A focus region being drawn. Its own colour, like the other two drags, so
+#: that which of the three a drag is going to be is plain before it is let go.
+_REGION_DRAG = QColor(255, 200, 80)
+#: The number on a region picks its ink from the colour it is drawn in, since
+#: the colours run from pale to dark and one ink is unreadable on half of them.
+_DARK_INK = QColor(20, 20, 24)
+_LIGHT_INK = QColor(250, 250, 252)
 
-#: How big a placed point is drawn, and how near the pointer has to be for
-#: its tooltip -- in fractions of the displayed picture, so a click lands
-#: the same way whatever size the window is.
-_POINT_RADIUS = 11
-_POINT_REACH = 0.05
+#: How big the number tag on a region is, in pixels on screen.
+_TAG = 16
 
 
 class LiveViewWidget(QWidget):
@@ -83,12 +79,19 @@ class LiveViewWidget(QWidget):
     zoomReset = Signal()
     #: Arrow keys: pan by (dx, dy) steps of -1, 0 or +1, across the frame.
     panStepped = Signal(int, int)
-    #: Ctrl-click: put a point to be measured here, or take away the one
-    #: already here. Ctrl because every other button and modifier on the
-    #: image is spoken for, and because it is the one gesture that has to be
-    #: impossible to make by accident: a stray click that moved a point
-    #: would silently invalidate a measurement that took a minute to make.
-    pointPlaced = Signal(float, float)
+    #: A rectangle dragged with ctrl held: a focus region, to be kept in focus
+    #: along with the others. In fractions of the **whole frame**, like the
+    #: measured area, because a region is a place on the subject and has to
+    #: stay on it while a calibration magnifies onto every region in turn.
+    #:
+    #: Ctrl because every other button and modifier on the image is spoken
+    #: for, and because it is a gesture that has to be impossible to make by
+    #: accident: a stray drag that moved a region would silently throw away a
+    #: calibration that took minutes to make.
+    regionDrawn = Signal(float, float, float, float)
+    #: A ctrl-click without a drag, at (nx, ny) in fractions of the displayed
+    #: picture: take away the region under it, if there is one.
+    regionClicked = Signal(float, float)
     #: Manual focus, as the name of an increment and a direction of -1 for
     #: nearer or +1 for further. The widget deliberately does not know how many
     #: steps an increment is: that is the user's setting, resolved by the
@@ -120,11 +123,15 @@ class LiveViewWidget(QWidget):
         self._target = QRect()
         self._drag_origin: "QPoint | None" = None
         self._drag_current: "QPoint | None" = None
-        self._drag_measures = False
+        # What the drag in progress will be when it is let go: a magnification,
+        # a measured area, or a focus region. Decided by the modifier held at
+        # the press, so letting go of it midway changes nothing.
+        self._drag_kind = "zoom"
         self._measure_area: "tuple[float, float, float, float] | None" = None
-        # The places someone asked about, each with the colour to draw it in
-        # and the line to show when the pointer is over it.
-        self._points: "list[tuple[float, float, int, QColor, str]]" = []
+        # The focus regions on this picture: each a rectangle in fractions of
+        # it, its number, the colour to draw it in, the line to show when the
+        # pointer is over it, and whether it is the one being worked on.
+        self._regions: "list[tuple[tuple[float, ...], int, QColor, str, bool]]" = []
         self._focus_state = "idle"
         self._placeholder = "Not connected"
 
@@ -198,19 +205,25 @@ class LiveViewWidget(QWidget):
     def measure_area(self) -> "tuple[float, float, float, float] | None":
         return self._measure_area
 
-    def set_points(self, points) -> None:
-        """Show the places being measured: (x, y, number, colour, tooltip) each.
+    def set_regions(self, regions) -> None:
+        """Show the focus regions: (rect, number, colour, tooltip, active) each.
 
-        In fractions of the picture on screen, worked out afresh for every
-        frame by whoever holds the points, because the points themselves live
-        on the sensor and the picture on screen is a crop of it that moves.
-        The number comes with them for the same reason: at magnification only
-        some of them are on screen, and the one that is has to keep the number
-        the readout calls it by rather than being renumbered from one.
+        The rectangle is in fractions of the picture on screen, worked out
+        afresh for every frame by whoever holds the regions, because the
+        regions themselves live on the sensor and the picture on screen is a
+        crop of it that moves. The number comes with them for the same reason:
+        magnified, only one of them is on screen, and it has to keep the
+        number the report calls it by rather than being renumbered from one.
         """
-        self._points = [
-            (float(x), float(y), int(number), QColor(colour), str(text))
-            for x, y, number, colour, text in points
+        self._regions = [
+            (
+                tuple(float(v) for v in rect),
+                int(number),
+                QColor(colour),
+                str(text),
+                bool(active),
+            )
+            for rect, number, colour, text, active in regions
         ]
         self.update()
 
@@ -244,42 +257,41 @@ class LiveViewWidget(QWidget):
         if self._frame is not None:
             self._draw_focus_box(painter)
             self._draw_measure_area(painter)
-        if self._points:
-            self._draw_points(painter)
+        if self._regions:
+            self._draw_regions(painter)
         if self._drag_origin is not None and self._drag_current is not None:
-            colour = _MEASURE if self._drag_measures else _SELECTION
+            colour = {"measure": _MEASURE, "region": _REGION_DRAG}.get(
+                self._drag_kind, _SELECTION
+            )
             painter.setPen(QPen(colour, 1, Qt.PenStyle.DashLine))
             painter.setBrush(QColor(colour.red(), colour.green(), colour.blue(), 40))
             painter.drawRect(QRect(self._drag_origin, self._drag_current).normalized())
 
-    def _draw_points(self, painter: QPainter) -> None:
-        """The places being measured, numbered, in the colour they came back.
+    def _draw_regions(self, painter: QPainter) -> None:
+        """The focus regions, numbered, in the colour the report left them.
 
-        Numbered because the numbers are what the readout and the tooltips
-        refer to, and a ring rather than a filled blob because whatever is
-        under a point is the thing being measured and covering it up would
-        hide exactly what someone needs to see to judge the answer.
+        An outline rather than a filled box because whatever is inside a
+        region is the thing being judged, and covering it would hide exactly
+        what someone needs to see. The number sits on a tag at the region's
+        top left corner on screen -- whichever corner of the frame that is
+        once the picture has been turned -- so it covers as little as it can.
         """
         font = QFont(painter.font())
         font.setPointSizeF(max(8.0, font.pointSizeF()))
         font.setBold(True)
         painter.setFont(font)
-        for x, y, number, colour, _text in self._points:
-            centre = self._at(x, y)
-            box = QRect(0, 0, _POINT_RADIUS * 2, _POINT_RADIUS * 2)
-            box.moveCenter(centre)
-            painter.setPen(QPen(QColor(0, 0, 0, 150), 3))
+        for rect, number, colour, _text, active in self._regions:
+            box = self._box(rect)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(box)
-            painter.setPen(QPen(colour, 2))
-            painter.drawEllipse(box)
-            # The number sits on a disc of its own colour so it stays legible
-            # over whatever the picture happens to be.
-            tag = QRect(0, 0, _POINT_RADIUS + 4, _POINT_RADIUS + 4)
-            tag.moveCenter(centre)
+            painter.setPen(QPen(QColor(0, 0, 0, 150), 4 if active else 3))
+            painter.drawRect(box)
+            style = Qt.PenStyle.DashLine if active else Qt.PenStyle.SolidLine
+            painter.setPen(QPen(colour, 3 if active else 2, style))
+            painter.drawRect(box)
+            tag = QRectF(box.left(), box.top(), _TAG, _TAG)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(colour)
-            painter.drawEllipse(tag)
+            painter.drawRect(tag)
             painter.setPen(_ink_for(colour))
             painter.drawText(tag, Qt.AlignmentFlag.AlignCenter, str(number))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -287,11 +299,11 @@ class LiveViewWidget(QWidget):
     # -- tooltips ----------------------------------------------------------
 
     def event(self, happening) -> bool:  # noqa: N802 - Qt naming
-        """Answer a tooltip request with whatever the point under it says.
+        """Answer a tooltip request with whatever the region under it says.
 
-        Per-point rather than one tooltip for the widget, which is why this
+        Per-region rather than one tooltip for the widget, which is why this
         is done by hand: the widget is the picture, and what someone wants
-        to read is what *that* point came back with.
+        to read is what *that* region came back with.
         """
         if happening.type() == QEvent.Type.ToolTip:
             said = self._said_at(happening.pos())
@@ -304,16 +316,17 @@ class LiveViewWidget(QWidget):
         return super().event(happening)
 
     def _said_at(self, position: QPoint) -> str:
-        """What the nearest point to *position* says, if one is near enough."""
+        """What the region under *position* says, the smallest if they overlap."""
         spot = self._normalise(position)
         if spot is None:
             return ""
-        nearest, best = "", _POINT_REACH * _POINT_REACH
-        for x, y, _number, _colour, text in self._points:
-            gap = (x - spot[0]) ** 2 + (y - spot[1]) ** 2
-            if gap <= best:
-                nearest, best = text, gap
-        return nearest
+        under = [
+            (rect[2] * rect[3], text)
+            for rect, _number, _colour, text, _active in self._regions
+            if rect[0] <= spot[0] <= rect[0] + rect[2]
+            and rect[1] <= spot[1] <= rect[1] + rect[3]
+        ]
+        return min(under)[1] if under else ""
 
     def _at(self, x: float, y: float) -> QPoint:
         """A place in the frame as a pixel on the widget."""
@@ -393,8 +406,8 @@ class LiveViewWidget(QWidget):
 
         In the *frame's* coordinates and not the screen's, so that everything
         this widget emits means the same thing however the picture is being
-        shown -- and so that the tooltip reach and the point-removal reach are
-        still measured in the space the points are kept in.
+        shown -- and so that the regions are hit-tested in the space they are
+        drawn from.
         """
         if self._target.isEmpty() or not self._target.contains(point):
             return None
@@ -407,20 +420,17 @@ class LiveViewWidget(QWidget):
         if self._pixmap is None:
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                # Handled on the press and not the release, and it opens no
-                # drag: a ctrl-click is never the start of a rectangle.
-                spot = self._normalise(event.position().toPoint())
-                if spot is not None:
-                    self.pointPlaced.emit(*spot)
-                return
             self._drag_origin = event.position().toPoint()
             self._drag_current = self._drag_origin
-            # Held at the moment of the press, so letting go of shift midway
-            # through cannot turn a measurement into a magnification.
-            self._drag_measures = bool(
-                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-            )
+            # Held at the moment of the press, so letting go of a modifier
+            # midway through cannot turn one kind of rectangle into another.
+            modifiers = event.modifiers()
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                self._drag_kind = "region"
+            elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+                self._drag_kind = "measure"
+            else:
+                self._drag_kind = "zoom"
         elif event.button() == Qt.MouseButton.RightButton:
             self.zoomToggled.emit()
 
@@ -436,17 +446,21 @@ class LiveViewWidget(QWidget):
             return
         origin, self._drag_origin = self._drag_origin, None
         current, self._drag_current = event.position().toPoint(), None
-        measuring, self._drag_measures = self._drag_measures, False
+        kind, self._drag_kind = self._drag_kind, "zoom"
         self.update()
 
         rect = QRect(origin, current).normalized()
-        # A drag has to be deliberate before it counts as a region rather than
-        # a click; a few pixels of travel while pressing is still a click.
+        # A drag has to be deliberate before it counts as a rectangle rather
+        # than a click; a few pixels of travel while pressing is still a click.
         if rect.width() < 12 or rect.height() < 12:
-            # A shift-click is a slip of the hand, not a request to move the
-            # focus point somewhere the user was trying to draw a box.
-            spot = None if measuring else self._normalise(current)
-            if spot is not None:
+            spot = self._normalise(current)
+            if spot is None:
+                return
+            if kind == "region":
+                self.regionClicked.emit(*spot)
+            elif kind == "zoom":
+                # A shift-click is a slip of the hand, not a request to move
+                # the focus point somewhere the user was trying to draw a box.
                 self.pointSelected.emit(*spot)
             return
         top_left = self._normalise(rect.topLeft())
@@ -456,20 +470,23 @@ class LiveViewWidget(QWidget):
         # Both corners come back in the displayed picture's coordinates, where
         # a turn or a mirror may have swapped which of them is the top left
         # one, so the rectangle is rebuilt from the two rather than subtracted.
-        if not measuring:
+        if kind == "zoom":
             self.regionSelected.emit(*_rect_between(top_left, bottom_right))
             return
-        # The measured area is a place on the sensor, so the two corners go
-        # out through the crop this frame was sent with. Without a frame there
-        # is no crop to go through and nothing that could be said.
+        # A measured area and a focus region are both places on the sensor,
+        # so the two corners go out through the crop this frame was sent
+        # with. Without a frame there is no crop to go through and nothing
+        # that could be said.
         if self._frame is None:
             return
-        self.measureAreaSelected.emit(
-            *_rect_between(
-                self._frame.to_frame_fraction(*top_left),
-                self._frame.to_frame_fraction(*bottom_right),
-            )
+        on_the_sensor = _rect_between(
+            self._frame.to_frame_fraction(*top_left),
+            self._frame.to_frame_fraction(*bottom_right),
         )
+        if kind == "region":
+            self.regionDrawn.emit(*on_the_sensor)
+        else:
+            self.measureAreaSelected.emit(*on_the_sensor)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self._frame is not None:
@@ -541,13 +558,8 @@ def _rect_between(
 
 
 def _ink_for(colour: QColor) -> QColor:
-    """Dark or light, whichever the number will be readable on.
-
-    The depth ramp is dark at both ends -- deep violet at the near one, deep
-    red at the far -- so a single ink colour makes the first and last points
-    unreadable, which are exactly the two the answer is about.
-    """
+    """Dark or light, whichever the number will be readable on."""
     brightness = (
         0.299 * colour.red() + 0.587 * colour.green() + 0.114 * colour.blue()
     )
-    return _POINT_DARK_INK if brightness > 140 else _POINT_LIGHT_INK
+    return _DARK_INK if brightness > 140 else _LIGHT_INK

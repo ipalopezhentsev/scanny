@@ -526,6 +526,18 @@ class NikonCamera:
             self._live_view = False
             self.session.try_execute(Op.NIKON_END_LIVE_VIEW)
 
+    def restart_live_view(self, timeout: float = 8.0) -> None:
+        """Start live view again after the body has ended it by itself.
+
+        The body turns live view off after its own monitor-off delay for it
+        -- custom setting c4 on a D750, ten minutes out of the box -- and says
+        nothing: frames simply stop coming. Ending it here as well first
+        leaves the body in the state a start expects, whatever state it had
+        got itself into.
+        """
+        self.stop_live_view()
+        self.start_live_view(timeout)
+
     def live_view_frame(self) -> LiveViewFrame:
         """Grab the current live-view frame."""
         data, _ = self.session.read(Op.NIKON_GET_LIVE_VIEW_IMAGE)

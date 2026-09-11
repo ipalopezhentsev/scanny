@@ -462,6 +462,10 @@ class _Lens:
     def stop_live_view(self) -> None:
         pass
 
+    def restart_live_view(self) -> None:
+        # What a refused drive tries first, in case live view went off.
+        pass
+
     def set_setting(self, name, value) -> None:
         pass
 

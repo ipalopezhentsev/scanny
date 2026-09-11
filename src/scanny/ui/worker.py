@@ -32,8 +32,8 @@ from .depth import (
 from .hunt import FineTune
 from .integration import FrameIntegrator
 from .naming import NameSequence, unique
-from .points import Point, PointSurvey, area_for, ordering
 from .pixels import green
+from .regions import OBJECTIVES, Calibration, Look, Region, View, cut_out
 from .sharpness import SharpnessMeter, grain_reading, measure, variance_between
 
 __all__ = ["CameraWorker"]
@@ -67,6 +67,27 @@ _FRAME_INTERVAL_MS = 15
 
 #: Consecutive grab failures tolerated before concluding live view has ended.
 _MAX_GRAB_ERRORS = 15
+
+#: How many times live view may be started again by itself within how many
+#: seconds, when the body ends it. The body does end it: a D750 turns live
+#: view off after its own monitor-off delay for live view -- custom setting
+#: c4, ten minutes out of the box -- whoever is driving it, and a calibration
+#: or a depth map can take longer than that. Starting it again is harmless
+#: and puts back everything the readings depend on; but a body that ends it
+#: again straight away is refusing for some other reason, and saying so beats
+#: fighting it.
+_MOST_RESTARTS = 3
+_RESTART_WINDOW = 120.0
+
+#: How long to wait before each attempt at starting live view again. A body
+#: that has just turned it off can refuse to turn it straight back on while
+#: it is still putting the mirror down, so the first attempt is immediate and
+#: the rest are patient.
+_RESTART_WAITS = (0.0, 1.0, 2.0, 4.0)
+
+#: How long to keep trying to put the zoom and the focus point back after a
+#: restart. The body answers the first commands after one with busy.
+_VIEW_BACK_PATIENCE = 4.0
 
 #: How the settling after a focus move is judged. `MfDrive` has returned by
 #: the time the call does, but live view is a frame or two behind the lens and
@@ -201,23 +222,22 @@ _MEASURED_MAGNIFICATION = {
 }
 
 #: How many redrawn frames to wait for after panning the magnified view to the
-#: next point. The camera pans by moving its focus point, and live view is a
+#: next region. The camera pans by moving its focus point, and live view is a
 #: few frames behind that as it is behind everything else; a reading taken off
-#: a frame that still shows the last point is a reading of the wrong subject,
+#: a frame that still shows the last region is a reading of the wrong subject,
 #: which is worse than no reading at all because it looks like one.
 #:
 #: The same four frames the stop-finder waits for, and it costs the same:
 #: magnified, the body draws sixteen a second, so a pan is a quarter of a
-#: second and a stop with five points on it is a second and a quarter.
+#: second.
 _AIM_FRESH = 4
 
-#: How much more of the bracket a pass may take than it was asked for, when it
-#: reaches its last stop with a point still getting sharper. Extending forward
-#: is free of the play in the gearing -- the lens is already driving that way
-#: -- so the only reason to bound it is that a point which never peaks is a
-#: point that is not going to, and marching to the end of the travel to prove
-#: it wastes a minute.
-_MOST_EXTRA = 1.0
+#: How long to wait for a region's view to come back and fill a stack before
+#: giving up on it: a fixed allowance for the body to answer, and so much a
+#: frame on top. Generous, because the body draws sixteen a second magnified
+#: and a change of zoom level can take it a moment longer than a pan.
+_VIEW_PATIENCE = 2.0
+_FRAME_TIME = 0.1
 
 
 class CameraWorker(QObject):
@@ -249,14 +269,24 @@ class CameraWorker(QObject):
     #: the travel it decided to cover, in what step, and how far through it
     #: is. The status bar carries this too, but the status bar is where every
     #: other message lands as well, so the numbers that say whether the sweep
-    #: was pointed at the right place scroll away as it runs. Shared by both
-    #: the things a sweep can be filling in.
+    #: was pointed at the right place scroll away as it runs.
     sweeping = Signal(str)
-    #: Whether a scan of the placed points is running, and what it made of
-    #: them: a list of :class:`scanny.ui.points.Found`, or None for nothing
-    #: measured yet. Emitted after every stop as well as at the end.
-    pointScanChanged = Signal(bool)
-    pointsFound = Signal(object)  # list[Found] | None
+    #: Whether a calibration of the focus regions is running, and what it made
+    #: of them: a :class:`scanny.ui.regions.CalibrationReport`, or None when
+    #: there is nothing to report -- the regions changed, or one has begun.
+    calibrationChanged = Signal(bool)
+    calibrationReady = Signal(object)  # CalibrationReport | None
+    #: Which region is being fine tuned (-1 for none, or for all of them at
+    #: once), and a line saying how far the calibration has got.
+    calibrationProgress = Signal(int, str)
+    #: One probe of the compromise, for the chart of every region: which
+    #: regions by number, what the search was doing, each one's share of its
+    #: best, and the number made of them.
+    calibrationProbe = Signal(object, str, object, float)
+    #: A line for the activity log: what is going on in more detail than the
+    #: status bar holds, and everything that went wrong, with the camera's
+    #: own words for it. See scanny.ui.activity.
+    log = Signal(str)
     exposurePreviewChanged = Signal(bool)
     #: Whether shots are being written to the camera's card. Reported back
     #: rather than assumed: a body that refuses the choice keeps using it.
@@ -277,6 +307,8 @@ class CameraWorker(QObject):
         self._camera: "NikonCamera | None" = None
         self._timer: "QTimer | None" = None
         self._grab_errors = 0
+        # When live view was last started again after the body ended it.
+        self._restarts: "deque[float]" = deque()
         self._zoom_level = 0
         self._com_ready = False
         self._last_frame: "LiveViewFrame | None" = None
@@ -323,24 +355,16 @@ class CameraWorker(QObject):
         self._sweep_travel = 0
         self._sweep_last_step = 0
         self._sweep_span = (0, 0)
-        # Which of the two things a sweep can be filling in is running:
-        # "depth" for the whole-frame grid, "points" for the few places
-        # someone put on the picture, and empty for neither. Everything
-        # about driving the lens is the same for both; all that differs is
-        # what each settled picture is read into and what comes out at the
-        # end, so they share one controller and branch twice.
-        self._scan = ""
-        self._points: "list[Point]" = []
-        self._point_box = 0.12
-        self._point_survey: "PointSurvey | None" = None
-        # Whether the running point scan is the magnified kind: bracketed
-        # around where autofocus landed, with the camera panned from point to
-        # point at every stop because at that magnification no two of them are
-        # on screen together. What it has to put back when it is done, and how
-        # many extra stops it has already allowed itself.
-        self._points_apart = False
-        self._points_restore: "tuple[int, int, int] | None" = None
-        self._points_extra = 0
+        # The rectangles someone drew to be kept in focus together, and the
+        # calibration finding the one focus position that serves them all.
+        self._regions: "list[Region]" = []
+        self._calibration: "Calibration | None" = None
+        # The user's own sharpness meter, put aside while a calibration runs
+        # one of its own over each region in turn, and handed back after.
+        self._calibration_meter: "SharpnessMeter | None" = None
+        # The zoom level and focus point to put back when a calibration ends,
+        # since it pans and magnifies the view all over the frame.
+        self._view_restore: "tuple[int, int, int] | None" = None
         # Whether the body reported a stop rather than the picture having to
         # say so, and how much two frames of a still picture differ, which is
         # what the stop-finder judges a chunk of travel against.
@@ -447,6 +471,7 @@ class CameraWorker(QObject):
 
     @Slot()
     def disconnect_camera(self) -> None:
+        self._cancel_hunt("")
         self._stop_timer()
         if self._camera is not None:
             try:
@@ -516,6 +541,11 @@ class CameraWorker(QObject):
         camera = self._camera
         if camera is None or not camera.live_view_active:
             return
+        if self._calibration is not None and self._calibration.phase == "compromise":
+            # That part of a calibration reads its own frames, one region's
+            # view at a time; see _advance_compromise.
+            self._advance_compromise(camera)
+            return
         try:
             frame = camera.live_view_frame()
         except (CameraError, MtpError, WpdCommandError):
@@ -524,6 +554,10 @@ class CameraWorker(QObject):
             # of them means live view really has ended, because someone pressed
             # a button on the body or the mirror dropped.
             if self._grab_errors >= _MAX_GRAB_ERRORS:
+                if self._recover_live_view(
+                    camera, f"{_MAX_GRAB_ERRORS} live-view frames failed in a row"
+                ):
+                    return
                 self._stop_timer()
                 self._cancel_hunt("")
                 camera.stop_live_view()
@@ -584,9 +618,120 @@ class CameraWorker(QObject):
                 reading = self._note_sharpness(frame, image)
         self.frameReady.emit(frame, image if image is not None else QImage())
         if self._hunt is not None:
-            self._advance_hunt(frame, reading)
+            self._advance_hunt(frame, reading, image)
         elif self._sweep is not None:
             self._advance_sweep(frame, image)
+
+    def _recover_live_view(self, camera: NikonCamera, why: object = None) -> bool:
+        """Start live view again after the body ended it, and put the view back.
+
+        What the body ends is live view, not anything that depends on the
+        lens: focus stays where it was, so a fine tune, a depth sweep or a
+        calibration running across the gap can carry on across it -- once the
+        view is what it was, the zoom level and the focus point that the
+        magnified crop is centred on, and once the picture has been let settle
+        again, so that no reading is taken off frames from before the gap.
+
+        *why* is what gave it away, for the log. Frames stopping is one sign;
+        the body refusing to move the focus point or drive focus, "not in live
+        view", is another, and the one a calibration between two probes meets
+        first -- missing that one is what used to end calibrations at the
+        body's ten minutes.
+
+        The restart is tried more than once, with a wait between, because a
+        body that has only just turned live view off can refuse to turn it
+        back on while the mirror is still coming down. False when it will not
+        come back, or has been brought back too often lately to be believed:
+        then whatever was running stops, and says why.
+        """
+        now = time.monotonic()
+        while self._restarts and now - self._restarts[0] > _RESTART_WINDOW:
+            self._restarts.popleft()
+        if len(self._restarts) >= _MOST_RESTARTS:
+            self._log(
+                f"Live view went off again ({why}), the {_MOST_RESTARTS + 1}th time "
+                f"in {_RESTART_WINDOW:.0f} s: not starting it again"
+            )
+            return False
+        self._restarts.append(now)
+        self._log(f"Live view seems to have gone off ({why}); starting it again")
+        frame = self._last_frame
+        level = self._zoom_level
+        trouble: "Exception | None" = None
+        for attempt, wait in enumerate(_RESTART_WAITS, start=1):
+            if wait:
+                time.sleep(wait)
+            try:
+                camera.restart_live_view()
+            except (CameraError, MtpError, WpdCommandError) as exc:
+                trouble = exc
+                self._log(f"  attempt {attempt}: the camera refused: {exc}")
+                continue
+            trouble = None
+            self._log(f"  attempt {attempt}: live view is back")
+            break
+        if trouble is not None:
+            self.failed.emit(f"Live view went off and could not be started again: {trouble}")
+            return False
+        if not self._put_view_back(camera, frame, level):
+            self._log("  the view could not be put back exactly; carrying on")
+        self._grab_errors = 0
+        self._last_digest = None
+        self._integrator.reset()
+        if self._hunt is not None or self._sweep is not None:
+            self._settle()
+        self.status.emit(
+            "The camera turned live view off by itself -- its own monitor-off "
+            "delay for live view, custom setting c4 on a D750 -- so it was "
+            "started again and the view put back"
+        )
+        return True
+
+    def _put_view_back(
+        self, camera: NikonCamera, frame: "LiveViewFrame | None", level: int
+    ) -> bool:
+        """The focus point and the zoom level as they were, busy or not."""
+        deadline = time.monotonic() + _VIEW_BACK_PATIENCE
+        while True:
+            try:
+                if frame is not None:
+                    # The point first: the body centres a magnified view on it.
+                    camera.set_af_area(frame.af_x, frame.af_y)
+                if level:
+                    camera.set_zoom_level(level)
+                return True
+            except (CameraError, MtpError, WpdCommandError) as exc:
+                if time.monotonic() >= deadline:
+                    self._log(f"  putting the view back failed: {exc}")
+                    try:
+                        self._zoom_level = camera.zoom_level()
+                    except (CameraError, MtpError, WpdCommandError):
+                        pass
+                    self.zoomChanged.emit(self._zoom_level)
+                    return False
+                time.sleep(0.2)
+
+    def _drive_through(self, camera: NikonCamera, steps: int) -> bool:
+        """Drive focus, starting live view again first if it has gone off.
+
+        False, having said why, when it cannot be done either way.
+        """
+        try:
+            camera.drive_focus(steps)
+            return True
+        except (CameraError, MtpError, WpdCommandError) as exc:
+            if not self._recover_live_view(camera, exc):
+                self.failed.emit(f"Focus could not be driven: {exc}")
+                return False
+        try:
+            camera.drive_focus(steps)
+            return True
+        except (CameraError, MtpError, WpdCommandError) as exc:
+            self.failed.emit(f"Focus could not be driven: {exc}")
+            return False
+
+    def _log(self, text: str) -> None:
+        self.log.emit(text)
 
     def _note_noise(self) -> None:
         """Measure the grain from the frame just decoded and the one before it.
@@ -967,6 +1112,15 @@ class CameraWorker(QObject):
     @Slot(bool)
     def set_sharpness(self, enabled: bool) -> None:
         """Measure the contrast in each displayed picture, or stop measuring."""
+        if self._calibration_meter is not None:
+            # A calibration has its own meter in place; this is about the one
+            # it put aside, and only a real change to that one stops it.
+            if bool(enabled) == self._calibration_meter.enabled:
+                return
+            self._end_calibration(
+                "Calibration stopped - sharpness measuring was switched",
+                stopped=True,
+            )
         if not self._sharpness.configure(enabled):
             return
         self._cancel_hunt("")
@@ -989,6 +1143,13 @@ class CameraWorker(QObject):
         pans instead of jumping to whatever the same fractions of the new crop
         happen to cover. See :meth:`scanny.ui.sharpness.SharpnessMeter.set_area`.
         """
+        if self._calibration_meter is not None:
+            wanted = tuple(float(v) for v in area) if area is not None else None
+            if wanted == self._calibration_meter.area:
+                return
+            self._end_calibration(
+                "Calibration stopped - the measured area moved", stopped=True
+            )
         if not self._sharpness.set_area(area):
             return
         self._cancel_hunt("Focus hunt stopped - the measured area moved")
@@ -1022,6 +1183,12 @@ class CameraWorker(QObject):
     @Slot(int)
     def fine_tune(self, step: int) -> None:
         """Autofocus over the measured area, then better it one increment at a time."""
+        # A calibration runs fine tunes of its own, and between them walks the
+        # lens itself; one started by hand in the middle of that takes the
+        # focus from it, like anything else that touches the focus does.
+        self._end_calibration(
+            "Calibration stopped - fine tuning took over", stopped=True
+        )
         step = abs(int(step)) or 1
         self._start_hunt(
             FineTune(step),
@@ -1083,15 +1250,18 @@ class CameraWorker(QObject):
         # A level's magnification is the same in both axes, so the area fits
         # whole while the magnification is no more than one over its long side.
         level = self._level_for_magnification(1.0 / max(w, h, 1e-6))
-        if level == self._zoom_level:
+        if level == self._zoom_level and _inside(area, frame.crop_normalised):
             return None
         before = self._frame_reading(frame)
         try:
             # The body centres its magnified view on the focus point, so the
             # point goes first: it is what decides where the magnified view
-            # lands.
+            # lands. It goes even when the level is already right, because
+            # the view may be magnified onto somewhere else -- which is what
+            # a calibration moving on to its next region finds.
             camera.set_af_area(*frame.to_af_coords_in_frame(x + w / 2, y + h / 2))
-            camera.set_zoom_level(level)
+            if level != self._zoom_level:
+                camera.set_zoom_level(level)
         except CameraError as exc:
             # Worth saying, not worth stopping for: the search still works at
             # whatever magnification the view is already at.
@@ -1113,8 +1283,14 @@ class CameraWorker(QObject):
         magnified, the exposure altered, focus taken by hand -- and each of
         those invalidates a sweep for exactly the reason it invalidates a
         hunt: the readings after it are not comparable with the ones before.
+        A calibration goes too, for the same reason and one more: its peaks
+        are only worth anything while the lens is walked from where they
+        left it.
         """
         self._cancel_sweep(why.replace("Focus hunt stopped", "Depth map stopped"))
+        self._end_calibration(
+            why.replace("Focus hunt stopped", "Calibration stopped"), stopped=True
+        )
         if self._hunt is None:
             return
         self._hunt = None
@@ -1138,7 +1314,10 @@ class CameraWorker(QObject):
         self._settle_moving = False
 
     def _advance_hunt(
-        self, frame: LiveViewFrame, reading: "float | None"
+        self,
+        frame: LiveViewFrame,
+        reading: "float | None",
+        image: "QImage | None" = None,
     ) -> None:
         """Give the hunt one settled reading, and carry out what it asks for.
 
@@ -1160,18 +1339,17 @@ class CameraWorker(QObject):
 
         move = hunt.step(reading)
         if move is None:
-            self._finish_hunt(hunt)
+            self._finish_hunt(hunt, frame, image)
             return
         if move.autofocus:
             self._autofocus_on_measured_area(camera, frame)
             return
         before = self._frame_reading(frame)
-        try:
-            camera.drive_focus(move.steps)
-        except CameraError as exc:
-            self._cancel_hunt("")
-            self.failed.emit(f"Focus hunt stopped: {exc}")
+        if not self._drive_through(camera, move.steps):
+            self._cancel_hunt("Focus hunt stopped: focus could not be driven")
             return
+        if self._calibration is not None:
+            self._calibration.drove(move.steps)
         self._settle(before)
         probes = hunt.probes
         # Which half of the walk it is in, because they take very different
@@ -1295,14 +1473,24 @@ class CameraWorker(QObject):
         # settling below waits for the move to come through the pipeline
         # rather than believing the frames that still show where focus was.
         before = self._frame_reading(frame)
+        if self._calibration is not None:
+            self._calibration.autofocused()
         try:
             self._aim_at_measured_area(camera)
             focused = camera.autofocus()
-        except CameraError as exc:
-            self.focusStateChanged.emit("idle")
-            self._cancel_hunt("")
-            self.failed.emit(str(exc))
-            return
+        except (CameraError, MtpError, WpdCommandError) as exc:
+            # Live view may have gone off under it; once it is back, the
+            # autofocus is simply asked for again.
+            try:
+                if not self._recover_live_view(camera, exc):
+                    raise
+                self._aim_at_measured_area(camera)
+                focused = camera.autofocus()
+            except (CameraError, MtpError, WpdCommandError) as again:
+                self.focusStateChanged.emit("idle")
+                self._cancel_hunt("")
+                self.failed.emit(f"Autofocus failed: {again}")
+                return
         self.focusStateChanged.emit("focused" if focused else "idle")
         self._settle(before)
 
@@ -1315,10 +1503,23 @@ class CameraWorker(QObject):
         x, y, w, h = area
         camera.set_af_area(*frame.to_af_coords_in_frame(x + w / 2, y + h / 2))
 
-    def _finish_hunt(self, hunt: FineTune) -> None:
+    def _finish_hunt(
+        self,
+        hunt: FineTune,
+        frame: "LiveViewFrame | None" = None,
+        image: "QImage | None" = None,
+    ) -> None:
+        """Say how the search ended, with the picture it ended on to hand.
+
+        The picture matters to a calibration, which keeps it as what the
+        region looked like at its best; see :meth:`_region_tuned`.
+        """
         self._hunt = None
         self._settling = False
         self.huntChanged.emit(False)
+        if self._calibration is not None and self._calibration.phase == "peaks":
+            self._region_tuned(hunt, frame, image)
+            return
         stopped_on = hunt.confirmed if hunt.confirmed is not None else hunt.best
         self.status.emit(
             {
@@ -1390,195 +1591,393 @@ class CameraWorker(QObject):
             if narrowed and self._survey is not None and len(self._survey)
             else None
         )
-        self._scan = "depth"
         self._survey = Survey(tiling_for(frame.width, frame.height))
         self.depthMapReady.emit(None)
         self.depthChanged.emit(True)
         self._sweep_over(camera, again)
 
-    @Slot(object, float)
-    def set_focus_points(self, points: object, box: float) -> None:
-        """Take the places on the sensor's frame that are to be measured.
+    # -- focus regions: one focus position for several places --------------
 
-        Fractions of the **whole frame**, not of what is on screen, so they
-        stay on the piece of the world someone pointed at when the camera
-        magnifies or pans underneath them -- see :class:`scanny.ui.points.Point`.
-        What was measured before is thrown away: a point that moved is a
-        different question.
+    @Slot(object)
+    def set_focus_regions(self, regions: object) -> None:
+        """Take the rectangles on the sensor's frame to be kept in focus together.
+
+        Fractions of the **whole frame**, not of what is on screen -- see
+        :class:`scanny.ui.regions.Region`. Whatever a calibration found is
+        thrown away: a region that moved, or one more region to serve, is a
+        different compromise.
         """
-        self._points = [Point(float(x), float(y)) for x, y in (points or [])]
-        self._point_box = float(box)
-        if self._scan == "points":
-            self._cancel_sweep("Point scan stopped - the points moved")
-        self._point_survey = None
-        self.pointsFound.emit(None)
+        self._regions = [
+            Region(*(float(part) for part in rect)) for rect in (regions or [])
+        ]
+        self._end_calibration(
+            "Calibration stopped - the regions changed", stopped=True
+        )
+        self.calibrationReady.emit(None)
 
-    @Slot(int, int, int, bool, bool, int)
-    def start_point_scan(
+    @Slot(int, str, int, bool)
+    def start_calibration(
         self,
-        samples: int,
-        passes: int,
-        minimum: int,
-        narrowed: bool = False,
-        magnified: bool = False,
-        around: int = 0,
+        step: int,
+        objective: str = "average",
+        turn_back: int = 80,
+        depths: bool = False,
     ) -> None:
-        """Sweep focus once and read every placed point off the same frames.
+        """Find each region's best, then the one focus that does best by all.
 
-        The same driving as the depth map, down to the parking and the
-        bracket, and for the same reasons -- see :mod:`scanny.ui.depth`. What
-        differs is only what each settled picture is read into: a handful of
-        boxes someone chose rather than a grid over the whole frame, which is
-        what makes the answers worth having. See :mod:`scanny.ui.points`.
+        *step* is the one increment every walk is made in, the fine tunes and
+        the compromise alike: the lens's minimum. *objective* is what "does
+        best by all" means -- one of :data:`scanny.ui.regions.OBJECTIVES`.
+        *turn_back* is the percentage of its best below which a walk of the
+        search turns round; see :data:`scanny.ui.regions.TURN_BACK`. With
+        *depths*, the walks also go far enough to place every region's peak,
+        for the depths and the film's shape -- which costs walking the
+        compromise itself does not need. See
+        :mod:`scanny.ui.regions` for the two phases, and why the second one
+        walks rather than drives.
         """
+        if objective not in OBJECTIVES:
+            self.failed.emit(f"There is no compromise called {objective!r}.")
+            return
         camera = self._require()
-        if camera is None:
+        if camera is None or self._calibration is not None:
             return
         if not camera.live_view_active:
-            self.failed.emit("Start live view before measuring points.")
+            self.failed.emit("Start live view before calibrating.")
             return
-        if len(self._points) < 2:
+        frame = self._last_frame
+        if frame is None:
+            self.failed.emit("Wait for a live-view frame before calibrating.")
+            return
+        if len(self._regions) < 2:
             self.failed.emit(
-                "Put at least two points on the picture first: ctrl-click "
-                "where you want them measured."
+                "Draw at least two regions first: ctrl-drag on the picture "
+                "round each place that has to be sharp."
             )
             return
         self._cancel_hunt("")
-        self._sweep_samples = max(4, int(samples))
-        self._sweep_passes = max(1, int(passes))
-        self._sweep_minimum = max(1, int(minimum))
-        self._sweep_pass = 0
-        if magnified:
-            self._start_points_apart(camera, max(1, int(around)))
-            return
-        again = (
-            self._point_survey.interesting(
-                self._sweep_last_step or self._sweep_minimum
-            )
-            if narrowed and self._point_survey is not None
-            and len(self._point_survey)
-            else None
+        self._calibration = Calibration(
+            self._regions,
+            step,
+            objective=objective,
+            turn_back=turn_back / 100.0,
+            depths=depths,
         )
-        self._scan = "points"
-        self._points_apart = False
-        self._point_survey = PointSurvey(self._points)
-        self.pointsFound.emit(None)
-        self.pointScanChanged.emit(True)
-        self._sweep_over(camera, again)
+        self._view_restore = (self._zoom_level, frame.af_x, frame.af_y)
+        # A meter of its own, pointed at each region in turn. The user's is
+        # put aside rather than repointed, so that nothing about it -- on or
+        # off, where its area is -- has to be remembered and put back.
+        self._calibration_meter = self._sharpness
+        self._sharpness = SharpnessMeter(enabled=True)
+        self.calibrationReady.emit(None)
+        self.calibrationChanged.emit(True)
+        self._log(
+            f"Calibration started: {len(self._regions)} regions, aiming for "
+            f"{OBJECTIVES[objective].lower()}, turning back below "
+            f"{self._calibration.turn_back:.0%}, in steps of {step}"
+            + (", measuring depths" if depths else "")
+        )
+        self._tune_region()
 
-    # -- the same question at full magnification ----------------------------
+    @Slot()
+    def cancel_calibration(self) -> None:
+        self._end_calibration("Calibration stopped", stopped=True)
 
-    def _start_points_apart(self, camera: NikonCamera, around: int) -> None:
-        """Measure the points magnified, one in view at a time.
+    def _tune_region(self) -> None:
+        """Fine tune the next region on its own, to find what it reads at best.
 
-        The whole-frame scan above reads every point off the same frame, and
-        on an unmagnified frame that is the best there is: one pass driving
-        one way puts every reading in one coordinate. What it cannot do is
-        *resolve* anything small. A step of focus moves the picture in
-        proportion to how much the view is magnified, so on a whole frame two
-        things a hundred steps apart move the reading less than the grain
-        does, and the honest answer -- which is the one the doubt gives -- is
-        that they cannot be told apart.
-
-        Magnifying fixes that and breaks something else: at 18.8x the screen
-        shows a hundredth of the frame, so two points worth comparing are
-        never on it together. What is kept, and what is given up:
-
-        **Kept: one sweep, one coordinate.** The camera is panned from point
-        to point at every stop and focus is not touched while it pans, so
-        every reading taken at a stop still belongs to that one position, on
-        one monotonic drive. Panning costs frames; it costs nothing in the
-        coordinate.
-
-        **Given up: the near stop as the datum.** This never parks. Parking
-        and then sweeping the whole travel at a step fine enough to be worth
-        magnifying for would be thousands of stops, so instead the camera's
-        own autofocus is pointed at the first point and the sweep is a
-        bracket around where that landed: back off *around* steps, then drive
-        forward through twice that. Backing off first is not a detail -- it is
-        what puts the play in the gearing behind the sweep instead of inside
-        it, so that every stop of the pass that follows is honest travel. The
-        positions that come out are counted from where the bracket began
-        rather than from the near stop, and the gaps between them -- which are
-        the answer -- are unaffected either way.
-
-        Points whose focus lies past the far end of the bracket say so, and
-        the pass keeps driving to reach them; see :meth:`_reach_further`. A
-        point past the *near* end cannot be reached that way, because reaching
-        back is a reversal, so that one is reported rather than chased.
+        Exactly the search the Fine tune button runs -- magnified onto the
+        region, autofocus aimed at it, a walk in the one increment -- with the
+        region as its measured area. What it ends on is picked up again in
+        :meth:`_region_tuned`.
         """
-        frame = self._current_frame()
-        if frame is None:
+        run = self._calibration
+        if run is None:
             return
-        self._scan = "points"
-        self._points_apart = True
-        self._points_extra = 0
-        self._sweep_passes = 1
-        self._point_survey = PointSurvey(self._points)
-        self.pointsFound.emit(None)
-        self.pointScanChanged.emit(True)
-        self._points_restore = (self._zoom_level, frame.af_x, frame.af_y)
-        # The grain is a property of the view, and the view is about to change
-        # out of all recognition: what a whole frame reads says nothing about
-        # what a hundredth of one does.
-        self._noise_seen.clear()
-        self._last_pixels = None
-        try:
-            self._magnify_fully(camera)
-            self._aim_at(camera, self._points[0])
-            self.status.emit(
-                "Autofocusing on point 1, to find the stretch of travel worth "
-                "sweeping..."
-            )
-            self.focusStateChanged.emit("busy")
-            locked = camera.autofocus()
-            self.focusStateChanged.emit("focused" if locked else "idle")
-            if not locked:
-                self._finish_scan(
-                    "Point scan stopped: autofocus could not find point 1, so "
-                    "there is nothing to bracket around. Put point 1 on "
-                    "something with an edge in it, or focus by hand and use "
-                    "the whole-frame scan."
-                )
-                return
-            # Behind where the sweep will start, so that the first stops of it
-            # are the optics moving rather than the gearing taking up its play.
-            camera.drive_focus(-around)
-        except CameraError as exc:
-            self._finish_scan(f"Point scan stopped: {exc}")
-            return
-        span = 2 * around
-        step = max(self._sweep_minimum, span // self._sweep_samples)
-        self._sweep_span = (0, span)
-        self._sweep = Sweep(0, step, self._sweep_samples)
-        self._settling = False
-        self._sweep_pixels = None
-        self._sweep_silent = 0
-        self._sweep_spoke = False
-        self.status.emit(
-            f"Sweeping {span} steps around where autofocus landed, in "
-            f"{self._sweep_samples} stops of {step}, panning to each of the "
-            f"{len(self._points)} points at every one of them"
+        region = run.regions[run.index]
+        number, total = run.index + 1, len(run.regions)
+        self._sharpness.set_area(region.rect)
+        self.calibrationProgress.emit(
+            run.index, f"Region {number} of {total}: fine tuning it on its own"
         )
-        self._say_sweeping(0)
+        self._log(f"Region {number} of {total}: fine tuning it on its own")
+        self._start_hunt(
+            FineTune(run.step),
+            f"Calibrating region {number} of {total}: magnified onto it, "
+            f"autofocus, then steps of {run.step}...",
+        )
+        if self._hunt is None:
+            self._end_calibration(
+                f"Calibration stopped: region {number} could not be fine tuned",
+                stopped=True,
+            )
 
-    def _magnify_fully(self, camera: NikonCamera) -> None:
-        """Go to the strongest magnification the body has."""
-        level = max(NikonCamera.ZOOM_LEVELS)
-        camera.set_zoom_level(level)
-        self._zoom_level = level
-        self.zoomChanged.emit(level)
+    def _region_tuned(
+        self,
+        hunt: FineTune,
+        frame: "LiveViewFrame | None",
+        image: "QImage | None",
+    ) -> None:
+        """Keep one region's best, then go on to the next region or the compromise.
+
+        The best is what the fine tune stood on at the end -- the reading it
+        confirmed, and the picture that reading came off -- not the highest
+        reading it passed on the way. That one is the luckiest of a noisy
+        walk; this one is where the lens actually is, and the picture of the
+        region there is what it looks like at its best.
+
+        The view goes with it: the zoom level, the focus point, and the crop
+        the body answered with. Every later reading of this region is taken
+        through that same crop, because a reading through another one is not
+        the same measurement.
+        """
+        run = self._calibration
+        if run is None:
+            return
+        reading = hunt.confirmed if hunt.confirmed is not None else hunt.best
+        region = run.regions[run.index]
+        if frame is None or image is None:
+            look, view = Look(0.0), None
+        else:
+            look = _look_at(region, frame, image, reading)
+            view = View.of(frame, self._zoom_level)
+        self._log(
+            f"Region {run.index + 1}: best reading {reading:.1f} ({hunt.outcome}) "
+            f"after {hunt.probes} probes, read at zoom level {self._zoom_level}"
+        )
+        if run.region_tuned(look, hunt.outcome, view, hunt.probes):
+            self._tune_region()
+            return
+        if not run.begin_compromise():
+            self._end_calibration()
+            return
+        self._log("Every region has its best; the search for the compromise begins")
+        self.calibrationProgress.emit(
+            -1, "Every region has its best: walking to the focus that serves all"
+        )
+        # A fresh trend line: what is plotted from here is the average.
+        self.sharpnessChanged.emit(0.0, 0.0)
+        self.status.emit(
+            "Calibrating: every region has its best, now walking to the one "
+            "focus position that does best by all of them..."
+        )
+
+    def _advance_compromise(self, camera: NikonCamera) -> None:
+        """One probe of the compromise: read every region here, then step.
+
+        One probe per call, and the call comes from the frame grab, so the
+        timer keeps running between probes and a Stop pressed halfway through
+        still lands. Inside a probe this blocks, because there is nothing else
+        to be doing: the camera has to be panned to each region and a stack
+        of its picture gathered before the next can be read.
+
+        Live view going off in the middle of it -- which the body does after
+        its own monitor-off delay, and which shows up here as the camera
+        refusing to move the focus point or drive focus -- is not the end of
+        the calibration. Live view is started again, and the probe is taken
+        again, whole: focus has not moved. A move the search had already asked
+        for when it went off is kept, and made first, so the search's idea of
+        where it is stays true.
+        """
+        run = self._calibration
+        if run is None or run.phase != "compromise":
+            return
+        try:
+            if run.pending:
+                camera.drive_focus(run.pending)
+                run.drove(run.pending)
+                run.pending = 0
+                run.moved = True
+            if run.moved:
+                self._hold_still(camera)
+            looks: "dict[int, Look]" = {}
+            for index in run.order():
+                look = self._read_region(camera, index)
+                if look is None:
+                    raise CameraError(
+                        f"no picture of region {index + 1} the way it was measured"
+                    )
+                looks[index] = look
+        except (CameraError, MtpError, WpdCommandError) as exc:
+            self._log(f"Compromise probe {run.probes + 1} interrupted: {exc}")
+            if self._recover_live_view(camera, exc):
+                return  # the probe is taken again, whole, next time round
+            self._end_calibration(f"Calibration stopped: {exc}", stopped=True)
+            return
+        doing = run.searching
+        move = run.take(looks)
+        if run.score is not None:
+            self.calibrationProbe.emit(run.history_regions, doing, run.shares, run.score)
+            self._log(
+                f"Compromise probe {run.probes} ({doing}): "
+                + ", ".join(
+                    f"{number}: {share:.0%}"
+                    for number, share in zip(run.history_regions, run.shares)
+                )
+                + f" -> {run.score:.0%}"
+                + (f", then {move.steps:+d} steps" if move is not None else ", standing here")
+            )
+        if run.searching != doing and run.searching:
+            self._log(f"Compromise: now {run.searching}")
+        if move is None:
+            self._end_calibration()
+            return
+        run.pending = move.steps
+        try:
+            camera.drive_focus(move.steps)
+        except (CameraError, MtpError, WpdCommandError) as exc:
+            self._log(f"Compromise move {move.steps:+d} refused: {exc}")
+            if not self._recover_live_view(camera, exc):
+                self._end_calibration(f"Calibration stopped: {exc}", stopped=True)
+            return  # the move is still pending, and is made first next time
+        run.drove(move.steps)
+        run.pending = 0
+        run.moved = True
+        self.calibrationProgress.emit(-1, run.progress())
+        # The trend line plots the average while the compromise is sought, as
+        # a percentage of the regions' best, so the search can be watched the
+        # way a fine tune can.
+        if run.score is not None:
+            self.sharpnessChanged.emit(100.0 * run.score, 100.0 * run.best)
+
+    def _read_region(self, camera: NikonCamera, index: int) -> "Look | None":
+        """Pan to a region's view, stack its picture, and read the region.
+
+        Read exactly as its peak was: through the same crop, off a stack of
+        as many frames as the integration is set to, with the grain taken off
+        in the same proportion. Otherwise its fraction of that peak would be
+        comparing two different measurements.
+        """
+        run = self._calibration
+        view = run.view(index) if run is not None else None
+        if run is None or view is None:
+            return None
+        frames = self._integrator.frames if self._integrator.enabled else 1
+        frame, image = self._show_view(camera, view, frames)
+        if frame is None or image is None:
+            return None
+        region = run.regions[index]
+        shown = frame.area_normalised(region.rect)
+        reading = (
+            measure(image, shown, self._noise_variance / frames)
+            if shown is not None
+            else 0.0
+        )
+        return _look_at(region, frame, image, reading)
+
+    def _show_view(
+        self, camera: NikonCamera, view: View, frames: int
+    ) -> "tuple[LiveViewFrame | None, QImage | None]":
+        """Point the camera the way *view* says, and hand back a stack from there.
+
+        The zoom level and the focus point are only sent when they differ
+        from what the camera has, and the redrawn frames a pan needs are only
+        waited for when something was sent -- the region read last at one
+        probe is read first at the next, still on screen, for nothing.
+        """
+        moved = False
+        if view.level != self._zoom_level:
+            camera.set_zoom_level(view.level)
+            self._zoom_level = view.level
+            self.zoomChanged.emit(view.level)
+            moved = True
+        frame = self._last_frame
+        if frame is None or (frame.af_x, frame.af_y) != view.af:
+            camera.set_af_area(*view.af)
+            moved = True
+        return self._stack_through(camera, view, frames, _AIM_FRESH if moved else 0)
+
+    def _stack_through(
+        self, camera: NikonCamera, view: View, frames: int, skip: int
+    ) -> "tuple[LiveViewFrame | None, QImage | None]":
+        """Gather *frames* redrawn frames showing *view*, and average them.
+
+        *skip* redrawn frames are let go first, for a view that has only just
+        been asked for: live view is a few frames behind the camera, and the
+        frames still in flight show wherever it was pointed before. Past
+        those, a frame is only taken if its crop is the view's, so a stack is
+        never a blend of two places.
+
+        The averaging is a :class:`~scanny.ui.integration.FrameIntegrator`'s,
+        the same arithmetic the peaks were read off. And the grain is
+        measured on the way, from each frame against the one before it: the
+        lens has stopped and so has the view, so what is between them is
+        noise.
+        """
+        stacker = FrameIntegrator(frames > 1, max(frames, 2))
+        deadline = time.monotonic() + _VIEW_PATIENCE + _FRAME_TIME * (skip + frames)
+        skipped = 0
+        previous: "np.ndarray | None" = None
+        while time.monotonic() < deadline:
+            try:
+                latest = camera.live_view_frame()
+            except (CameraError, MtpError, WpdCommandError):
+                continue
+            digest = hashlib.blake2b(latest.jpeg, digest_size=8).digest()
+            if digest == self._last_digest:
+                continue
+            self._last_digest = digest
+            self._last_frame = latest
+            if skipped < skip:
+                skipped += 1
+                continue
+            if not view.shows(latest):
+                continue
+            image = stacker.add(latest)
+            single = stacker.last_frame
+            if single is not None:
+                pixels = green(single)[::2, ::2]
+                if previous is not None:
+                    variance = variance_between(previous, pixels)
+                    if variance is not None:
+                        self._noise_seen.append(variance)
+                previous = pixels
+            if image is not None and stacker.last_image_was_whole:
+                self._note_magnification(latest)
+                self.frameReady.emit(latest, image)
+                return latest, image
+        return None, None
+
+    def _end_calibration(self, why: str = "", *, stopped: bool = False) -> None:
+        """Stop calibrating, put everything back, and say what was found.
+
+        Every way a calibration ends comes through here, the bad ones
+        included: the user's own sharpness meter goes back, and so do the
+        zoom and the focus point -- leaving someone at 18.8x on the last
+        region is leaving them somewhere they did not ask to be. The lens is
+        *not* put back. Standing on the compromise is the point of it.
+
+        What was found is published even when it stopped part way: the
+        peaks of the regions it got to are still worth looking at.
+        """
+        run, self._calibration = self._calibration, None
+        if run is None:
+            return
+        if self._hunt is not None:
+            self._hunt = None
+            self._settling = False
+            self.huntChanged.emit(False)
+        if self._calibration_meter is not None:
+            self._sharpness, self._calibration_meter = self._calibration_meter, None
+            self._sharpness.reset()
+            self.sharpnessChanged.emit(0.0, 0.0)
+        self._restore_view()
+        report = run.report(stopped=stopped)
+        self.calibrationReady.emit(report)
+        self.calibrationProgress.emit(-1, "")
+        self.calibrationChanged.emit(False)
+        message = why if stopped else (why or report.describe())
+        if message:
+            self.status.emit(message)
+        self._log(
+            f"Calibration {'stopped' if stopped else 'finished'}: "
+            f"{why or report.describe()}"
+            + (f". {report.cost()}" if report.cost() else "")
+        )
 
     def _restore_view(self) -> None:
-        """Put the zoom and the focus point back where the scan found them.
-
-        Everything that ends a magnified scan comes through here, including
-        the ways it ends badly: leaving someone at 18.8x on the last point of
-        a scan that failed is leaving them somewhere they did not ask to be
-        and cannot easily get back from.
-        """
-        remembered, self._points_restore = self._points_restore, None
-        self._points_apart = False
+        """Put the zoom and the focus point back where the calibration found them."""
+        remembered, self._view_restore = self._view_restore, None
         camera = self._camera
         if remembered is None or camera is None:
             return
@@ -1591,158 +1990,13 @@ class CameraWorker(QObject):
         self._zoom_level = level
         self.zoomChanged.emit(level)
 
-    def _aim_at(
-        self, camera: NikonCamera, point: Point
-    ) -> "tuple[LiveViewFrame | None, QImage | None]":
-        """Pan the magnified view onto *point* and hand back what it shows.
-
-        The camera centres its magnified view on the focus point, so moving
-        the focus point is how the view is panned -- the same mechanism the
-        arrow keys and the navigator use, and it touches nothing about focus.
-        Near the edge of the frame the focus point stops before the crop does,
-        which is why where the point actually landed is read back off the
-        frame that comes out rather than assumed to be the middle of it.
-        """
-        frame = self._last_frame
-        if frame is None:
-            frame, _image = self._fresh(camera, 1)
-            if frame is None:
-                return None, None
-        x, y = frame.to_af_coords_in_frame(point.x, point.y)
-        if (x, y) == (frame.af_x, frame.af_y):
-            return self._fresh(camera, 1)
-        camera.set_af_area(x, y)
-        return self._fresh(camera, _AIM_FRESH)
-
-    def _fresh(
-        self, camera: NikonCamera, fresh: int = _AIM_FRESH
-    ) -> "tuple[LiveViewFrame | None, QImage | None]":
-        """Wait for *fresh* frames the body has really redrawn; keep the last.
-
-        Redrawn frames rather than a length of time, for the reason
-        :meth:`_look_again` gives: reads overshoot the draw rate on purpose,
-        and magnified the body draws sixteen a second rather than forty-four.
-
-        The grain is measured here too, off the last two frames, because by
-        then the view has stopped moving and two frames of a still picture
-        differ by nothing but noise. It has to be measured on this view: the
-        grain is what :func:`~scanny.ui.sharpness.measure` subtracts before it
-        answers, and a figure carried over from an unmagnified frame is a
-        figure about a different picture.
-        """
-        deadline = time.monotonic() + _STOP_PATIENCE
-        seen = 0
-        frame: "LiveViewFrame | None" = None
-        image: "QImage | None" = None
-        before: "np.ndarray | None" = None
-        while seen < fresh and time.monotonic() < deadline:
-            try:
-                latest = camera.live_view_frame()
-            except (CameraError, MtpError, WpdCommandError):
-                continue
-            digest = hashlib.blake2b(latest.jpeg, digest_size=8).digest()
-            if digest == self._last_digest:
-                continue
-            decoded = QImage.fromData(latest.jpeg, "JPG")
-            if decoded.isNull():
-                continue
-            self._last_digest = digest
-            self._last_frame = latest
-            before = green(image)[::2, ::2] if image is not None else None
-            frame, image = latest, decoded
-            seen += 1
-        if frame is None or image is None:
-            return None, None
-        if before is not None:
-            variance = variance_between(before, green(image)[::2, ::2])
-            if variance is not None:
-                self._noise_seen.append(variance)
-        self._note_magnification(frame)
-        self.frameReady.emit(frame, image)
-        return frame, image
-
-    def _advance_points_apart(self, camera: NikonCamera) -> None:
-        """One stop of the magnified scan: read every point, then drive on.
-
-        One stop per call, and the call comes from the frame grab, so the
-        timer keeps running between stops and a Stop pressed halfway through
-        still lands. Inside a stop this blocks, because there is nothing else
-        to be doing: the camera has to be panned and its answer waited for
-        before the next point can be read.
-        """
-        sweep, survey = self._sweep, self._point_survey
-        if sweep is None or survey is None:
-            return
-        try:
-            self._hold_still(camera)
-            readings = self._read_points_apart(camera)
-        except CameraError as exc:
-            self._finish_scan(f"Point scan stopped: {exc}")
-            return
-        if readings is None:
-            self._finish_scan(
-                "Point scan stopped: live view stopped sending pictures"
-            )
-            return
-        survey.add(sweep.position, readings, self._sweep_pass)
-        self.pointsFound.emit(survey.found())
-        self._say_sweeping(sweep.taken + 1)
-        if sweep.taken + 1 >= sweep.samples:
-            self._reach_further(sweep)
-        move = sweep.took_one() if not sweep.done else None
-        if move is not None:
-            try:
-                if not camera.drive_focus(move):
-                    sweep.blocked()
-            except CameraError as exc:
-                self._finish_scan(f"Point scan stopped: {exc}")
-                return
-        if sweep.done:
-            self._sweep_pass += 1
-            self._finish_scan()
-
-    def _read_points_apart(self, camera: NikonCamera) -> "list[float] | None":
-        """Pan to each point in turn and read the box around it.
-
-        Every one of these belongs to the focus position the lens is at now:
-        panning moves the view and nothing else. What it costs is frames --
-        four redrawn ones a point, so a quarter of a second each at the
-        sixteen a second the body draws magnified.
-
-        A point the camera cannot bring into view reads zero, which is what
-        :func:`~scanny.ui.sharpness.measure` answers for anything it cannot
-        tell from the grain, and what the peak finder treats as "nothing
-        here" rather than as a low reading to be fitted.
-        """
-        survey = self._point_survey
-        if survey is None:
-            return None
-        readings: "list[float]" = []
-        for point in survey.points:
-            frame, image = self._aim_at(camera, point)
-            if frame is None or image is None:
-                return None
-            seen = point.seen_in(frame.crop_normalised)
-            if seen is None:
-                readings.append(0.0)
-                continue
-            aspect = image.width() / max(image.height(), 1)
-            readings.append(
-                measure(
-                    image,
-                    area_for(seen[0], seen[1], self._point_box, aspect),
-                    self._noise_variance,
-                )
-            )
-        return readings
-
     def _hold_still(self, camera: NikonCamera) -> None:
         """Wait for the lens to arrive and the picture to stop changing.
 
-        The frame-driven sweep has :meth:`_watch_for_stillness` for this and
-        cannot be used here, because that judges stillness by the sharpness of
-        the whole displayed picture and this view is about to be panned across
-        five different subjects.
+        The frame-driven searches have :meth:`_watch_for_stillness` for this,
+        and it cannot be used here: it judges stillness by the sharpness of
+        the measured area, and the compromise has one per region and is about
+        to pan across all of them.
 
         Same two parts as everywhere else in this file, and the order of them
         is the point: **first** wait for frames the body has redrawn since the
@@ -1772,55 +2026,18 @@ class CameraWorker(QObject):
             if still >= 2:
                 return
 
-    def _reach_further(self, sweep: Sweep) -> None:
-        """Add stops when a point is still getting sharper at the last one.
-
-        Only ever forward, and only so far. Forward because that is the way
-        the lens is already driving, so the stops added are in the same
-        coordinate as the ones before them; a reversal would not be. So far
-        because a point that has not peaked by twice as many stops is not
-        going to -- there is nothing in its box to peak -- and marching the
-        rest of the travel to prove it costs a minute and answers nothing.
-
-        Two things ask for more stops, and the second is the ordinary one. A
-        point still getting sharper at the last stop obviously has its peak
-        further on. But a point far outside the bracket does not read as
-        rising at all: thoroughly defocused it reads nothing, flat, all the
-        way across -- so having no answer for a point counts as a reason to
-        keep driving too. It is a guess in that case, because a point nearer
-        than the bracket reads exactly the same flat nothing and driving
-        further goes away from it; it is a bounded guess, and the way to not
-        need it is to put point 1 on the nearest of the subjects.
-        """
-        survey = self._point_survey
-        if survey is None:
-            return
-        rising, _falling = survey.escaping()
-        if not rising and all(one.known for one in survey.found()):
-            return
-        allowed = int(_MOST_EXTRA * self._sweep_samples)
-        if self._points_extra >= allowed:
-            return
-        more = min(max(4, self._sweep_samples // 4), allowed - self._points_extra)
-        self._points_extra += more
-        sweep.keep_going(more)
-        self.status.emit(
-            f"A point has not shown its best yet at the end of the bracket, so "
-            f"the sweep is carrying on for {more} more stops"
-        )
 
     def _sweep_over(
         self, camera: NikonCamera, again: "tuple[int, int] | None"
     ) -> None:
         """Decide which stretch of travel to sweep, and start the first pass."""
-        what = "Depth map" if self._scan == "depth" else "Point scan"
         try:
             # A second run over what the first one found is following it
             # immediately, on the same lens and the same scene, so the range
             # the first one found still stands and is not looked for again.
             span = again if again is not None else self._useful_range(camera)
         except CameraError as exc:
-            self._finish_scan(f"{what} stopped: {exc}")
+            self._finish_scan(f"Depth map stopped: {exc}")
             return
         if span is None:
             self._finish_scan(
@@ -1854,10 +2071,6 @@ class CameraWorker(QObject):
     def cancel_depth_map(self) -> None:
         self._cancel_sweep("Depth map stopped")
 
-    @Slot()
-    def cancel_point_scan(self) -> None:
-        self._cancel_sweep("Point scan stopped")
-
     @Slot(int)
     def set_depth_detail(self, level: int) -> None:
         """Redraw the map at a coarser or finer grid, without sweeping again.
@@ -1875,19 +2088,13 @@ class CameraWorker(QObject):
         """Stop a sweep, if one is running. Silent when nothing is happening.
 
         What was read is kept. Half a map is still worth looking at, the
-        detail control still works on it, and points that were placed before
-        the sweep gave up keep the answers they got.
+        detail control still works on it.
         """
         if self._sweep is None:
             return
         self._sweep = None
         self._settling = False
-        kind, self._scan = self._scan, ""
-        self._restore_view()
-        if kind == "points":
-            self.pointScanChanged.emit(False)
-        else:
-            self.depthChanged.emit(False)
+        self.depthChanged.emit(False)
         if why:
             self.status.emit(why)
 
@@ -1912,9 +2119,8 @@ class CameraWorker(QObject):
         self._sweep_silent = 0
         self._sweep_spoke = False
         self._settle()
-        what = "Depth map" if self._scan == "depth" else "Point scan"
         self.status.emit(
-            f"{what} pass {self._sweep_pass + 1} of {self._sweep_passes}: "
+            f"Depth map pass {self._sweep_pass + 1} of {self._sweep_passes}: "
             f"{self._sweep_samples} stops in steps of {step}..."
         )
         self._say_sweeping(0)
@@ -2075,12 +2281,6 @@ class CameraWorker(QObject):
         sweep, camera = self._sweep, self._camera
         if sweep is None or camera is None:
             return
-        if self._points_apart:
-            # Nothing below this applies: that scan reads its own frames, at
-            # its own magnification, one point at a time. See
-            # _start_points_apart.
-            self._advance_points_apart(camera)
-            return
         if self._settling:
             self._watch_for_stillness(frame)
             return
@@ -2089,7 +2289,7 @@ class CameraWorker(QObject):
         if not self._integrator.last_image_was_whole:
             return
         frames = self._integrator.frames if self._integrator.enabled else 1
-        if not self._record(frame, sweep.position, image, frames):
+        if not self._record(sweep.position, image, frames):
             return
         if self._out_of_lens(image, sweep.step, frames):
             sweep.blocked()
@@ -2101,55 +2301,25 @@ class CameraWorker(QObject):
                     # The far end of the travel: there is nowhere left to
                     # sweep, and what was read up to here is the map.
                     sweep.blocked()
-            except CameraError as exc:
-                self._cancel_sweep(f"Depth map stopped: {exc}")
-                return
+            except (CameraError, MtpError, WpdCommandError) as exc:
+                if not (
+                    self._recover_live_view(camera, exc)
+                    and self._drive_through(camera, move)
+                ):
+                    self._cancel_sweep(f"Depth map stopped: {exc}")
+                    return
         if sweep.done:
             self._finish_pass(camera, sweep)
             return
         self._settle(before)
         self._say_sweeping(sweep.taken)
 
-    def _record(
-        self, frame: LiveViewFrame, position: int, image: QImage, frames: int
-    ) -> bool:
-        """Read one settled picture into whichever survey is being filled.
-
-        The one place the two kinds of sweep part company, along with
-        :meth:`_interesting` and :meth:`_finish_scan`. Everything about
-        driving the lens to get here was the same for both.
-
-        The frame comes in as well as the picture because the points are
-        places on the sensor, and it takes the frame's crop rectangle to say
-        where on *this* picture each of them falls. A point outside the crop
-        reads zero: on an unmagnified sweep that means someone placed it while
-        magnified somewhere else, and a zero is the reading that says "nothing
-        here" rather than a small one that would be fitted like an answer.
+    def _record(self, position: int, image: QImage, frames: int) -> bool:
+        """Read one settled picture into the survey.
 
         Answers False when the sweep cannot go on, having said why.
         """
         noise = self._noise_variance / max(frames, 1)
-        if self._scan == "points":
-            survey = self._point_survey
-            if survey is None:
-                return False
-            aspect = image.width() / max(image.height(), 1)
-            crop = frame.crop_normalised
-            readings = []
-            for point in survey.points:
-                seen = point.seen_in(crop)
-                readings.append(
-                    0.0
-                    if seen is None
-                    else measure(
-                        image,
-                        area_for(seen[0], seen[1], self._point_box, aspect),
-                        noise,
-                    )
-                )
-            survey.add(position, readings, self._sweep_pass)
-            self.pointsFound.emit(survey.found())
-            return True
         survey = self._survey
         if survey is None:
             return False
@@ -2162,13 +2332,6 @@ class CameraWorker(QObject):
             return False
         self.depthMapReady.emit(survey.map(self._sweep_detail))
         return True
-
-    def _interesting(self, margin: int) -> "tuple[int, int] | None":
-        """The stretch worth sweeping again, from whichever survey is running."""
-        survey = (
-            self._point_survey if self._scan == "points" else self._survey
-        )
-        return survey.interesting(margin) if survey is not None else None
 
     def _out_of_lens(self, image: QImage, step: int, frames: int) -> bool:
         """Whether the picture has held still over a long stretch of driving.
@@ -2241,7 +2404,8 @@ class CameraWorker(QObject):
         if self._sweep_pass >= self._sweep_passes:
             self._finish_scan()
             return
-        span = self._interesting(sweep.step)
+        survey = self._survey
+        span = survey.interesting(sweep.step) if survey is not None else None
         if span is None:
             self._finish_scan(
                 "Nothing anywhere in the travel came into focus to refine"
@@ -2264,57 +2428,11 @@ class CameraWorker(QObject):
         self._begin_pass(camera, low, step)
 
     def _finish_scan(self, why: str = "") -> None:
-        """Stop the sweep and publish what it found, whichever kind it was."""
+        """Stop the sweep and publish the map it made."""
         self._sweep = None
         self._settling = False
-        kind, self._scan = self._scan, ""
-        apart = self._points_apart
-        self._restore_view()
         passes = self._sweep_pass
         spent = f"{passes} pass" + ("" if passes == 1 else "es")
-        if kind == "points":
-            self.pointScanChanged.emit(False)
-            survey = self._point_survey
-            if survey is None or not len(survey):
-                self.status.emit(why or "Point scan finished with nothing read")
-                return
-            results = survey.found()
-            self.pointsFound.emit(results)
-            if why:
-                self.status.emit(why)
-                return
-            if apart:
-                # A point whose best reading was the first one taken was
-                # already past its best when the sweep began, and the sweep
-                # cannot reach back for it: that would be a reversal, and the
-                # play the reversal takes up is the one thing none of this can
-                # measure. Say so instead of quietly reporting the edge of the
-                # bracket as an answer.
-                _rising, falling = survey.escaping()
-                missing = [one for one in results if not one.known]
-                if falling:
-                    short = (
-                        " One point was already at its best when the bracket "
-                        "began, so its real peak is nearer than anything "
-                        "swept -- raise 'Around AF' and measure again."
-                    )
-                elif missing:
-                    short = (
-                        f" {len(missing)} of them never came into focus "
-                        f"anywhere in the bracket. Raise 'Around AF', or put "
-                        f"point 1 on the nearest of the subjects -- the sweep "
-                        f"can drive further out to reach a point but never "
-                        f"back to reach one nearer than where it began."
-                    )
-                else:
-                    short = ""
-                self.status.emit(
-                    f"Points measured at full magnification: "
-                    f"{ordering(results)}.{short}"
-                )
-                return
-            self.status.emit(f"Points measured in {spent}: {ordering(results)}")
-            return
         self.depthChanged.emit(False)
         survey = self._survey
         if survey is None or not len(survey):
@@ -2493,3 +2611,34 @@ class CameraWorker(QObject):
             return camera.live_view_frame()
         except (CameraError, MtpError, WpdCommandError):
             return None
+
+
+def _look_at(
+    region: Region, frame: LiveViewFrame, image: QImage, reading: float
+) -> Look:
+    """A reading of *region*, with the region cut out of the picture it came off.
+
+    Cut from the picture exactly where the reading was taken: the region as
+    it falls on this frame's crop, which is a place on the sensor turned into
+    a place on the picture. A region off the picture altogether has no
+    picture to keep.
+    """
+    shown = frame.area_normalised(region.rect)
+    picture = cut_out(image, shown) if shown is not None else None
+    return Look(float(reading), picture)
+
+
+def _inside(
+    area: "tuple[float, float, float, float]",
+    crop: "tuple[float, float, float, float]",
+) -> bool:
+    """Whether the whole of *area* is inside *crop*, both fractions of the frame."""
+    x, y, w, h = area
+    left, top, width, height = crop
+    slack = 1e-6
+    return (
+        x >= left - slack
+        and y >= top - slack
+        and x + w <= left + width + slack
+        and y + h <= top + height + slack
+    )

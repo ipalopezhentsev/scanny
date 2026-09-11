@@ -98,7 +98,11 @@ trusting that number anywhere:
 | `ui/hunt.py` | Autofocus, then bettering it a single step at a time, without counting steps |
 | `ui/depth.py` | Sweeping the travel once and reading every part of the picture: a depth map |
 | `ui/depthview.py` | That map drawn, with the scale to read it by |
-| `ui/points.py` | The same sweep asked about a few places you point at, in order |
+| `ui/regions.py` | Each region's best, then the one focus that does best by all of them |
+| `ui/report.py` | That compromise laid out: every region at its best and at the compromise |
+| `ui/film.py` | The film's shape from the regions' depths -- edges' plane and bulge -- drawn in 3D over the sensor |
+| `ui/regionchart.py` | Every region's sharpness through the search for the compromise, one line each |
+| `ui/activity.py` | The activity log: everything said, with the time, in a window and a file |
 | `ui/navigator.py` | The whole frame, with the magnified view marked on it and draggable |
 | `ui/orientation.py` | Turning, mirroring and inverting the picture on its way to the screen |
 | `ui/histogram.py` | The levels in the frame the camera sends, per channel |
@@ -137,6 +141,12 @@ to a focus coordinate at every magnification:
 ```python
 af_x = crop_centre_x + (click_fraction_x - 0.5) * crop_width
 ```
+
+The body also turns live view off by itself after its monitor-off delay for
+live view (custom setting c4 on a D750, ten minutes by default), without a
+word -- frames simply stop coming. When that happens live view is started
+again and the zoom and focus point put back, so a long calibration or depth
+map carries on across it; see *What stops it* under focus regions.
 
 ## Live-view resolution
 
@@ -263,8 +273,8 @@ what focusing against a number is comparing, had nothing to do with each
 other.
 
 It is kept in fractions of the **whole frame** now: the same coordinates the
-camera's own focus point lives in, and the same ones `ui/points.py` keeps the
-measured points in, for the same reason. It does not move when the view
+camera's own focus point lives in, and the same ones `ui/regions.py` keeps the
+focus regions in, for the same reason. It does not move when the view
 magnifies or pans; where it falls on the picture is worked out afresh for
 every frame from that frame's crop rectangle. Magnify somewhere else entirely
 and it is not on the picture at all, which is drawn as no box and read as no
@@ -856,200 +866,240 @@ mean the next reading would be of a different picture from the last one, and
 comparing across that is exactly the mistake the whole thing is made of. The
 button says **Stop** while it is running.
 
-## Distance between a few points you pick
+## One focus for several places: focus regions
 
-The depth map asks how far away every part of the picture is. This asks it
-about five places someone chose, and almost everything that made the map
-fragile goes away with that choice. The boxes are large where a grid zone is
-ten pixels across. They have subject in them, because a person looked before
-clicking, where most of a grid is sky and wall. And there are five of them
-rather than two thousand, so a test that has to hold for every one can be
-strict without throwing most of the answer away.
+Fine tuning answers where one rectangle is sharpest. A frame of film is not one
+rectangle: it curls, it sags in the carrier, and the lens has a curved field,
+so the corners and the middle come into focus at slightly different places --
+and there is only one focus position to give them. What is wanted is not how
+far apart they are but **the position that does best by all of them together**,
+and an honest account of what each of them gave up for it. `ui/regions.py` is
+that, `ui/report.py` shows it.
 
-Ctrl-click the picture to put a point down, ctrl-click it again to take it
-away. **Measure points** sweeps, and then each point on the picture is drawn in
-its depth colour with a number on it, and hovering it says what was found:
+Ctrl-drag the picture to draw a region round something that has to be sharp,
+up to five; ctrl-click inside one to take it away. They are remembered between
+runs, since a copy stand is set up once and scanned from for hours.
+**Calibrate** does two things, and the second only means anything because of
+the first:
 
-```
-Point 3: sharpest at 18,543 steps from the near stop
-3rd nearest: 4,544 steps behind point one, 2,254 behind the one before it
-Reading 156 at its best
-```
+1. **Each region's best, by fine tuning on it alone.** Exactly what the Fine
+   tune button does -- magnified onto the region, the camera's autofocus aimed
+   at it, then walked in minimum steps to the best it reads -- once per region.
+   What it stood on at the end is that region's *peak*: the reading, and the
+   picture of the region at that moment. Along with where the camera was
+   pointed when it read it, because a reading is only comparable with another
+   taken through the same crop at the same magnification.
+2. **Then one position for all of them.** At every probe the camera is panned
+   to each region's view in turn -- panning moves the focus point and nothing
+   else, so every region is read at the one focus position -- and each is
+   read against its own peak. Those shares are combined into the one number
+   the search climbs, in the way **Aim for** says, chosen before it starts:
+   *the best average* of them, or *the best worst region* -- the softest one
+   made as sharp as it can be, whatever that costs the sharpest.
 
-The panel writes the order out underneath -- `1: nearest   2: +2,290   3: +4,544`
--- and the status bar says the same when the scan finishes.
+When it finishes, focus is left on the compromise, the view is put back where
+it was, the regions are coloured by how near their best they ended up (green
+within 5%, amber within 15%, red further), and the **report** opens: every
+region at its own best and at the compromise, side by side at the same size
+with the numbers, so a person can look at what was possible and what was
+chosen rather than take a percentage's word for it. The pictures are shown
+the way the view is set -- turned, mirrored and inverted as the View panel has
+it now -- and enlarged pixel for pixel, never smoothed. **Save as picture...**
+keeps the whole report as one PNG.
 
-### A point is a place on the sensor, not a place on the screen
+While it runs, the panel keeps a clock of how long it has been going and says
+what it is doing, and once the compromise is being sought it charts **every
+region's sharpness, one line each**, as a share of its own best, with the
+combined number dashed over them and what the search was doing shaded
+behind -- so region 1 coming to its best and going over it while region 2 is
+still climbing can be watched, not guessed from the one number. The report
+says what it all took: the time, each region's fine-tune probes, the
+compromise's, and how many focus moves and drive steps that came to.
 
-It was the other way round to begin with, in fractions of the picture on
-screen, on the same reasoning the sharpness meter's area uses: it is a place in
-the picture someone is looking at, so let it stay where they put it while the
-camera moves underneath. That is exactly wrong for this, and the failure is
-worth keeping.
+The report has three pages. **Regions** is the pictures. **Film shape** is what
+levelling the film needs: **how far apart in focus the regions are**, in drive
+steps, nearest first with the doubt on each -- `1 nearest,  3 +42 ±2,  2 +95
+±3` -- and the film itself, drawn in three dimensions over the sensor: each
+region's rectangle on the sensor, a line up from it to where that region is
+on the film, and the film bent through those points. Drag it round, scroll to
+come closer; the height is exaggerated, since the depths are drive steps and
+have no length in common with the frame. **The search** is the chart of every
+region, full size.
 
-Put two points near opposite corners of the whole frame, then magnify to read
-the small gap between them -- which is the one thing that makes a small gap
-readable, and what the *too close to call* message tells you to go and do. At
-18.8x the screen is a hundredth of the frame. A point kept at "a tenth of the
-way across the screen" is now a tenth of the way across that hundredth: some
-other piece of the world entirely. Both points survive the zoom, both look
-right, and neither is on the thing it was put on.
+### The film is foil, held at its edges
 
-Points are kept in fractions of the whole sensor frame instead -- the
-coordinate the camera's own focus point lives in, which does not move when the
-view magnifies or pans. Every frame carries the crop rectangle in its header,
-so where a point falls on the picture *now* is worked out afresh for every
-frame; a point outside the crop is simply not drawn. The navigator keeps
-drawing all of them, which is the whole use of it here: magnified onto one
-point, it is the only place the others can be seen at all.
+A frame of film in a holder is not a plane. The holder grips it along its four
+sides, which lie more or less on a plane -- one that may lean against the
+sensor, which is what levelling corrects -- and inside them the film is free
+to bow towards the lens or away from it. So that is the shape fitted to the
+depths: **a plane for the edges, and a bulge that is nothing at the edges**,
+made of the shapes a sheet clamped along its sides takes, and the gentlest of
+those that passes through every measured depth -- each weighted by how much
+bending it costs, so nothing is invented between the regions that they do not
+ask for. Three regions are always a plane, so it takes a fourth -- one in the
+middle says most -- to see the bow at all.
 
-Clicks stay in screen coordinates, because that is all a click can be, and are
-turned through the crop on the way in. Taking a point away is still judged on
-screen, so what you can click off is the ring that is under the pointer at
-whatever zoom.
+That separation is the point of it. A plane pulled through all the regions,
+the obvious fit, leans the wrong amount as soon as one of them is on a bow:
+the holder tips the edges, not the middle. So what the report gives as the
+lean to correct is the **edges'** -- how much further the right edge focuses
+than the left and the bottom than the top, in the picture's directions as it
+is shown, with the doubt on each carried through from the depths -- and,
+separately, how far the film bows between them, which no levelling removes.
+The edges are taken to be the picture's: true when the film frame fills the
+camera's frame, as a copy stand is set up to.
 
-### It is one sweep, not a hunt per point
+### Depth, when it is asked for, and why it can be trusted
 
-Pointing `ui/hunt.py` at each box in turn is the obvious construction and it is
-worse in both directions at once.
+Depths cost walking the compromise does not need, so they are asked for:
+**Measure depths for levelling**, off out of the box. Levelling is done once,
+when the stand is set up, and frames are calibrated many times after. With it
+on, the walks go on past the turn-back line until every region has fallen a
+quarter below its best on both sides of its peak -- far enough to place the
+peak to a step or two, where a sixth left the worst five steps out -- and no
+further than twenty-five increments for that. With it off, the report's Film
+shape page says how to get them rather than showing a few that happened to
+be measured.
 
-It costs five searches of dozens of probes each, where a sweep costs its stops
-once: every box is read off the same frame, so the fifth point is free.
+The search's walk across (below) crosses every region's peak in one
+direction. Within one direction the steps are honest -- the play in the
+gearing was taken up at the start of the walk and stayed taken up -- so where
+on it each region peaked is its depth against the others. The play moves every
+position on that walk by the same amount, which is why only the differences
+are reported: they are the answer, and the positions themselves mean nothing.
+This is the same reasoning the old point scan was built on, without its
+parking or its bracket, because the walk across was happening anyway.
 
-And **its answers would not compare**. A hunt walks out until the reading turns
-over and then walks back, and finishes wherever the reading told it to. What
-separates the resting places of two hunts is the focus difference *plus*
-whatever play the gearing took up on the way there -- and the play is precisely
-the thing nothing here can measure, which is why `ui/hunt.py` refuses to count
-steps at all. One pass driving one way from the near stop has every reading in
-one coordinate by construction. See *Steps mean something here* above.
+Two things were needed to make the number worth levelling by. The walk has to
+take in the **top** of each region's curve with some of both its sides, not
+just its peak: the depth is the middle of that top, drawn at the same height
+on both sides so that it stays symmetrical, and a curve cut off on one side
+has a middle pulled towards the cut. That is what the quarter's fall on each
+side is for, whether or not the compromise needs that region -- a region a
+little outside the others is still one the film is levelled by. And each
+depth carries its doubt, worked out from the grain on the readings
+themselves, and the lean carries that doubt through the fit, so a lean
+smaller than it can tell is called level. Against made-up scenes of regions
+on one frame, with up to sixty steps of play and 2% grain on every reading,
+depths came back within two steps of the truth, most within a fraction of
+one, for about a dozen more probes than the compromise alone.
 
-So the driving is the depth map's, unchanged and shared: park against the near
-stop, bracket the part of the travel the picture answers focus in, sweep it,
-come back over what was found in a finer step. What differs is a dozen lines --
-what each settled picture is read into, and what comes out at the end.
+**Which way is further is the drive's word, not a measurement.** The focus
+drive's two directions are named nearer and further after Nikon's usual
+convention, and `camera/nikon.py` could not confirm from live view which way
+a lens actually turns. Before levelling by the report, drive focus a few
+steps further with `>` and check that the edge it says is further is the one
+that sharpens. The steps are the lens's, too: how much film height one of
+them is depends on the lens and the magnification, and a shim of known
+thickness under one edge, calibrated again, is the way to find out.
 
-### Every answer comes with the doubt on it, and that is the point
+### Shares of each region's own best, not the readings
 
-The first version of this had none, and that made it worse than useless.
-Whether two things a hundred steps apart can be told apart is not a property
-of the arithmetic. It is a property of the lens, of how far the view is
-magnified, and of what happens to be in the boxes -- read an unmagnified scene
-and a hundred steps may move the reading less than the grain does. Asked
-anyway, the old code answered with the few steps of noise between two curves it
-could not separate, in whichever order the grain fell, and said it in the same
-voice it uses for an answer it is sure of. Tried on two points about a hundred
-steps apart, it called the nearer one further and put seven steps between them.
+A reading has no units: its size is set by how much detail is in the box and
+how bright it is. Averaging raw readings would hand the compromise to
+whichever region has the most texture in it, and a faint region would count
+for nothing. As shares of their own peaks, every region has the same say.
 
-So each peak now carries a standard deviation, worked out from the readings
-themselves: on a curve that is smooth apart from noise, each sample less the
-average of its two neighbours *is* the noise, and the median of those is a
-measure of it that a few wild samples cannot inflate. That is then carried
-through the arithmetic that found the peak. Two points whose gap does not clear
-two and a half of those are reported as **too close to call** -- joined by `=`
-in the readout rather than ordered, with the tooltip saying to magnify and
-measure again.
+The two ways of combining them part company when regions are further apart
+in focus than each is deep. The best average can then be one region's own
+peak, with the others well short of theirs; the best worst region never
+sacrifices one, and pays for that in the average. Both only ever go up when a
+single share does, so the search is the same for either.
 
-(Splitting the samples in two and comparing the halves was tried first and is
-worth recording as wrong. Neighbouring samples of a broad peak read almost the
-same thing, so the two halves are not two looks at the curve but very nearly
-the same look twice. They agree beautifully and say nothing.)
+### Why the compromise is not a fine tune on the average
 
-### Magnify onto each point, which is how the doubt is made small
+That was the first version, and two things about the average that are not
+true of one region's reading each cost it something real.
 
-*Too close to call* says to magnify and measure again, and **Magnify onto each
-point** is that, done by the machine. It is on by default.
+**It can have more than one hill.** A region's reading against focus has one
+peak. The average of several has one per region wherever the regions are
+further apart than each is deep, and a climb finds the hill it starts on --
+which, started as it has to be on the last region's own peak, is that
+region's, when the hill in the middle serves all of them better. Against a
+simulated rig with three regions sixty steps apart, the climb stood on 40%
+where 44% was there to be had.
 
-Magnification is the whole of what makes a small gap readable: a step of focus
-moves the picture in proportion to how far the view is magnified, so a hundred
-steps that are lost in the grain on a whole frame are obvious at 18.8x. And it
-breaks the thing the section above is built on, because at 18.8x no two points
-worth comparing are on the screen together. What is kept and what is given up:
+**Its top is flat.** Several peaks side by side add up to a broad top whose
+readings are within a per cent of each other over many steps. A fine tune
+walks home until the reading is within a per cent of the best it saw, which
+on one region's steep peak is the top -- and on the average's flat top is its
+edge. Two regions eighty steps apart came back as 85% and 42% where the
+middle had both at 64%.
 
-**Kept: one sweep, one coordinate.** The camera is panned from point to point
-at every stop, and focus is not touched while it pans -- panning is moving the
-focus point, which is how the arrow keys and the navigator scroll the magnified
-view. So every reading taken at a stop still belongs to that one position, on
-one monotonic drive. Panning costs frames; it costs nothing in the coordinate,
-and the coordinate is the only thing the answer depends on. It costs about a
-quarter of a second a point a stop: magnified, the body draws sixteen frames a
-second and four redrawn ones are waited for, because a reading taken off a
-frame that still shows the last point is worse than no reading at all.
+So the search is three legs, and none of them counts a step across a reversal:
 
-**Given up: the near stop as the datum.** Parking and then sweeping the whole
-travel at a step fine enough to be worth magnifying for is thousands of stops.
-So this never parks. The camera's own autofocus is pointed at point 1, and the
-sweep is a bracket around where that landed: back off **Around AF** steps, then
-drive forward through twice that. Backing off first is not a detail -- it is
-what puts the play in the gearing *behind* the sweep instead of inside it, so
-every stop of the pass that follows is honest travel. The positions that come
-out are counted from where the bracket began rather than from the near stop,
-and the tooltips say so. The gaps between the points are the answer either way,
-and they are unaffected.
+- **Out**, one way until it is plainly the wrong way: the number being
+  climbed has fallen below **Turn back below** -- 80% out of the box -- of the
+  best it reached on this walk, and it turns at the first reading under that
+  line. The one thing it waits for is a region *visibly climbing* towards its
+  own best, and then only ten increments: that is how a hill just beyond a
+  valley is still found. It used to walk on while anything ahead could in
+  principle beat the best so far, and then until every region had fallen well
+  below its own best for the sake of the depths -- which is how a walk told
+  to turn back at 80% was seen going on to where the sharpest region was at
+  38% of its best, waiting for three broad ones around it to fall. On one
+  frame of film turning back at 80% loses nothing and saves about a third of
+  the probes; set it lower only when regions are so far apart in focus that
+  the best compromise lies beyond a valley where they are all soft. Regions
+  so far apart that each reads nothing where another is sharp are beyond any
+  walk: nothing on the way says there is anything further on.
+- **Across**, back the other way until the same holds. That one leg crosses
+  every region's peak in a single direction, so its steps are honest -- the
+  play was taken up at its start -- and it is a true profile of the average
+  against focus. Its best is the best of all of it, found as the middle of
+  its top by the estimator the depth map settled on -- with the top drawn
+  near the top: a line half way down took in enough of a lopsided top to pull
+  its middle several steps off the best.
+- **Home**, back again. The way home retraces the profile, but how much play
+  was taken up first is not known, and it is the one number the walk needs.
+  So it is measured: every reading on the way home is matched against the
+  profile, and the play is whatever lines them up. The walk goes on an
+  increment at a time, matching again with every reading, until the best is
+  less than half an increment away. If the reading there does not agree --
+  the top was one increment wide, or the walk passed the best before it could
+  tell -- the walk home is itself an honest profile, and it goes home again
+  from that; only after that does a fine tune take over and climb the hill it
+  is next to.
 
-The bracket can miss. A point whose focus is past the far end reads flat
-nothing rather than reading as still rising, so *having no answer for a point*
-counts as a reason to keep driving, and the pass takes up to twice its stops
-again reaching for it -- forward only, because forward is where the lens is
-already going and a reversal would take up play that nothing here can measure.
-A point *nearer* than the bracket cannot be reached that way at all, and is
-reported instead: raise **Around AF**, or put point 1 on the nearest of the
-subjects.
+Against made-up scenes of two to five regions at random depths, with up to
+sixty steps of play and 2% grain on every reading, it ends on average 0.2%
+short of the best average any focus position gives, 1.3% at the 99th
+percentile. The worst region is harder, because its top is a point where two
+regions' curves cross: an increment off it, which the play can make
+unavoidable, costs more there, and it ends on average 0.9% short. It takes
+about sixty probes, each a pan and a stack per region -- a few minutes for
+three regions magnified.
 
-It is one pass by construction, so **Passes** is greyed out while it is on: the
-bracket is already fine, and a second pass would have to reverse the lens. Turn
-the whole thing off to sweep the travel on the frame as it is -- faster, and
-the only thing to do when the points have no edges for autofocus to lock onto.
-The zoom and the focus point are put back wherever the scan ends, including the
-ways it ends badly.
+### What stops it
 
-### Three things that were making the number worse
+Anything that would make the readings after it incomparable with the ones
+before -- focus taken by hand, the view magnified, the exposure or the
+integration changed, the regions or the measured area moved -- stops it and
+puts the view back. What it had found by then is kept: the peaks of the
+regions it reached still colour them and still fill the report.
 
-All three were found by putting a lens with realistic faults into the
-simulation and watching a known hundred-step gap come back wrong.
+Live view going off does not stop it. A D750 ends live view after its own
+monitor-off delay for it -- custom setting **c4 > Live view**, ten minutes out
+of the box -- whoever is driving it, and a calibration or a depth map can run
+longer than that. It shows two ways: frames stop coming, and the body refuses
+to move the focus point or drive focus, "not in live view" -- the second is
+what a calibration meets first, between two probes, and missing it is what
+used to end calibrations at the ten-minute mark. Either way live view is
+started again, patiently -- a body still putting its mirror down refuses the
+first attempt -- the zoom and the focus point are put back through the busy
+answers that follow a restart, and the picture is let settle before anything
+is read. Focus never moved, so whatever was running carries on: a probe is
+taken again, and a move the search had asked for when live view went is made
+first. Up to three times in two minutes: a body that ends it faster than that
+is refusing for some other reason, and live view is shut down as before.
+Setting c4 to its longest on the body saves the restarts altogether.
 
-**The peak was found from three samples.** Argmax plus a parabola through its
-two neighbours is the textbook answer and it is the wrong one whenever the
-depth of field is broad, which on an ordinary lens it usually is. A broad peak
-finely sampled has a summit twenty samples wide, all of them within the noise
-of each other, so *which* is highest is the grain's choice and a fit through it
-inherits all of that. The peak is now the centroid of everything on the top
-half of the curve, weighted by height above it and by how much travel each
-sample stands for -- which divides that wander by the square root of how many
-samples are up there.
-
-**Refining narrowed inside the peak.** Each pass swept the stretch the last one
-found the points in, plus one step either side. Once the points were located,
-that stretch was narrower than the peak was wide -- so the finest pass was
-looking at a flat noisy plateau and answering with the grain on it, making the
-coarse answer worse instead of better. A pass now always reaches a peak-width
-and a half past the top on both sides, because a hill can only be placed by
-seeing it fall away.
-
-**The passes were merged.** Each pass parks against the stop again, and the
-play in the gearing gives back a little more or less each time, so positions
-from different passes are not quite the same coordinate. Against a modelled
-lens whose parking landed within forty steps of the same place, merging turned
-a hundred-step gap into a hundred and fifty. The answer now comes from the last
-pass alone, and falls back to everything only when that pass placed fewer
-points.
-
-With all three, that modelled lens reads the hundred-step gap as 103 to 110
-whether its parking is repeatable to nothing, to forty steps or to a hundred
-and twenty.
-
-### The one test that is turned off for points
-
-A grid zone whose best reading is fifty times below what the rest of the frame
-managed has nothing in it and has agreed with itself about where the nothing
-peaked; the map throws it away for that reason alone. A *point* whose reading
-is fifty times below the others is a dim thing someone pointed at on purpose,
-and throwing it away would be answering a question they did not ask. Everything
-else -- the grain floor, the prominence, the shoulders either side of the peak,
-the parabola through the three readings around it -- is the same code.
-
-Against a modelled 24000-step travel with a scene living in its far half, five
-points across it come back within about thirty steps of where they belong.
+Everything along the way is in **View > Activity log** (Ctrl+L): every region
+tuned, every probe of the compromise with every region's share, every
+attempt at getting live view back with the camera's own reason for refusing,
+and why anything stopped. The same lines are written to `activity.log` in the
+program's data folder, so they are there after the window or the program is
+closed.
 
 ## Mapping the depth of the scene
 
@@ -1397,9 +1447,10 @@ and inverts its colours. All of it is a **display transform** and nothing else:
 
 | Follows the view | Does not |
 | --- | --- |
-| The image, and every overlay on it — focus box, measured area, points | The focus coordinates sent to the camera |
+| The image, and every overlay on it — focus box, measured area, regions | The focus coordinates sent to the camera |
 | The navigator map and its crop rectangle | The histogram |
 | The depth map pane, turned but never inverted | The sharpness reading and the depth sweep |
+| The pictures in the focus report | What the calibration measured |
 | | The pictures the camera saves, and the saved depth-map files |
 
 The **histogram** is the deliberate one. It is read to judge exposure and
@@ -1718,16 +1769,19 @@ Switched off, the camera's own names are kept, and a collision is decorated
   instead, ten seconds on a tight lens and under a minute on a loose one. The
   view is left magnified afterwards; Esc or 0 goes back. Anything you do to
   the focus, the view or the exposure stops it.
-- **Ctrl-click** the picture to put down a point to be measured, up to five,
-  and ctrl-click one again to take it away. **Measure points** then sweeps
-  focus once and reports which of them is nearest, and how many drive steps
-  the others are behind it. Hover a point for what was found there. It is
-  the depth map's question asked about places you chose rather than about a
-  grid, which is why it is the one to reach for first. **Magnify onto the
-  subject first if the points are close together**: a step of focus moves the
-  picture far more when the view is magnified, and that is the whole of what
-  makes a small gap readable. Two points it cannot separate are reported as
-  too close to call rather than put in an order.
+- **Ctrl-drag** the picture to draw a focus region round something that has
+  to be sharp, up to five, and ctrl-click inside one to take it away.
+  **Calibrate** fine tunes each region on its own and keeps what it read and
+  looked like at its best, then walks focus to the one position where the
+  regions are, on average, nearest their own best -- panning to every region
+  at each step. Focus is left there, the regions are coloured by what the
+  compromise cost them, and the **Report** shows each region at its best and
+  at the compromise side by side, with how far apart in focus they are and
+  how the frame leans. **Aim for** chooses, before it starts, between the
+  best average and the best worst region, and **Turn back below** how far a
+  walk goes the wrong way before it turns round. It takes a few minutes;
+  anything you do to the focus or the view stops it, live view going off does
+  not, and **View > Activity log** says what it did.
 - **Map depth** reports where each part of the picture was sharpest, as a
   colour map of the scene's depth in drive steps. It parks against the near
   stop, drives the whole way across watching for where the picture answers

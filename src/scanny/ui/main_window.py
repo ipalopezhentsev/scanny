@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QStandardPaths,
     QEvent,
     QObject,
     QRect,
@@ -13,6 +14,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QThread,
+    QTimer,
     QUrl,
     Signal,
     Slot,
@@ -42,7 +44,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..camera.nikon import NikonCamera, Setting
-from .depth import LEVELS, as_steps_image, colourise, ramp_colour
+from .depth import LEVELS, as_steps_image, colourise
+from .activity import ActivityLog, ActivityWindow
 from .depthview import DepthView
 from .histogram import HistogramWidget
 from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES, source_fps
@@ -50,7 +53,18 @@ from .liveview import LiveViewWidget
 from .naming import DEFAULT_PREFIX, MAX_NUMBER, format_name
 from .navigator import NavigatorWidget
 from .orientation import Orientation
-from .points import BOX, MAX_POINTS, MIN_BOX, Point, ordering, summarise
+from .regionchart import RegionChart
+from .regions import (
+    MAX_REGIONS,
+    OBJECTIVES,
+    TURN_BACK,
+    TURN_BACK_RANGE,
+    Region,
+    clock,
+    colour_for,
+    summarise,
+)
+from .report import CalibrationReportDialog
 from .trend import TrendGraph
 from .worker import _FRAME_INTERVAL_MS, CameraWorker
 
@@ -93,12 +107,6 @@ _FINE_INCREMENT = "minimum"
 
 #: The grids the depth map offers, coarsest first. Level numbers are the
 #: pyramid's own; see :mod:`scanny.ui.depth`.
-#: How near a ctrl-click has to be to a point already placed before it means
-#: "take that one away" rather than "put another one here". The same reach
-#: the picture uses for its tooltips, so what you can hover is what you can
-#: remove.
-_POINT_REACH = 0.05
-
 _DEPTH_DETAIL = (("Coarse", 0), ("Medium", 1), ("Fine", LEVELS - 1))
 
 #: Where a freshly switched-on measurement area starts: a third of the frame,
@@ -111,6 +119,11 @@ _DEFAULT_MEASURE_AREA = (1 / 3, 1 / 3, 1 / 3, 1 / 3)
 #: were fractions of the picture on screen and are now fractions of the whole
 #: frame, and one read as the other is a rectangle nobody drew.
 _MEASURE_AREA_KEY = "focus/sharpness_frame_rect"
+
+#: Where the focus regions are remembered between runs, as fractions of the
+#: whole frame. A copy stand is set up once and then scanned from for hours,
+#: so the regions drawn round the corners of its carrier are worth keeping.
+_REGIONS_KEY = "focus/regions"
 
 #: The shape of a live-view picture: what a D750 sends in its photo position,
 #: 640x424. The window opens this shape so the picture fills the image area
@@ -252,13 +265,14 @@ class MainWindow(QMainWindow):
     requestDepthMap = Signal(int, int, int, bool)
     requestDepthCancel = Signal()
     requestDepthDetail = Signal(int)  # which grid to draw the map at
-    #: The places on the picture to be measured, and how wide a box to read
-    #: around each. Sent whole on every change, since either may move.
-    requestFocusPoints = Signal(object, float)
-    #: Measure them: stops per pass, passes, the lens minimum, and whether to
-    #: cover only what the last scan found.
-    requestPointScan = Signal(int, int, int, bool, bool, int)
-    requestPointCancel = Signal()
+    #: The focus regions, as fractions of the whole frame. Sent whole on every
+    #: change, since any of them may move.
+    requestFocusRegions = Signal(object)
+    #: Calibrate them, walking in this many drive steps -- the lens minimum --
+    #: aiming for one of scanny.ui.regions.OBJECTIVES, and turning a walk back
+    #: once it has fallen below this percentage of its best.
+    requestCalibration = Signal(int, str, int, bool)
+    requestCalibrationCancel = Signal()
     #: Naming for downloaded pictures: on, the prefix, and the next number.
     #: Sent whole on every change, since an override may touch any of them.
     requestNaming = Signal(bool, str, int)
@@ -281,18 +295,31 @@ class MainWindow(QMainWindow):
         self._measure_area = _DEFAULT_MEASURE_AREA
         self._mapping = False
         self._depth_map = None
-        # The places someone ctrl-clicked, and what the last scan made of
-        # them. The points outlive a scan; the findings do not.
+        # The rectangles someone ctrl-dragged, and what the last calibration
+        # made of them. The regions outlive a calibration; the report does not.
         #
         # Fractions of the **whole sensor frame**, not of the picture on
-        # screen: that is what keeps a point on the thing it was put on when
-        # the view is magnified. See scanny.ui.points.Point.
-        self._points: "list[tuple[float, float]]" = []
-        # What a measured position is counted from, which the magnified scan
-        # changes -- it never parks, so it has no near stop to count from.
-        self._points_datum = "the near stop"
-        self._found = None
-        self._scanning = False
+        # screen: that is what keeps a region on the thing it was drawn round
+        # when the view is magnified. See scanny.ui.regions.Region.
+        self._regions: "list[tuple[float, float, float, float]]" = (
+            self._stored_regions()
+        )
+        self._report = None
+        self._calibrating = False
+        # Which region the calibration is fine tuning, drawn dashed, or -1.
+        self._active_region = -1
+        self._report_dialog: "CalibrationReportDialog | None" = None
+        #: Everything the worker says, kept with the time: see scanny.ui.activity.
+        self.activity = ActivityLog(self)
+        self._activity_window: "ActivityWindow | None" = None
+        # When the calibration running now began, and the last thing it said
+        # it was doing: the clock in front of that is kept by the window, so
+        # that it keeps going while the worker is busy between two probes.
+        self._calibration_began: "float | None" = None
+        self._progress_said = ""
+        self._clock = QTimer(self)
+        self._clock.setInterval(1000)
+        self._clock.timeout.connect(self._show_progress)
         # Set while the counter is being written into the box by the worker
         # rather than by the user, so it is not mistaken for an override.
         self._updating_naming = False
@@ -390,7 +417,8 @@ class MainWindow(QMainWindow):
         self.view.panStepped.connect(self.requestPan)
         self.view.focusStepped.connect(self._step_focus)
         self.view.measureAreaSelected.connect(self._on_measure_area_selected)
-        self.view.pointPlaced.connect(self._on_point_placed)
+        self.view.regionDrawn.connect(self._on_region_drawn)
+        self.view.regionClicked.connect(self._on_region_clicked)
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -524,7 +552,7 @@ class MainWindow(QMainWindow):
         column.addWidget(self._build_live_view_box())
         column.addWidget(self._build_view_box())
         column.addWidget(self._build_focus_box())
-        column.addWidget(self._build_points_box())
+        column.addWidget(self._build_regions_box())
         column.addWidget(self._build_depth_box())
         column.addWidget(self._build_exposure_box())
         column.addWidget(self._build_capture_box())
@@ -647,7 +675,8 @@ class MainWindow(QMainWindow):
         column.addWidget(self.orientation_label)
 
         hint = WrappedLabel(
-            "The image, the navigator and the depth map all follow. The "
+            "The image, the navigator, the depth map and the focus report "
+            "all follow. The "
             "histogram, the readings and the pictures the camera saves do "
             "not: this changes what you are looking at, not what is measured "
             "or recorded."
@@ -767,6 +796,8 @@ class MainWindow(QMainWindow):
         self.view.set_orientation(orientation)
         self.navigator.set_orientation(orientation)
         self.depth_view.set_orientation(orientation)
+        if self._report_dialog is not None:
+            self._report_dialog.set_orientation(orientation)
         # The histogram is deliberately not on that list. It is read to judge
         # exposure and clipping in what the camera is recording, and inverting
         # it would report a blown highlight as a blocked shadow -- the one
@@ -1073,160 +1104,198 @@ class MainWindow(QMainWindow):
         self.requestSharpness.emit(enabled)
         self._apply_measure_area()
 
-    def _build_points_box(self) -> QGroupBox:
-        """How far apart, in focus, are a few places you point at.
+    def _build_regions_box(self) -> QGroupBox:
+        """Several places to be sharp at once, and one focus for all of them.
 
-        The depth map's question asked of five boxes instead of two thousand
-        zones, which is what makes it answerable: the boxes are large, and they
-        have something in them because a person looked before clicking.
+        Fine tuning answers where one rectangle is sharpest. This answers
+        where a handful of them are sharpest *together* -- each one fine tuned
+        on its own first, so that what the compromise cost each of them can be
+        said, and shown. See :mod:`scanny.ui.regions`.
         """
-        box = QGroupBox("Distance between points")
+        box = QGroupBox("Focus regions")
         column = QVBoxLayout(box)
         column.setSpacing(4)
 
-        self.points_hint = WrappedLabel(
-            "Ctrl-click the picture to put a point where you want it measured, "
-            f"up to {MAX_POINTS}. Ctrl-click one again to take it away. Points "
-            f"stick to the sensor, so place them on the whole frame and they "
-            f"stay on the same subject however far you magnify."
+        self.regions_hint = WrappedLabel(
+            "Ctrl-drag on the picture to draw a region that has to be sharp, "
+            f"up to {MAX_REGIONS}; ctrl-click inside one to take it away. "
+            "Regions stick to the sensor, so they stay on their subject however "
+            "far you magnify."
         )
-        self.points_hint.setStyleSheet("color: #888; font-size: 11px;")
-        column.addWidget(self.points_hint)
+        self.regions_hint.setStyleSheet("color: #888; font-size: 11px;")
+        column.addWidget(self.regions_hint)
 
-        self.points_result = WrappedLabel("")
-        self.points_result.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.points_result.setToolTip(
-            "The points in order, nearest focus first, and how many drive steps "
-            "each is behind the nearest. Hover a point on the picture for the "
-            "whole of what was found there."
+        self.regions_result = WrappedLabel("")
+        self.regions_result.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.regions_result.setToolTip(
+            "How near its own best the compromise left each region, on "
+            "average, and which one gave up the most. Hover a region on the "
+            "picture for its own numbers, or open the report to see them."
         )
-        column.addWidget(self.points_result)
+        column.addWidget(self.regions_result)
 
-        settings = QSettings()
-        form = QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setHorizontalSpacing(6)
-        form.setVerticalSpacing(4)
+        # What the calibration is doing, kept in front of you while it runs:
+        # it takes minutes, and the status bar is where everything else lands.
+        self.regions_progress = WrappedLabel("")
+        self.regions_progress.setStyleSheet("color: #888; font-size: 11px;")
+        self.regions_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(self.regions_progress)
 
-        self.points_box_size = QSpinBox()
-        self.points_box_size.setRange(int(MIN_BOX * 100), 40)
-        self.points_box_size.setSuffix("%")
-        self.points_box_size.setValue(
-            _stored_int(settings, "points/box", int(BOX * 100), int(MIN_BOX * 100), 40)
+        # Every region through the search for the compromise, one line each,
+        # so that which region is peaking when can be watched rather than
+        # guessed from the one combined number. Hidden until there is a search.
+        self.regions_chart = RegionChart(compact=True)
+        self.regions_chart.setToolTip(
+            "Each region's sharpness as a share of its own best at every probe "
+            "of the search, and the number the search climbs dashed over them. "
+            "Shaded behind is what the search was doing: walking out, walking "
+            "across every region's peak, and going home to the best."
         )
-        self.points_box_size.setToolTip(
-            "How much of the picture is read around each point, across. Wide "
-            "enough to hold some subject, narrow enough that two points do not "
-            "read the same thing. The box is square on screen, so this is its "
-            "width as a fraction of the frame's."
-        )
-        self.points_box_size.valueChanged.connect(self._on_points_changed)
-        self.points_box_size.editingFinished.connect(self.view.setFocus)
-        form.addRow("Box", self.points_box_size)
+        self.regions_chart.setVisible(False)
+        column.addWidget(self.regions_chart)
 
-        self.points_stops = QSpinBox()
-        self.points_stops.setRange(8, 200)
-        self.points_stops.setValue(_stored_int(settings, "points/stops", 40, 8, 200))
-        self.points_stops.setToolTip(
-            "How many places along the travel the sweep stops to read every "
-            "point. All of them are read off the same frame, so this is the "
-            "whole of what a scan costs -- about half a second a stop."
+        # Chosen before the search starts, because it is what the search
+        # climbs: the two can end in different places, and a report made by
+        # one cannot be read as if it had been made by the other.
+        aim = QHBoxLayout()
+        aim.setContentsMargins(0, 0, 0, 0)
+        aim.addWidget(QLabel("Aim for"))
+        self.regions_objective = QComboBox()
+        for key, name in OBJECTIVES.items():
+            self.regions_objective.addItem(name, key)
+        self.regions_objective.setToolTip(
+            "What the one focus position is chosen to do for the regions, each "
+            "measured as a share of its own best.\n\n"
+            "The best average: the highest average of those shares. It can be "
+            "bought with one region's sharpness -- where the regions are further "
+            "apart in focus than each is deep, the best average may stand on one "
+            "region's peak with the others well short of theirs.\n\n"
+            "The best worst region: the softest region made as sharp as it can "
+            "be, whatever that costs the sharpest. No region is sacrificed."
         )
-        self.points_stops.editingFinished.connect(self.view.setFocus)
-        form.addRow("Stops per pass", self.points_stops)
+        stored = str(QSettings().value("regions/objective", "average"))
+        self.regions_objective.setCurrentIndex(
+            max(0, self.regions_objective.findData(stored))
+        )
+        self.regions_objective.currentIndexChanged.connect(self._on_objective_changed)
+        aim.addWidget(self.regions_objective, 1)
+        column.addLayout(aim)
 
-        self.points_passes = QSpinBox()
-        self.points_passes.setRange(1, 6)
-        self.points_passes.setValue(_stored_int(settings, "points/passes", 3, 1, 6))
-        self.points_passes.setToolTip(
-            "How many times it comes back over the stretch the last pass found "
-            "the points in, each time in a finer step. The magnified scan is "
-            "one pass by construction: its bracket is already fine, and a "
-            "second pass would have to reverse the lens."
+        # How far a walk of the search goes the wrong way before it turns
+        # round. Chosen before it starts, for the same reason as the aim.
+        turn = QHBoxLayout()
+        turn.setContentsMargins(0, 0, 0, 0)
+        turn.addWidget(QLabel("Turn back below"))
+        self.regions_turn_back = QSpinBox()
+        low, high = TURN_BACK_RANGE
+        self.regions_turn_back.setRange(round(low * 100), round(high * 100))
+        self.regions_turn_back.setSingleStep(5)
+        self.regions_turn_back.setSuffix("% of the best")
+        self.regions_turn_back.setValue(
+            _stored_int(
+                QSettings(),
+                "regions/turn_back",
+                round(TURN_BACK * 100),
+                round(low * 100),
+                round(high * 100),
+            )
         )
-        self.points_passes.editingFinished.connect(self.view.setFocus)
-        form.addRow("Passes", self.points_passes)
+        self.regions_turn_back.setToolTip(
+            "While it looks for the compromise, the search walks focus one way "
+            "and then back across every region's best. A walk turns round once "
+            "the number it is climbing -- the average, or the worst region -- "
+            "has fallen below this share of the best it reached on that walk. "
+            "Only a region visibly climbing towards its own best -- a hill "
+            "just beyond a valley -- is waited for, and only a few steps.\n\n"
+            "Higher turns back sooner and saves time: at 80% a walk never goes "
+            "far into focus where the regions are all soft, and on one frame "
+            "of film that costs nothing. Lower lets it walk further, which only "
+            "matters when regions are so far apart in focus that the best "
+            "compromise lies beyond a valley where every region is soft."
+        )
+        self.regions_turn_back.valueChanged.connect(
+            lambda value: QSettings().setValue("regions/turn_back", value)
+        )
+        self.regions_turn_back.editingFinished.connect(self.view.setFocus)
+        turn.addWidget(self.regions_turn_back, 1)
+        column.addLayout(turn)
 
-        self.points_around = QSpinBox()
-        self.points_around.setRange(20, 4000)
-        self.points_around.setSingleStep(50)
-        self.points_around.setSuffix(" steps")
-        self.points_around.setValue(
-            _stored_int(settings, "points/around", 400, 20, 4000)
+        # Depths are for levelling the film, which is done once when the
+        # stand is set up rather than for every frame -- and they cost the
+        # walking the compromise does not need, so they are asked for.
+        self.regions_depths = QCheckBox("Measure depths for levelling")
+        self.regions_depths.setToolTip(
+            "Also walk far enough past every region's best to place its peak, "
+            "and so say how far apart in focus the regions are, how the film's "
+            "edges lean and how far it bows between them -- the Film shape page "
+            "of the report.\n\n"
+            "It costs time: a broad region takes a long way to fall far enough "
+            "to be placed, and all that way a sharp one is going soft, which "
+            "the compromise itself does not need. Tick it when levelling the "
+            "film, and leave it off for calibrating frames."
         )
-        self.points_around.setToolTip(
-            "How far either side of where autofocus landed the magnified scan "
-            "sweeps. It has to clear two things: how far apart in focus the "
-            "points really are, and the play in the focus gearing, which the "
-            "backing-off has to take up before the sweep starts. Too small and "
-            "the far points fall outside the bracket -- the sweep will drive on "
-            "to reach them, but a point nearer than the first one cannot be "
-            "reached at all without starting again."
+        self.regions_depths.setChecked(
+            bool(QSettings().value("regions/depths", False, bool))
         )
-        self.points_around.editingFinished.connect(self.view.setFocus)
-        form.addRow("Around AF", self.points_around)
-        column.addLayout(form)
-
-        self.points_magnified = QCheckBox("Magnify onto each point")
-        self.points_magnified.setChecked(
-            settings.value("points/magnified", True, bool)
+        self.regions_depths.toggled.connect(
+            lambda on: QSettings().setValue("regions/depths", on)
         )
-        self.points_magnified.setToolTip(
-            "Measure at the body's strongest magnification, panning to each "
-            "point in turn at every stop of the sweep.\n\n"
-            "This is what makes a small difference readable: a step of focus "
-            "moves the picture in proportion to how much the view is "
-            "magnified, so two things a hundred steps apart that are lost in "
-            "the grain on a whole frame are obvious at 18.8x. Focus is not "
-            "touched while the camera pans, so every reading at a stop still "
-            "belongs to that one position on one drive -- which is what makes "
-            "the points comparable.\n\n"
-            "It starts by autofocusing on point 1 and sweeps a bracket around "
-            "that rather than parking and sweeping the whole travel, so the "
-            "positions it reports are counted from where the bracket began. "
-            "The gaps between the points, which are the answer, are the same "
-            "either way.\n\n"
-            "Turn it off to sweep the whole travel on the frame as it is: "
-            "faster, and the only thing to do when the points have no edges "
-            "for autofocus to lock onto."
-        )
-        self.points_magnified.toggled.connect(self._on_points_magnified)
-        column.addWidget(self.points_magnified)
+        column.addWidget(self.regions_depths)
 
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
-        self.points_button = QPushButton("Measure points")
-        self.points_button.setToolTip(
-            "Sweep focus one way, once, reading every point off the same "
-            "stops. That is what makes the answers comparable: one pass "
-            "driving one way puts every reading in one coordinate, where five "
-            "separate hunts would each finish wherever the play in the gearing "
-            "left them."
+        self.calibrate_button = QPushButton("Calibrate")
+        self.calibrate_button.setToolTip(
+            "First each region on its own: magnified onto it, autofocus aimed "
+            "at it, then walked in minimum steps to the best it reads -- "
+            "exactly what Fine tune focus does -- and that reading and the "
+            "picture of it kept.\n\n"
+            "Then one focus for all of them: the camera is panned to every "
+            "region at each step, each is read against its own best, and focus "
+            "is walked across all of their peaks and back to where the "
+            "average of those shares is highest. Nothing is driven to a "
+            "remembered step count, so play in the gearing costs it nothing.\n\n"
+            "Focus is left on the compromise; the view is put back."
         )
-        self.points_button.clicked.connect(self._toggle_point_scan)
-        buttons.addWidget(self.points_button, 1)
+        self.calibrate_button.clicked.connect(self._toggle_calibration)
+        buttons.addWidget(self.calibrate_button, 1)
 
-        self.points_clear = QPushButton("Clear")
-        self.points_clear.setToolTip("Take all the points off the picture")
-        self.points_clear.clicked.connect(self._clear_points)
-        buttons.addWidget(self.points_clear)
+        self.report_button = QPushButton("Report...")
+        self.report_button.setToolTip(
+            "Every region at its own best and at the compromise, side by side "
+            "with the numbers, shown the way the view is."
+        )
+        self.report_button.clicked.connect(self._show_report)
+        buttons.addWidget(self.report_button)
+
+        self.regions_clear = QPushButton("Clear")
+        self.regions_clear.setToolTip("Take all the regions off the picture")
+        self.regions_clear.clicked.connect(self._clear_regions)
+        buttons.addWidget(self.regions_clear)
         column.addLayout(buttons)
 
-        self._on_points_magnified(self.points_magnified.isChecked())
-        self._show_points()
+        self._show_regions()
         return box
 
-    # -- placing and showing them ------------------------------------------
+    # -- drawing and showing them ------------------------------------------
 
-    def _on_points_magnified(self, magnified: bool) -> None:
-        """Only one of the two shapes of scan is being described at a time."""
-        QSettings().setValue("points/magnified", magnified)
-        self.points_around.setEnabled(magnified)
-        self.points_passes.setEnabled(not magnified)
+    @staticmethod
+    def _stored_regions() -> "list[tuple[float, float, float, float]]":
+        """The regions drawn last time, or none."""
+        stored = str(QSettings().value(_REGIONS_KEY, "") or "")
+        regions = []
+        for part in stored.split(";"):
+            try:
+                numbers = tuple(float(value) for value in part.split(","))
+            except ValueError:
+                continue
+            if len(numbers) == 4 and numbers[2] > 0 and numbers[3] > 0:
+                regions.append(numbers)
+        return regions[:MAX_REGIONS]
 
     @property
     def _crop(self) -> "tuple[float, float, float, float]":
-        """Which part of the frame is on screen, as the points' coordinates.
+        """Which part of the frame is on screen, as the regions' coordinates.
 
         The whole of it when there is no frame yet, so that a click before the
         first one arrives still means what it looks like it means.
@@ -1234,173 +1303,249 @@ class MainWindow(QMainWindow):
         frame = self.view.frame
         return (0.0, 0.0, 1.0, 1.0) if frame is None else frame.crop_normalised
 
-    @Slot(float, float)
-    def _on_point_placed(self, x: float, y: float) -> None:
-        """A ctrl-click: add a point here, or take away the one already here.
-
-        In fractions of the picture on screen, which is all a click can be,
-        and stored in fractions of the sensor's frame, which is the only
-        coordinate that survives magnifying. Taking one away is judged on
-        screen rather than on the sensor, so that what can be clicked off is
-        exactly the ring that is under the pointer at whatever zoom.
-        """
-        left, top, width, height = self._crop
-        for index, (px, py) in enumerate(self._points):
-            seen = Point(px, py).seen_in((left, top, width, height))
-            if seen is not None and Point(*seen).near(x, y, _POINT_REACH):
-                del self._points[index]
-                self._on_points_changed()
-                return
-        if len(self._points) >= MAX_POINTS:
+    @Slot(float, float, float, float)
+    def _on_region_drawn(self, x: float, y: float, w: float, h: float) -> None:
+        """A ctrl-drag: a new region, already in fractions of the whole frame."""
+        if self._calibrating:
             self.statusBar().showMessage(
-                f"That is as many points as it will measure at once "
-                f"({MAX_POINTS}). Ctrl-click one to take it away first.",
+                "Stop the calibration before changing the regions.", 6000
+            )
+            return
+        if len(self._regions) >= MAX_REGIONS:
+            self.statusBar().showMessage(
+                f"That is as many regions as it will calibrate at once "
+                f"({MAX_REGIONS}). Ctrl-click inside one to take it away first.",
                 6000,
             )
             return
-        self._points.append((left + x * width, top + y * height))
-        self._on_points_changed()
+        self._regions.append((x, y, w, h))
+        self._on_regions_changed()
 
-    def _clear_points(self) -> None:
-        self._points = []
-        self._on_points_changed()
+    @Slot(float, float)
+    def _on_region_clicked(self, x: float, y: float) -> None:
+        """A ctrl-click: take away the region under it.
 
-    def _on_points_changed(self) -> None:
-        """Tell the worker, and forget what the last scan said about them.
-
-        A point that moved is a different question, and a box that changed size
-        is a different one again: the readings either side of that are of
-        different parts of the picture.
+        In fractions of the picture on screen, which is all a click can be,
+        and turned through the crop into the frame the regions live in. The
+        smallest one under the pointer goes, if several overlap -- it is the
+        one that cannot be clicked any other way.
         """
-        QSettings().setValue("points/box", self.points_box_size.value())
-        self._found = None
-        self.requestFocusPoints.emit(
-            list(self._points), self.points_box_size.value() / 100.0
-        )
-        self._show_points()
-
-    def _show_points(self) -> None:
-        """Draw them on the picture and write the order out underneath."""
-        off = self._draw_points()
-        found = self._found
-        self.points_result.setText(
-            ordering(found) if found else
-            ("Ctrl-click at least two points, then measure" if len(self._points) < 2
-             else f"{len(self._points)} points placed, not yet measured")
-            + (
-                f" ({off} off screen at this magnification)"
-                if off and not found
-                else ""
+        left, top, width, height = self._crop
+        spot = (left + x * width, top + y * height)
+        under = [
+            (rect[2] * rect[3], index)
+            for index, rect in enumerate(self._regions)
+            if Region(*rect).contains(*spot)
+        ]
+        if not under:
+            self.statusBar().showMessage(
+                "Ctrl-drag to draw a focus region; ctrl-click inside one to "
+                "take it away.",
+                6000,
             )
-        )
-        self.points_button.setEnabled(len(self._points) >= 2 or self._scanning)
-        self.points_clear.setEnabled(bool(self._points) and not self._scanning)
+            return
+        if self._calibrating:
+            self.statusBar().showMessage(
+                "Stop the calibration before changing the regions.", 6000
+            )
+            return
+        del self._regions[min(under)[1]]
+        self._on_regions_changed()
 
-    def _draw_points(self) -> int:
+    def _clear_regions(self) -> None:
+        self._regions = []
+        self._on_regions_changed()
+
+    def _on_regions_changed(self) -> None:
+        """Remember them, tell the worker, and forget the last report.
+
+        A region that moved is a different question, and one more region is a
+        different compromise.
+        """
+        QSettings().setValue(
+            _REGIONS_KEY,
+            ";".join(",".join(f"{v:.5f}" for v in rect) for rect in self._regions),
+        )
+        self._report = None
+        self.requestFocusRegions.emit(list(self._regions))
+        self._show_regions()
+
+    def _show_regions(self) -> None:
+        """Draw them on the picture and write the answer out underneath."""
+        off = self._draw_regions()
+        report = self._report
+        if report is not None:
+            text = report.describe()
+            if report.ordering():
+                text += "\n" + report.ordering()
+        elif len(self._regions) < 2:
+            text = "Ctrl-drag at least two regions, then calibrate"
+        else:
+            text = f"{len(self._regions)} regions drawn, not yet calibrated"
+        if off and report is None and not self._calibrating:
+            text += f" ({off} off screen at this magnification)"
+        self.regions_result.setText(text)
+        self.calibrate_button.setEnabled(len(self._regions) >= 2 or self._calibrating)
+        self.regions_clear.setEnabled(bool(self._regions) and not self._calibrating)
+        self.regions_objective.setEnabled(not self._calibrating)
+        self.regions_turn_back.setEnabled(not self._calibrating)
+        self.regions_depths.setEnabled(not self._calibrating)
+        self.report_button.setEnabled(report is not None)
+
+    def _draw_regions(self) -> int:
         """Put them on the picture and on the navigator; answer how many are off.
 
-        Called for every frame, because where a point falls on the picture is
-        a property of the frame and not of the point: the crop moves whenever
-        the view is magnified or panned, and a ring left where the last crop
-        put it is a ring pointing at the wrong thing.
-
-        The navigator gets all of them whatever the crop is doing, which is the
-        whole use of it here -- magnified, it is the only place the points that
-        are off screen can be seen at all.
+        Called for every frame, because where a region falls on the picture
+        is a property of the frame and not of the region: the crop moves
+        whenever the view is magnified or panned. The navigator gets all of
+        them whatever the crop is doing -- magnified, it is the only place the
+        ones off screen can be seen at all.
         """
-        found = self._found
+        report = self._report
         crop = self._crop
         drawn, whole, off = [], [], 0
-        for index, (x, y) in enumerate(self._points):
-            answer = found[index] if found is not None and index < len(found) else None
-            colour = self._point_colour(answer, found)
-            whole.append((x, y, index + 1, colour))
-            seen = Point(x, y).seen_in(crop)
+        for index, rect in enumerate(self._regions):
+            result = (
+                report.results[index]
+                if report is not None and index < len(report.results)
+                else None
+            )
+            colour = colour_for(result)
+            whole.append((rect, index + 1, colour))
+            seen = Region(*rect).seen_in(crop)
             if seen is None:
                 off += 1
                 continue
+            active = self._calibrating and index == self._active_region
             drawn.append(
-                (
-                    seen[0],
-                    seen[1],
-                    index + 1,
-                    colour,
-                    self._point_text(index, answer),
-                )
+                (seen, index + 1, colour, summarise(result, index + 1), active)
             )
-        self.view.set_points(drawn)
-        self.navigator.set_points(whole)
+        self.view.set_regions(drawn)
+        self.navigator.set_regions(whole)
         return off
 
-    @staticmethod
-    def _point_colour(answer, found) -> str:
-        """White until it has an answer, then near-to-far along the depth ramp.
+    # -- calibrating them --------------------------------------------------
 
-        The same ramp the depth map uses, so near and far read the same way in
-        both places.
-        """
-        if answer is None or not answer.known:
-            return "#ebebeb"
-        placed = [one.steps for one in found if one.known]
-        near, far = min(placed), max(placed)
-        fraction = 0.0 if far <= near else (answer.steps - near) / (far - near)
-        red, green, blue = ramp_colour(fraction)
-        return f"#{red:02x}{green:02x}{blue:02x}"
-
-    def _point_text(self, index: int, answer) -> str:
-        if answer is None:
-            return (
-                f"Point {index + 1}: placed, not yet measured.\n"
-                f"Press Measure points, or ctrl-click here again to remove it."
-            )
-        return summarise(answer, index + 1, self._found, self._points_datum)
-
-    @Slot(object)
-    def _on_points_found(self, found) -> None:
-        self._found = found
-        self._show_points()
-
-    def _toggle_point_scan(self) -> None:
-        if self._scanning:
-            self.requestPointCancel.emit()
+    def _toggle_calibration(self) -> None:
+        if self._calibrating:
+            self.requestCalibrationCancel.emit()
             return
-        settings = QSettings()
-        settings.setValue("points/stops", self.points_stops.value())
-        settings.setValue("points/passes", self.points_passes.value())
-        settings.setValue("points/around", self.points_around.value())
-        magnified = self.points_magnified.isChecked()
-        # A magnified scan never parks, so what it counts from is where its
-        # bracket began. Saying "from the near stop" about those numbers would
-        # be saying something untrue; the gaps are the answer either way.
-        self._points_datum = (
-            "where the sweep began" if magnified else "the near stop"
-        )
-        self.requestPointScan.emit(
-            self.points_stops.value(),
-            self.points_passes.value(),
+        self.requestCalibration.emit(
             self._focus_steps[_FINE_INCREMENT].value(),
-            False,
-            magnified,
-            self.points_around.value(),
+            str(self.regions_objective.currentData()),
+            self.regions_turn_back.value(),
+            self.regions_depths.isChecked(),
         )
+
+    def _on_objective_changed(self) -> None:
+        QSettings().setValue("regions/objective", self.regions_objective.currentData())
+        # The combo needed the keyboard for its popup; give it back to the
+        # image, as every other combo here does.
+        self.view.setFocus()
 
     @Slot(bool)
-    def _on_point_scan_changed(self, scanning: bool) -> None:
-        self._scanning = scanning
-        self.points_button.setText("Stop" if scanning else "Measure points")
-        for control in (
-            self.points_stops,
-            self.points_box_size,
-            self.points_around,
-            self.points_magnified,
-        ):
-            control.setEnabled(not scanning)
-        self.points_passes.setEnabled(
-            not scanning and not self.points_magnified.isChecked()
+    def _on_calibration_changed(self, calibrating: bool) -> None:
+        self._calibrating = calibrating
+        self.calibrate_button.setText("Stop" if calibrating else "Calibrate")
+        if calibrating:
+            self._calibration_began = time.monotonic()
+            self._progress_said = ""
+            self._clock.start()
+            self.regions_chart.clear()
+            self.regions_chart.set_combined_name(
+                str(self.regions_objective.currentData())
+            )
+            self.regions_chart.setVisible(False)
+            self._show_progress()
+        else:
+            self._clock.stop()
+            self._calibration_began = None
+            self._active_region = -1
+            self.regions_progress.setText("")
+        self._show_regions()
+
+    @Slot(object)
+    def _on_calibration_report(self, report) -> None:
+        """What a calibration found, or None when there is nothing to show.
+
+        A calibration that ran to the end opens its report by itself: it took
+        minutes, and the report is what it was for. One that was stopped only
+        colours the regions it got to.
+        """
+        finished = self._calibrating and report is not None and not report.stopped
+        self._report = report
+        self._show_regions()
+        if report is None:
+            return
+        if self._report_dialog is not None:
+            self._report_dialog.set_report(report)
+        if finished:
+            self._show_report()
+
+    @Slot(int, str)
+    def _on_calibration_progress(self, index: int, text: str) -> None:
+        self._active_region = index
+        if text:
+            self._progress_said = text
+        self._show_progress()
+        self._draw_regions()
+
+    def _show_progress(self) -> None:
+        """How long the calibration has run, and what it is doing now."""
+        if self._calibration_began is None:
+            return
+        running = clock(time.monotonic() - self._calibration_began)
+        said = self._progress_said or "starting"
+        self.regions_progress.setText(f"{running}  --  {said}")
+
+    @Slot(object, str, object, float)
+    def _on_calibration_probe(self, regions, stage: str, shares, combined: float) -> None:
+        """One probe of the compromise, for the chart of every region."""
+        self.regions_chart.add(regions, stage, shares, combined)
+        self.regions_chart.setVisible(True)
+
+    def _show_report(self) -> None:
+        report = self._report
+        if report is None:
+            return
+        if self._report_dialog is None:
+            self._report_dialog = CalibrationReportDialog(
+                report,
+                self._orientation,
+                self._save_directory(),
+                self,
+                aspect=self._frame_shape(),
+            )
+        else:
+            self._report_dialog.set_report(report)
+            self._report_dialog.set_orientation(self._orientation)
+        self._report_dialog.show()
+        self._report_dialog.raise_()
+        self._report_dialog.activateWindow()
+
+    def _frame_shape(self) -> float:
+        """The sensor frame's width over its height, for drawing the film."""
+        frame = self.view.frame
+        if frame is None or not frame.image_height:
+            return 1.5
+        return frame.image_width / frame.image_height
+
+    def _show_activity(self) -> None:
+        """The activity log, in a window of its own that follows it as it grows."""
+        if self._activity_window is None:
+            self._activity_window = ActivityWindow(self.activity, self)
+        self._activity_window.show()
+        self._activity_window.raise_()
+        self._activity_window.activateWindow()
+
+    def _save_directory(self) -> Path:
+        """Where pictures are being saved, which is where a report goes too."""
+        worker = getattr(self, "worker", None)
+        return (
+            worker.save_directory
+            if worker is not None
+            else Path.home() / "Pictures" / "scanny"
         )
-        if not scanning:
-            self._on_points_magnified(self.points_magnified.isChecked())
-        self._show_points()
 
     def _build_depth_box(self) -> QGroupBox:
         """Mapping how far away each part of the scene is, by sweeping focus.
@@ -2058,6 +2203,15 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("&View")
         view_menu.addAction(self.invert_action)
         view_menu.addSeparator()
+        activity = QAction("&Activity log...", self)
+        activity.setShortcut(QKeySequence("Ctrl+L"))
+        activity.setToolTip(
+            "Everything the program has done and every problem the camera "
+            "reported, with the time: where to look when something stopped."
+        )
+        activity.triggered.connect(self._show_activity)
+        view_menu.addAction(activity)
+        view_menu.addSeparator()
         for action in self._view_actions:
             view_menu.addAction(action)
 
@@ -2099,9 +2253,9 @@ class MainWindow(QMainWindow):
         self.requestDepthMap.connect(self.worker.start_depth_map)
         self.requestDepthCancel.connect(self.worker.cancel_depth_map)
         self.requestDepthDetail.connect(self.worker.set_depth_detail)
-        self.requestFocusPoints.connect(self.worker.set_focus_points)
-        self.requestPointScan.connect(self.worker.start_point_scan)
-        self.requestPointCancel.connect(self.worker.cancel_point_scan)
+        self.requestFocusRegions.connect(self.worker.set_focus_regions)
+        self.requestCalibration.connect(self.worker.start_calibration)
+        self.requestCalibrationCancel.connect(self.worker.cancel_calibration)
         self.requestDriveFocus.connect(self.worker.drive_focus)
         self.requestNaming.connect(self.worker.set_naming)
 
@@ -2117,8 +2271,10 @@ class MainWindow(QMainWindow):
         self.worker.huntChanged.connect(self._on_hunt_changed)
         self.worker.depthChanged.connect(self._on_depth_changed)
         self.worker.depthMapReady.connect(self._on_depth_map)
-        self.worker.pointsFound.connect(self._on_points_found)
-        self.worker.pointScanChanged.connect(self._on_point_scan_changed)
+        self.worker.calibrationReady.connect(self._on_calibration_report)
+        self.worker.calibrationChanged.connect(self._on_calibration_changed)
+        self.worker.calibrationProgress.connect(self._on_calibration_progress)
+        self.worker.calibrationProbe.connect(self._on_calibration_probe)
         self.worker.sweeping.connect(self.depth_sweeping.setText)
         self.worker.exposurePreviewChanged.connect(self._on_exposure_preview)
         self.worker.saveToCardChanged.connect(self._on_save_to_card)
@@ -2126,6 +2282,9 @@ class MainWindow(QMainWindow):
         self.worker.nextNumber.connect(self._on_next_number)
         self.worker.status.connect(self.statusBar().showMessage)
         self.worker.failed.connect(self._on_failed)
+        self.worker.status.connect(lambda said: self.activity.add(said, "status"))
+        self.worker.failed.connect(lambda said: self.activity.add(said, "error"))
+        self.worker.log.connect(self.activity.add)
 
         # The worker sets up its own COM apartment before touching the camera.
         self._thread.started.connect(self.worker.initialise)
@@ -2133,6 +2292,14 @@ class MainWindow(QMainWindow):
 
         self._thread.start()
         self.save_dir_label.setText(f"Saving to {self.worker.save_directory}")
+        # On disk as well, so that what happened survives the window closing
+        # or the program falling over -- which is when it is wanted.
+        folder = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppLocalDataLocation
+        )
+        if folder:
+            self.activity.write_to(Path(folder) / "activity.log")
+        self.activity.add("scanny started", "status")
         # Tell the worker what was restored from the last run; the requests are
         # queued, so they arrive once the worker's thread is up. The sharpness
         # ones cannot go out while the panel is built, since that happens
@@ -2144,7 +2311,7 @@ class MainWindow(QMainWindow):
         self.requestSharpness.emit(self.measure_sharpness.isChecked())
         self._apply_measure_area()
         self.requestDepthDetail.emit(int(self.depth_detail.currentData()))
-        self._on_points_changed()
+        self.requestFocusRegions.emit(list(self._regions))
         self.requestSaveToCard.emit(self.save_to_card.isChecked())
         self.requestShutterDelay.emit(self._chosen_shutter_delay())
         self._request_naming()
@@ -2209,10 +2376,10 @@ class MainWindow(QMainWindow):
         """
         self.view.show_frame(frame, image)
         self.navigator.show_frame(frame, image)
-        if self._points:
-            # Where a point falls on the picture depends on the crop, and the
+        if self._regions:
+            # Where a region falls on the picture depends on the crop, and the
             # crop arrives with the frame.
-            self._draw_points()
+            self._draw_regions()
         self._on_frame_histogram(image)
         self._on_frame_level(frame)
 

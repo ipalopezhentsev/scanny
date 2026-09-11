@@ -217,15 +217,15 @@ def test_a_dragged_rectangle_comes_back_the_right_way_round(view):
     assert vh * target.height() == pytest.approx(60, abs=1.5)
 
 
-def test_a_point_is_removed_by_pointing_at_where_it_is_drawn(view):
-    """The reach is measured in the frame, which is where the points are kept.
+def test_a_region_is_taken_away_by_clicking_where_it_is_drawn(view):
+    """A ctrl-click comes back in the frame, which is where regions are kept.
 
-    Ctrl-clicking a point takes it away, and the window decides that by how
-    near the click is to a point it holds. Both have to be in the same space
-    or a turned picture makes placed points impossible to remove.
+    The window decides which region a ctrl-click takes away by whether the
+    click is inside one it holds. Both have to be in the same space or a
+    turned picture makes regions impossible to remove.
     """
-    placed = []
-    view.pointPlaced.connect(lambda x, y: placed.append((x, y)))
+    clicked = []
+    view.regionClicked.connect(lambda x, y: clicked.append((x, y)))
     view.set_orientation(TURNED)
     QApplication.processEvents()
 
@@ -237,31 +237,44 @@ def test_a_point_is_removed_by_pointing_at_where_it_is_drawn(view):
         Qt.KeyboardModifier.ControlModifier,
         pos=where,
     )
-    assert len(placed) == 1
+    assert len(clicked) == 1
     # Drawn back where it was clicked, so the pointer can find it again.
-    spot = view._at(*placed[0])
+    spot = view._at(*clicked[0])
     assert spot.x() == pytest.approx(where.x(), abs=2.0)
     assert spot.y() == pytest.approx(where.y(), abs=2.0)
 
 
-# -- the points, which are places on the sensor ---------------------------
+# -- the focus regions, which are places on the sensor ---------------------
 
 
-def _ctrl_click(widget, fx: float, fy: float) -> QPoint:
-    """Ctrl-click at a fraction of the picture as it is being *shown*."""
-    widget.repaint()  # so the rect the click lands in is the one drawn
+def _shown_at(widget, fx: float, fy: float) -> QPoint:
+    """A fraction of the picture as it is being *shown*, as a pixel."""
     target = widget._fitted_rect()
-    where = QPoint(
+    return QPoint(
         target.x() + round(fx * target.width()),
         target.y() + round(fy * target.height()),
     )
+
+
+def _ctrl_drag(widget, one, other) -> "tuple[QPoint, QPoint]":
+    """Ctrl-drag between two fractions of the picture as it is being shown."""
+    widget.repaint()  # so the rect the drag lands in is the one drawn
+    start, end = _shown_at(widget, *one), _shown_at(widget, *other)
+    ctrl = Qt.KeyboardModifier.ControlModifier
+    QTest.mousePress(widget, Qt.MouseButton.LeftButton, ctrl, start)
+    QTest.mouseMove(widget, end)
+    QTest.mouseRelease(widget, Qt.MouseButton.LeftButton, ctrl, end)
+    return start, end
+
+
+def _ctrl_click(widget, fx: float, fy: float) -> None:
+    widget.repaint()
     QTest.mouseClick(
         widget,
         Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.ControlModifier,
-        pos=where,
+        pos=_shown_at(widget, fx, fy),
     )
-    return where
 
 
 def _magnified(window) -> LiveViewFrame:
@@ -273,88 +286,83 @@ def _magnified(window) -> LiveViewFrame:
     return shown
 
 
-def test_a_point_on_a_turned_magnified_picture_lands_where_the_sensor_is(window):
+def test_a_region_on_a_turned_magnified_picture_lands_where_the_sensor_is(window):
     """Where the two transforms meet, and the one place either could hide the
     other's absence.
 
-    A ctrl-click is a place on the screen. Getting from there to a place on the
-    sensor is the arrangement undone *and then* the crop applied, and dropping
-    either leaves a point that still looks plausible on the picture and is on
-    the wrong piece of the world.
+    A ctrl-drag is two places on the screen. Getting from there to places on
+    the sensor is the arrangement undone *and then* the crop applied, and
+    dropping either leaves a region that still looks plausible on the picture
+    and is on the wrong piece of the world.
     """
     window._apply_orientation(TURNED)
     _magnified(window)
-    _ctrl_click(window.view, 0.25, 0.5)
+    _ctrl_drag(window.view, (0.2, 0.4), (0.3, 0.6))
 
-    # A quarter across and half down the screen, with the picture mirrored and
-    # quarter-turned, is the middle across and three quarters down the picture
-    # -- and that picture is the quarter of the frame around (0.25, 0.75).
-    assert len(window._points) == 1
-    assert window._points[0] == pytest.approx((0.25, 0.8125), abs=0.02)
-    # Which is not where it would be with the turn left out, nor with the crop
-    # left out: both of those are somewhere else on the sensor.
-    assert window._points[0] != pytest.approx((0.1875, 0.75), abs=0.02)
-    assert window._points[0] != pytest.approx((0.5, 0.75), abs=0.02)
+    # Mirrored and quarter-turned, those corners are (0.6, 0.8) and (0.4, 0.7)
+    # of the picture -- and the picture is the quarter of the frame around
+    # (0.25, 0.75).
+    assert len(window._regions) == 1
+    assert window._regions[0] == pytest.approx((0.225, 0.8, 0.05, 0.025), abs=0.005)
 
 
-def test_a_point_is_still_taken_away_by_clicking_the_ring_you_can_see(window):
-    """The window judges that by how near the click is to where it drew the
-    point, so the drawing and the reach have to be through the same pair of
-    transforms."""
+def test_a_region_is_still_taken_away_by_clicking_inside_what_you_can_see(window):
     window._apply_orientation(TURNED)
     _magnified(window)
-    _ctrl_click(window.view, 0.25, 0.5)
-    assert len(window._points) == 1
-    _ctrl_click(window.view, 0.25, 0.5)
-    assert window._points == []
+    _ctrl_drag(window.view, (0.2, 0.4), (0.4, 0.6))
+    assert len(window._regions) == 1
+    _ctrl_click(window.view, 0.3, 0.5)
+    assert window._regions == []
 
 
-def test_the_ring_is_drawn_back_under_the_pointer_that_placed_it(window):
+def test_the_region_is_drawn_back_under_the_pointer_that_drew_it(window):
     window._apply_orientation(TURNED)
     _magnified(window)
-    where = _ctrl_click(window.view, 0.3, 0.4)
-    window._draw_points()
-    drawn = window.view._points
+    start, end = _ctrl_drag(window.view, (0.2, 0.3), (0.45, 0.6))
+    window._draw_regions()
+    drawn = window.view._regions
     assert len(drawn) == 1
-    spot = window.view._at(drawn[0][0], drawn[0][1])
-    assert spot.x() == pytest.approx(where.x(), abs=3.0)
-    assert spot.y() == pytest.approx(where.y(), abs=3.0)
+    box = window.view._box(drawn[0][0])
+    assert box.left() == pytest.approx(start.x(), abs=3.0)
+    assert box.top() == pytest.approx(start.y(), abs=3.0)
+    assert box.right() == pytest.approx(end.x(), abs=3.0)
+    assert box.bottom() == pytest.approx(end.y(), abs=3.0)
 
 
-def test_turning_the_picture_does_not_move_the_points_or_spoil_a_measurement(window):
-    """Rotating the display is not a change to what was measured.
+def test_turning_the_picture_does_not_move_the_regions_or_spoil_a_calibration(window):
+    """Rotating the display is not a change to what was calibrated.
 
-    The points are on the sensor and the transform is on the way to the
+    The regions are on the sensor and the transform is on the way to the
     screen, so turning it moves nothing behind the screen -- and the worker is
-    not told anything, which is what stops a rotation throwing away readings
-    that took a minute to make.
+    not told anything, which is what stops a rotation throwing away a
+    calibration that took minutes to make.
     """
     window.view.show_frame(frame(), picture())
     QApplication.processEvents()
-    _ctrl_click(window.view, 0.2, 0.3)
-    _ctrl_click(window.view, 0.8, 0.7)
-    was = list(window._points)
+    _ctrl_drag(window.view, (0.1, 0.2), (0.3, 0.4))
+    _ctrl_drag(window.view, (0.6, 0.6), (0.8, 0.8))
+    was = list(window._regions)
     assert len(was) == 2
 
     told = []
-    window.requestFocusPoints.connect(lambda points, box: told.append(points))
+    window.requestFocusRegions.connect(told.append)
     window._turn_view(1)
     window._flip_view(False)
-    assert window._points == was
-    assert told == [], "a turn is not a point moving"
+    assert window._regions == was
+    assert told == [], "a turn is not a region moving"
 
 
-def test_the_navigator_marks_a_point_where_the_turned_map_puts_it(window):
-    """Magnified onto one point the others are off screen, so this is the only
-    place they can be seen -- and it draws the whole frame turned like every
-    other pane."""
+def test_the_navigator_marks_a_region_where_the_turned_map_puts_it(window):
+    """Magnified onto one region the others are off screen, so this is the
+    only place they can be seen -- and it draws the whole frame turned like
+    every other pane."""
     window._apply_orientation(TURNED)
     window.navigator.show_frame(frame(), picture(60, 40))
-    window._points = [(0.1, 0.2)]
-    window._draw_points()
+    window._regions = [(0.1, 0.2, 0.1, 0.1)]
+    window._draw_regions()
     QApplication.processEvents()
 
-    assert window.navigator._points[0][:2] == (0.1, 0.2), "kept in the frame"
+    assert window.navigator._regions[0][0] == (0.1, 0.2, 0.1, 0.1), "kept in the frame"
     target = window.navigator._fitted_rect()
     spot = window.navigator._at(0.1, 0.2)
     # Mirrored then quarter-turned, (0.1, 0.2) is drawn at (0.8, 0.9) of the

@@ -482,20 +482,6 @@ class Sweep:
         self._position += self._step
         return self._step
 
-    def keep_going(self, more: int) -> None:
-        """Take *more* stops than were planned, having reached the end of them.
-
-        Only ever forward, which is the whole reason it can be done at all: a
-        pass that has not yet found the peak it was aimed at is already
-        driving the right way, so carrying on adds stops in the coordinate it
-        was already keeping. Reaching back the other way would be a reversal,
-        and a reversal takes up the play in the gearing -- which is exactly
-        what parking against the stop exists to avoid having to know about.
-        """
-        if self._done:
-            return
-        self._samples += max(0, int(more))
-
     def blocked(self) -> None:
         """The lens would not go any further: this pass is over."""
         self._done = True
@@ -659,7 +645,7 @@ def locate(
     and how wide the top of it was.
 
     *where* is the focus positions swept, and *stack* is ``(len(where), ...)``
-    -- one curve per zone of a grid, or per point someone put on the picture.
+    -- one curve per zone of a grid, or per anything else read at every stop.
     Answers ``(position, strength, at_the_limit, width)``, with ``NaN`` for a
     curve that has no peak worth reporting. The width is how much travel the
     top of the curve covers, which is what says whether a finer sweep of a

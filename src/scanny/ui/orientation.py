@@ -178,7 +178,7 @@ class Orientation:
         """A place in the frame as a place on the screen, both in fractions.
 
         What the overlays are drawn through: the focus box, the measured area
-        and the placed points all arrive in the frame's coordinates and have
+        and the focus regions all arrive in the frame's coordinates and have
         to land on the picture where the picture has been turned to.
         """
         if self.mirrored:
