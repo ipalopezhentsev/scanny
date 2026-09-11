@@ -183,6 +183,21 @@ def _shape(m: int, n: int, x, y):
     return np.sin(m * math.pi * np.asarray(x)) * np.sin(n * math.pi * np.asarray(y))
 
 
+def _rim(i: int, j: int, columns: int, rows: int) -> "list[tuple[int, int]]":
+    """Which sides of the mesh's face (i, j) lie on the frame's edge, as pairs
+    of its corners: top-left, top-right, bottom-right, bottom-left."""
+    sides = []
+    if j == 0:
+        sides.append((0, 1))
+    if i == columns - 1:
+        sides.append((1, 2))
+    if j == rows - 1:
+        sides.append((2, 3))
+    if i == 0:
+        sides.append((3, 0))
+    return sides
+
+
 # -- drawing it --------------------------------------------------------------
 
 
@@ -319,7 +334,10 @@ class FilmView(QWidget):
         across = x * math.cos(turn) - y * math.sin(turn)
         away = x * math.sin(turn) + y * math.cos(turn)
         screen_y = away * math.sin(tilt) - z * math.cos(tilt)
-        distance = away * math.cos(tilt) - z * math.sin(tilt)
+        # Square to the screen: what is drawn lower is nearer, as is what is
+        # higher, when looking down. Otherwise the sensor behind the film's
+        # near edge sorts in front of it and shows through.
+        distance = -away * math.cos(tilt) - z * math.sin(tilt)
         return across, screen_y, distance
 
     # -- painting ----------------------------------------------------------
@@ -344,8 +362,12 @@ class FilmView(QWidget):
         columns, rows = _MESH
 
         # Every face, sensor and film alike, so that whichever is nearer the
-        # eye is drawn over the other from above and from below.
-        faces: "list[tuple[float, list, QColor]]" = []
+        # eye is drawn over the other from above and from below. The sensor's
+        # outline and the film's edges -- what the holder grips -- go with the
+        # faces along them, so they are hidden by what is in front as well.
+        faces: "list[tuple[float, list, QColor, list, QPen]]" = []
+        sensor_rim = QPen(_SENSOR_EDGE, 1.2)
+        film_rim = QPen(text, 1.6)
         sensor_step = 6
         for i in range(sensor_step):
             for j in range(sensor_step):
@@ -358,7 +380,8 @@ class FilmView(QWidget):
                         (i / sensor_step, (j + 1) / sensor_step),
                     )
                 ]
-                faces.append((0.0, corners, _SENSOR))
+                rim = _rim(i, j, sensor_step, sensor_step)
+                faces.append((0.0, corners, _SENSOR, rim, sensor_rim))
         for i in range(columns):
             for j in range(rows):
                 corners = [
@@ -371,19 +394,22 @@ class FilmView(QWidget):
                     )
                 ]
                 height = sum(corner[2] for corner in corners) / 4.0
-                faces.append((height, corners, self._shade(corners, height, gap, top)))
+                colour = self._shade(corners, height, gap, top)
+                faces.append((height, corners, colour, _rim(i, j, columns, rows), film_rim))
 
         projected = [
             (
                 sum(self._project(corner)[2] for corner in corners) / 4.0,
                 [self._project(corner) for corner in corners],
                 colour,
+                rim,
+                pen,
             )
-            for _h, corners, colour in faces
+            for _h, corners, colour, rim, pen in faces
         ]
         # Fit everything to the widget, then come closer by the zoom.
-        xs = [p[0] for _d, points, _c in projected for p in points]
-        ys = [p[1] for _d, points, _c in projected for p in points]
+        xs = [p[0] for _d, points, *_rest in projected for p in points]
+        ys = [p[1] for _d, points, *_rest in projected for p in points]
         span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
         size = min(self.width(), self.height()) * 0.86 * self._zoom / span
         middle = QPointF(self.width() / 2, self.height() / 2 + 10)
@@ -396,29 +422,15 @@ class FilmView(QWidget):
             )
 
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        for _distance, points, colour in sorted(projected, key=lambda f: -f[0]):
+        for _distance, points, colour, rim, pen in sorted(projected, key=lambda f: -f[0]):
+            screen = [to_screen(p) for p in points]
             painter.setBrush(colour)
             painter.setPen(QPen(colour.darker(115), 0.6))
-            painter.drawPolygon(QPolygonF([to_screen(p) for p in points]))
-
-        # The sensor's outline, and the film's edges -- what the holder grips.
+            painter.drawPolygon(QPolygonF(screen))
+            painter.setPen(pen)
+            for start, end in rim:
+                painter.drawLine(screen[start], screen[end])
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(_SENSOR_EDGE, 1.2))
-        outline = [(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]
-        painter.drawPolyline(
-            QPolygonF([to_screen(self._project(self._world(u, v, 0.0))) for u, v in outline])
-        )
-        edge = [
-            (t, 0.0) for t in np.linspace(0, 1, columns + 1)
-        ] + [(1.0, t) for t in np.linspace(0, 1, rows + 1)] + [
-            (t, 1.0) for t in np.linspace(1, 0, columns + 1)
-        ] + [(0.0, t) for t in np.linspace(1, 0, rows + 1)]
-        painter.setPen(QPen(text, 1.6))
-        painter.drawPolyline(
-            QPolygonF(
-                [to_screen(self._project(self._film(u, v, low, scale, gap))) for u, v in edge]
-            )
-        )
 
         # Each region: its rectangle on the sensor, a line up to the film, and
         # a mark on the film where it was measured.

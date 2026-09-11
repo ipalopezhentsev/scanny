@@ -43,6 +43,7 @@ from scanny.ui.regions import (  # noqa: E402
     Calibration,
     CalibrationReport,
     Look,
+    Reading,
     Region,
     RegionResult,
     View,
@@ -228,13 +229,16 @@ def _walked(
     places=None,
     turn_back: float = TURN_BACK,
     depths: bool = False,
+    tuned=None,
 ) -> "tuple[Calibration, float]":
     """Run the compromise against modelled regions; answer it and where it ended.
 
     *curves* is one function per region, reading against focus position. The
     optics are carried between two faces of the driver, *slack* steps apart,
     so a reversal moves nothing until the play is taken up -- and it is where
-    the optics end up that is answered, not where the steps say.
+    the optics end up that is answered, not where the steps say. *tuned* is
+    what share of its true peak each region's fine tune read, if not all of
+    it.
     """
     rng = np.random.default_rng(seed)
     regions = places or [Region(0.2 * n, 0.2, 0.05, 0.05) for n in range(len(curves))]
@@ -243,7 +247,9 @@ def _walked(
     )
     peaks = [max(curve(p) for p in range(-400, 400)) for curve in curves]
     for index, peak in enumerate(peaks):
-        run.region_tuned(Look(peak), "found", _view(index))
+        run.region_tuned(
+            Look(peak * (tuned[index] if tuned else 1.0)), "found", _view(index)
+        )
     run.begin_compromise()
     optics = driver = start
     for _ in range(1000):
@@ -598,6 +604,51 @@ def test_the_report_says_what_each_region_gave_up():
     assert report.worst in report.results
     line = report.describe()
     assert "Compromise" in line and "region" in line
+
+
+def test_a_region_read_higher_on_the_walk_has_that_for_its_best():
+    """What a real calibration showed: three regions of four read up to 13%
+    over "their best" at the compromise, because the best they were measured
+    against was what their fine tunes had walked back to and stood on -- a
+    little off each region's top. The walk across crosses every region's
+    peak, so whatever it reads higher than a region's best is that region's
+    best from then on, and no share of anything is over the whole of it."""
+    curves = [_hill(-40), _hill(10), _hill(40)]
+    grid = np.arange(-400, 400)
+    peaks = [max(curve(p) for p in grid) for curve in curves]
+    run, _optics = _walked(curves, start=40.0, tuned=[0.93, 1.0, 0.9])
+    report = run.report()
+    first, second, third = report.results
+    assert first.tuned == pytest.approx(0.93 * peaks[0])
+    assert first.best.reading == pytest.approx(peaks[0], rel=0.01)
+    assert first.bettered == pytest.approx(1 / 0.93 - 1, abs=0.01)
+    assert third.bettered == pytest.approx(1 / 0.9 - 1, abs=0.01)
+    assert second.bettered is None, "read at its best by its fine tune already"
+    assert all(one.fraction <= 1.0 for one in report.results)
+    for _stage, shares, _combined in report.history:
+        assert max(shares) <= 1.0
+    assert report.score == pytest.approx(np.mean([one.fraction for one in report.results]))
+    assert "read on the walk for the compromise" in summarise(first, 1)
+    assert "7% above" in summarise(first, 1)
+
+
+def test_a_best_read_low_does_not_move_the_compromise():
+    """Worse than a report that says 108%. Each region's say in the compromise
+    is its share of its own best, so a best read low gives that region more
+    say than it should have -- and aiming for the best worst region, the one
+    looked after is not the one that needs it. With the best put right on the
+    walk across, the compromise is where it would have been."""
+    curves = [_hill(-30, width=20), _hill(30, width=60)]
+    grid = np.arange(-300.0, 300.0)
+    tops = [max(curve(p) for p in grid) for curve in curves]
+    softest = lambda p: min(c(p) / t for c, t in zip(curves, tops))  # noqa: E731
+    _run, exact = _walked(curves, start=30.0, objective="worst")
+    # Measured against a best a fifth short, the sharp region looked well
+    # enough off to be given up for the broad one: it stood an increment
+    # the broad one's way, the sharp one at 45% of its best rather than 53%.
+    _run, low = _walked(curves, start=30.0, objective="worst", tuned=[0.8, 1.0])
+    assert low == exact
+    assert softest(low) == pytest.approx(softest(exact))
 
 
 def test_a_calibration_stopped_part_way_keeps_the_peaks_it_found():
@@ -1202,6 +1253,39 @@ def test_each_region_s_best_is_remembered_with_its_picture(worker):
     assert report.score == pytest.approx(
         np.mean([one.fraction for one in report.results]), abs=1e-6
     )
+
+
+@pytest.mark.parametrize("slack", [0, 40])
+def test_each_region_s_best_is_the_best_its_fine_tune_saw(worker, slack):
+    """Not what it walked back to and stood on, which it no longer does: the
+    lens goes somewhere else next anyway, and walking back lands a little off
+    the top -- which then became the yardstick for every share of the region.
+    And every reading it and the compromise took is in the report, with how
+    long after the lens last moved it was taken."""
+    rig = _Rig(PLACES, slack=slack)
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+    assert report.outcome == "found"
+    for result in report.results:
+        walk = [
+            one.value
+            for one in report.readings
+            if one.region == result.number and one.stage == "tune"
+        ]
+        # The first is the one taken before its autofocus, somewhere else.
+        assert result.tuned == pytest.approx(max(walk[1:]))
+        assert result.best.reading >= result.tuned
+        assert result.best.picture is not None
+        assert 0.0 < result.fraction <= 1.0
+    stages = {one.stage for one in report.readings}
+    assert {"tune", "out", "across"} <= stages
+    times = [one.at for one in report.readings]
+    assert times == sorted(times)
+    known = [one.after for one in report.readings if not np.isnan(one.after)]
+    assert len(known) > 0.9 * len(report.readings)
+    assert all(after >= 0.0 for after in known)
+    said = "\n".join(report.log)
+    assert "the compromise walks on from there" in said, "it did not walk back"
+    assert "this one" in said, "each probe of a fine tune says what it read"
 
 
 @pytest.mark.parametrize("slack", [0, 40])
@@ -1813,7 +1897,10 @@ def _documented_report() -> CalibrationReport:
     levelled = _levelled_report(lambda x, y: 30 * x + 10 * y, places)
     results = list(levelled.results)
     results[0] = replace(
-        results[0], best=Look(152.345, picture), compromise=Look(140.5, picture)
+        results[0],
+        best=Look(152.345, picture),
+        compromise=Look(140.5, picture),
+        tuned=148.0,
     )
     results[1] = replace(results[1], doubt=float("inf"), edge=True)
     results[3] = replace(results[3], best=None, compromise=None, depth=None)
@@ -1832,6 +1919,11 @@ def _documented_report() -> CalibrationReport:
         depths_measured=True,
         began=1_789_000_000.0,
         log=("14:03:01  Calibration started", "14:03:02  !! the camera refused: busy"),
+        readings=(
+            Reading(1, "tune", 0, 120.5, 1.25, 0.5),
+            Reading(1, "tune", 12, 148.0, 2.5, 0.75),
+            Reading(2, "out", -6, 90.0, 5.0, 1.5),
+        ),
     )
 
 
@@ -1843,6 +1935,7 @@ def test_the_whole_report_can_be_saved_and_opened_again(app, tmp_path):
     save_report(path, report, aspect=1.5)
     saved = load_report(path)
     assert saved.report == report, "every number comes back as it went"
+    assert saved.report.results[0].bettered == pytest.approx(152.345 / 148.0 - 1)
     assert saved.aspect == pytest.approx(1.5)
     best = saved.report.results[0].best.picture
     assert (best.width(), best.height()) == (20, 10)
@@ -1850,6 +1943,71 @@ def test_the_whole_report_can_be_saved_and_opened_again(app, tmp_path):
     assert saved.report.results[1].best.picture is None
     assert saved.report.tilt() == report.tilt(), "and so does the film's shape"
     assert not list(tmp_path.glob("*.part")), "nothing left over from writing it"
+
+
+def test_every_reading_goes_into_the_file_as_a_table_too(app, tmp_path):
+    """For a spreadsheet, which is where a question about the readings --
+    why the compromise read a region higher than its fine tune did -- gets
+    looked into. A time not known is an empty cell, and comes back as one."""
+    import zipfile
+    from dataclasses import replace
+
+    from scanny.ui.reportfile import load_report, save_report
+
+    report = _documented_report()
+    report = replace(
+        report, readings=report.readings + (Reading(3, "home", 6, 80.25, 9.5),)
+    )
+    path = tmp_path / "levelling.focusreport"
+    save_report(path, report, aspect=1.5)
+    with zipfile.ZipFile(path) as archive:
+        table = archive.read("readings.csv").decode("utf-8").splitlines()
+    assert table[0] == "region,stage,position,value,at,after"
+    assert table[1] == "1,tune,0,120.5,1.250,0.500"
+    assert table[-1] == "3,home,6,80.25,9.500,"
+    back = load_report(path).report.readings
+    assert back[:3] == report.readings[:3]
+    assert np.isnan(back[3].after) and back[3].value == 80.25
+
+
+def test_a_report_saved_before_readings_were_kept_still_opens(app, tmp_path):
+    import json
+    import zipfile
+
+    from scanny.ui.reportfile import load_report, save_report
+
+    path = tmp_path / "older.focusreport"
+    save_report(path, _documented_report(), aspect=1.5)
+    older = tmp_path / "oldest.focusreport"
+    with zipfile.ZipFile(path) as archive, zipfile.ZipFile(older, "w") as kept:
+        numbers = json.loads(archive.read("report.json"))
+        del numbers["report"]["readings"]
+        for one in numbers["report"]["results"]:
+            del one["tuned"]
+        kept.writestr("report.json", json.dumps(numbers))
+        for name in archive.namelist():
+            if name not in ("report.json", "readings.csv"):
+                kept.writestr(name, archive.read(name))
+    report = load_report(older).report
+    assert report.readings == ()
+    assert all(one.tuned is None and one.bettered is None for one in report.results)
+
+
+def test_the_report_window_says_when_a_best_was_read_on_the_walk(window):
+    from dataclasses import replace
+
+    from PySide6.QtWidgets import QLabel
+
+    from scanny.ui.report import CalibrationReportDialog
+
+    report = _report()
+    first, second = report.results
+    report = replace(report, results=(replace(first, tuned=140.0), second))
+    dialog = CalibrationReportDialog(report, Orientation(), window._save_directory(), window)
+    said = [label.text() for label in dialog._content.findChildren(QLabel)]
+    assert any("read on the walk for the compromise" in text for text in said)
+    assert any("fine tuning on its own found 140" in text for text in said)
+    assert any("7% higher than fine tuning did" in text for text in said)
 
 
 def test_a_file_that_is_not_a_report_is_refused(app, tmp_path):

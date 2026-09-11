@@ -313,7 +313,7 @@ class CalibrationReportDialog(QDialog):
         grid.setHorizontalSpacing(_SPACING)
         grid.setVerticalSpacing(6)
         for column, heading in enumerate(
-            ("", "At its best, fine tuned on alone", "At the compromise"), start=0
+            ("", "At its best", "At the compromise"), start=0
         ):
             if heading:
                 # No wider than the pictures under it, or it sets the width
@@ -322,7 +322,12 @@ class CalibrationReportDialog(QDialog):
                 grid.addWidget(title, 0, column, Qt.AlignmentFlag.AlignHCenter)
         for row, result in enumerate(report.results, start=1):
             grid.addWidget(self._describe(result), row, 0, Qt.AlignmentFlag.AlignTop)
-            grid.addWidget(self._panel(result.best, "best"), row, 1, Qt.AlignmentFlag.AlignTop)
+            grid.addWidget(
+                self._panel(result.best, "best", tuned=result.tuned),
+                row,
+                1,
+                Qt.AlignmentFlag.AlignTop,
+            )
             grid.addWidget(
                 self._panel(result.compromise, "compromise", result.fraction),
                 row,
@@ -417,6 +422,11 @@ class CalibrationReportDialog(QDialog):
             lines.append("not reached")
         else:
             lines.append(_TUNED.get(result.outcome, result.outcome or ""))
+        if result.bettered is not None:
+            lines.append(
+                f"the search read it {result.bettered:.0%} higher than fine "
+                f"tuning did, and that is its best"
+            )
         if result.fraction is not None:
             lines.append(f"<b>{result.fraction:.0%}</b> of its best")
         if result.depth is not None:
@@ -424,7 +434,11 @@ class CalibrationReportDialog(QDialog):
         return _wrapped("<br>".join(lines), _NAMES, align=Qt.AlignmentFlag.AlignLeft)
 
     def _panel(
-        self, look: "Look | None", kind: str, fraction: "float | None" = None
+        self,
+        look: "Look | None",
+        kind: str,
+        fraction: "float | None" = None,
+        tuned: "float | None" = None,
     ) -> QWidget:
         holder = QWidget()
         column = QVBoxLayout(holder)
@@ -445,7 +459,7 @@ class CalibrationReportDialog(QDialog):
         self._pictures.append(picture)
         column.addWidget(picture, 0, Qt.AlignmentFlag.AlignHCenter)
         caption = _wrapped(
-            self._caption(look, kind, fraction),
+            self._caption(look, kind, fraction, tuned),
             _SHOWN,
             "color: #888; font-size: 11px;",
         )
@@ -453,12 +467,22 @@ class CalibrationReportDialog(QDialog):
         return holder
 
     @staticmethod
-    def _caption(look: "Look | None", kind: str, fraction: "float | None") -> str:
+    def _caption(
+        look: "Look | None",
+        kind: str,
+        fraction: "float | None",
+        tuned: "float | None" = None,
+    ) -> str:
         if look is None:
             return "no compromise found" if kind == "compromise" else "not tuned"
         reading = format_reading(look.reading)
         if kind == "compromise" and fraction is not None:
             return f"sharpness {reading}, {fraction:.0%} of its best"
+        if kind == "best" and tuned is not None and look.reading > tuned:
+            return (
+                f"sharpness {reading}, read on the walk for the compromise; "
+                f"fine tuning on its own found {format_reading(tuned)}"
+            )
         return f"sharpness {reading}"
 
     # -- keeping it --------------------------------------------------------

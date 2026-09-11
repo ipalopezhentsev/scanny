@@ -259,6 +259,13 @@ class CameraWorker(QObject):
         # Everything said while a calibration runs -- status, failures and
         # the log -- as the activity log shows it, to go into its report.
         self._calibration_said: "list[str] | None" = None
+        # The best reading of the region a calibration is fine tuning, with
+        # its picture and the view it was read through. See
+        # _note_tune_reading.
+        self._tune_best: "tuple[Look, View] | None" = None
+        # When the lens was last driven or autofocused, by monotonic clock,
+        # for saying how long after that each calibration reading was taken.
+        self._moved_at: "float | None" = None
         self.status.connect(lambda text: self._hear(text, "status"))
         self.failed.connect(lambda text: self._hear(text, "error"))
         self.log.connect(lambda text: self._hear(text, ""))
@@ -1213,7 +1220,9 @@ class CameraWorker(QObject):
         if reading is None or not self._integrator.last_image_was_whole:
             return
 
+        position = hunt.position
         move = hunt.step(reading)
+        self._note_tune_reading(hunt, position, reading, frame, image)
         if move is None:
             self._finish_hunt(hunt, frame, image)
             return
@@ -1224,17 +1233,54 @@ class CameraWorker(QObject):
         if not self._drive_through(camera, move.steps):
             self._cancel_hunt("Focus hunt stopped: focus could not be driven")
             return
+        self._moved_at = time.monotonic()
         if self._calibration is not None:
             self._calibration.drove(move.steps)
         self._settle(before)
         probes = hunt.probes
         # Which half of the walk it is in, because they take very different
         # lengths of time and a long search that says nothing but a rising
-        # probe count reads as a hang.
+        # probe count reads as a hang. And what this probe read, not only the
+        # best: the best alone says nothing while the walk is looking, and a
+        # calibration's log is read afterwards for how the walk went.
         doing = "coming back to" if hunt.coming_back else "looking, best"
         self.status.emit(
             f"Fine tuning focus: {probes} probe{'' if probes == 1 else 's'} in "
-            f"steps of {hunt.step_size}, {doing} {format_reading(hunt.best)}"
+            f"steps of {hunt.step_size}, {doing} {format_reading(hunt.best)}, "
+            f"this one {format_reading(reading)}"
+        )
+
+    def _note_tune_reading(
+        self,
+        hunt: FineTune,
+        position: int,
+        reading: float,
+        frame: LiveViewFrame,
+        image: "QImage | None",
+    ) -> None:
+        """Keep what a calibration needs of one fine-tune reading.
+
+        Every reading goes into its record, with how long after the lens
+        last moved it was taken. And the best one is kept whole -- the
+        picture of the region at that reading, and the view it was read
+        through -- because a calibration's fine tune does not walk back to
+        stand on its best: the best it saw is what it hands on.
+        """
+        run = self._calibration
+        if run is None or run.phase != "peaks":
+            return
+        since = (
+            time.monotonic() - self._moved_at
+            if self._moved_at is not None
+            else float("nan")
+        )
+        run.noted(run.index, "tune", position, reading, since)
+        if image is None or hunt.best != reading or hunt.best_position != position:
+            return
+        region = run.regions[run.index]
+        self._tune_best = (
+            _look_at(region, frame, image, reading),
+            View.of(frame, self._zoom_level),
         )
 
     def _watch_for_stillness(self, frame: LiveViewFrame) -> None:
@@ -1367,6 +1413,7 @@ class CameraWorker(QObject):
                 self._cancel_hunt("")
                 self.failed.emit(f"Autofocus failed: {again}")
                 return
+        self._moved_at = time.monotonic()
         self.focusStateChanged.emit("focused" if focused else "idle")
         self._settle(before)
 
@@ -1642,10 +1689,12 @@ class CameraWorker(QObject):
     def _tune_region(self) -> None:
         """Fine tune the next region on its own, to find what it reads at best.
 
-        Exactly the search the Fine tune button runs -- magnified onto the
-        region, autofocus aimed at it, a walk in the one increment -- with the
-        region as its measured area. What it ends on is picked up again in
-        :meth:`_region_tuned`.
+        The search the Fine tune button runs -- magnified onto the region,
+        autofocus aimed at it, a walk in the one increment -- with the region
+        as its measured area, but without the walk back to stand on the best
+        at the end: what is wanted of it is the best reading, and the lens is
+        walked somewhere else next anyway. What it found is picked up again
+        in :meth:`_region_tuned`.
         """
         run = self._calibration
         if run is None:
@@ -1653,12 +1702,13 @@ class CameraWorker(QObject):
         region = run.regions[run.index]
         number, total = run.index + 1, len(run.regions)
         self._sharpness.set_area(region.rect)
+        self._tune_best = None
         self.calibrationProgress.emit(
             run.index, f"Region {number} of {total}: fine tuning it on its own"
         )
         self._log(f"Region {number} of {total}: fine tuning it on its own")
         self._start_hunt(
-            FineTune(run.step),
+            FineTune(run.step, come_back=False),
             f"Calibrating region {number} of {total}: magnified onto it, "
             f"autofocus, then steps of {run.step}...",
         )
@@ -1676,11 +1726,15 @@ class CameraWorker(QObject):
     ) -> None:
         """Keep one region's best, then go on to the next region or the compromise.
 
-        The best is what the fine tune stood on at the end -- the reading it
-        confirmed, and the picture that reading came off -- not the highest
-        reading it passed on the way. That one is the luckiest of a noisy
-        walk; this one is where the lens actually is, and the picture of the
-        region there is what it looks like at its best.
+        The best is the highest reading the fine tune saw, and the picture
+        that reading came off -- not a reading it walked back to and stood
+        on, which it does not do here. Walking back lands a little off the
+        top however it is done, and what it lands on is then the yardstick
+        every share of the region is measured against: on a real
+        calibration, seven per cent short, so that the compromise read three
+        of the four regions well over "their best". The highest reading is
+        the luckiest of the walk, by the grain on it -- a per cent or so, on a
+        stack of frames.
 
         The view goes with it: the zoom level, the focus point, and the crop
         the body answered with. Every later reading of this region is taken
@@ -1690,17 +1744,27 @@ class CameraWorker(QObject):
         run = self._calibration
         if run is None:
             return
-        reading = hunt.confirmed if hunt.confirmed is not None else hunt.best
+        reading = hunt.best
         region = run.regions[run.index]
-        if frame is None or image is None:
+        kept, self._tune_best = self._tune_best, None
+        if kept is not None and kept[0].reading == reading:
+            look, view = kept
+        elif frame is None or image is None:
             look, view = Look(0.0), None
         else:
             look = _look_at(region, frame, image, reading)
             view = View.of(frame, self._zoom_level)
+        stood = hunt.confirmed
         self._log(
             f"Region {run.index + 1}: best reading {format_reading(reading)} "
             f"({hunt.outcome}) "
             f"after {hunt.probes} probes, read at zoom level {self._zoom_level}"
+            + (
+                f"; left where it read {format_reading(stood)}, the compromise "
+                f"walks on from there"
+                if stood is not None and stood < reading
+                else ""
+            )
         )
         if run.region_tuned(look, hunt.outcome, view, hunt.probes):
             self._tune_region()
@@ -1742,12 +1806,14 @@ class CameraWorker(QObject):
         try:
             if run.pending:
                 camera.drive_focus(run.pending)
+                self._moved_at = time.monotonic()
                 run.drove(run.pending)
                 run.pending = 0
                 run.moved = True
             if run.moved:
                 self._hold_still(camera)
             looks: "dict[int, Look]" = {}
+            after: "dict[int, float]" = {}
             for index in run.order():
                 look = self._read_region(camera, index)
                 if look is None:
@@ -1755,6 +1821,8 @@ class CameraWorker(QObject):
                         f"no picture of region {index + 1} the way it was measured"
                     )
                 looks[index] = look
+                if self._moved_at is not None:
+                    after[index] = time.monotonic() - self._moved_at
         except (CameraError, MtpError, WpdCommandError) as exc:
             self._log(f"Compromise probe {run.probes + 1} interrupted: {exc}")
             if self._recover_live_view(camera, exc):
@@ -1762,7 +1830,14 @@ class CameraWorker(QObject):
             self._end_calibration(f"Calibration stopped: {exc}", stopped=True)
             return
         doing = run.searching
-        move = run.take(looks)
+        tuned = {index: run.best_of(index) for index in looks}
+        move = run.take(looks, after)
+        for index in run.bettered:
+            self._log(
+                f"Region {index + 1} read {format_reading(looks[index].reading)} "
+                f"here, above its best of {format_reading(tuned[index])}: that is "
+                f"its best from now on"
+            )
         if run.score is not None:
             self.calibrationProbe.emit(run.history_regions, doing, run.shares, run.score)
             self._log(
@@ -1787,6 +1862,7 @@ class CameraWorker(QObject):
             if not self._recover_live_view(camera, exc):
                 self._end_calibration(f"Calibration stopped: {exc}", stopped=True)
             return  # the move is still pending, and is made first next time
+        self._moved_at = time.monotonic()
         run.drove(move.steps)
         run.pending = 0
         run.moved = True

@@ -96,6 +96,7 @@ trusting that number anywhere:
 | `ui/sharpness.py` | Scoring the contrast in the displayed picture, to focus against |
 | `ui/trend.py` | The plot of recent readings that focus is driven against |
 | `ui/hunt.py` | Autofocus, then bettering it a single step at a time, without counting steps |
+| `ui/homing.py` | Back to the top of a stretch walked one way, measuring the gearing's play on the way |
 | `ui/regions.py` | Each region's best, then the one focus that does best by all of them |
 | `ui/report.py` | That compromise laid out: every region at its best and at the compromise |
 | `ui/reportfile.py` | A report saved whole as one file, and opened again |
@@ -415,8 +416,11 @@ when the subject is large and roughly where the box is.
   means the other way, and that is the only thing it can mean.
 - Once the reading has been watched to fall away on **both sides of the best**,
   that best is a peak rather than a slope and there is nothing left to explore.
-- **It walks back to it**, still turning round whenever the reading gets worse,
-  and stops when the reading is back to what it was.
+- **It goes back to it** along the stretch it last walked in one direction,
+  which went over the top: that stretch is a profile of the peak, and the way
+  back measures the gearing's play against it and stops on its middle. Only if
+  that loses the way does it walk the rest by the reading alone, turning round
+  whenever it gets worse and stopping when it is back to what it was.
 - If what it ends on is worse than the baseline after all, **it autofocuses
   once more** and says so.
 
@@ -644,6 +648,45 @@ followed by a fall of three is ordinary, and without the test it reads as
 "climbed to the target and went over it" while standing at a tenth of the
 target -- which ends the search a dozen steps from focus. That was a real
 trace, not a hypothetical.
+
+And the test was still not enough, which a real calibration showed: three
+regions of four ended **seven per cent short** of the best their own walks had
+seen. The walk turns for home once the reading has sagged a twentieth or so
+below its best, so it crosses the play on the way back at around nine tenths
+of it -- inside the "genuinely near" band, where the grain alone rises and
+falls. So the rule now also asks that the top it went over was itself within
+a twentieth of the target, and above all it is no longer how the walk gets
+home: that is the next section.
+
+### Going back along the stretch that went over the top
+
+The walk turned for home because the reading fell away on the far side of the
+best, so the stretch it walked since it last turned round went over the top --
+all of it in one direction, where the steps are honest: the play was taken up
+at its start and stayed taken up. That stretch is a **profile of the peak**.
+Its best is found as the middle of its top, from every reading on the top
+rather than the luckiest one, and the way back is the same stretch in reverse.
+The one number missing is how much play the way back takes up before the
+optics move, and that is **measured**: the readings on the way are matched
+against the profile, and the play is whatever lines them up. Readings that
+have not moved yet say only that the play is not taken up, so the grain on one
+of them cannot end the walk. It goes on an increment at a time, matching again
+with every reading, until the best is less than half an increment away
+(`ui/homing.py`, the same arithmetic the compromise goes home by, below).
+
+If the reading there is more than a twentieth below the top of the profile,
+the way was misjudged -- the play placed a step out on a top a step wide -- and
+the way just walked is itself an honest stretch in one direction, so it goes
+back along that; if it is still climbing it carries on over the top first.
+Only after two of those, or if the profile has no top standing clear of the
+grain -- or its top is well below the best the walk saw, which is the grain
+making a hump out of a stretch spent crossing a long play -- is the rest walked
+by the reading, as before.
+
+Against a modelled lens with 20 or 40 steps of play and 1% grain on every
+reading, taking what the optics read where the walk stopped against the best
+they read anywhere on it: walking back by the reading alone stopped at 99.2%
+on average and 93.6% at worst; going back along the profile, 99.85% and 98.7%.
 
 ### Turning round, and what a falling reading means
 
@@ -880,13 +923,19 @@ runs, since a copy stand is set up once and scanned from for hours.
 **Calibrate** does two things, and the second only means anything because of
 the first:
 
-1. **Each region's best, by fine tuning on it alone.** Exactly what the Fine
-   tune button does -- magnified onto the region, the camera's autofocus aimed
-   at it, then walked in minimum steps to the best it reads -- once per region.
-   What it stood on at the end is that region's *peak*: the reading, and the
-   picture of the region at that moment. Along with where the camera was
-   pointed when it read it, because a reading is only comparable with another
-   taken through the same crop at the same magnification.
+1. **Each region's best, by fine tuning on it alone.** What the Fine tune
+   button does -- magnified onto the region, the camera's autofocus aimed at
+   it, then walked in minimum steps until the reading has fallen away on both
+   sides of its best -- once per region. The best reading the walk saw is that
+   region's *peak*: the reading, and the picture of the region at that
+   moment. Along with where the camera was pointed when it read it, because a
+   reading is only comparable with another taken through the same crop at the
+   same magnification. It does *not* walk back to stand on the peak, as the
+   button does: the lens is walked somewhere else next anyway, and whatever
+   the walk back lands on becomes the yardstick every share of that region is
+   measured against. On a real calibration that was 7% short of the top, and
+   the compromise then read three regions of four at up to 113% of "their
+   best".
 2. **Then one position for all of them.** At every probe the camera is panned
    to each region's view in turn -- panning moves the focus point and nothing
    else, so every region is read at the one focus position -- and each is
@@ -911,9 +960,14 @@ opened again with **File > Open focus report** (Ctrl+O) -- each in a window of
 its own, so an old one can be set beside the one just made. It is a zip
 archive: `report.json` holds every number the report has, `pictures/` every
 region at its best and at the compromise as it was cut out of the live view,
-and `activity.log` everything said while the calibration ran. Opened again, it
-is the same report, pages and 3D film included, shown the way the view is set
-now. **Save page as picture...** keeps the page on show as a PNG.
+`activity.log` everything said while the calibration ran, and `readings.csv`
+**every reading of every region it took**, one to a row -- which region, which
+part of the calibration (`tune`, or the search's `out`, `across`, `home`,
+`climb`), the step count, the reading, the seconds since the calibration began
+and the seconds since the lens last moved -- for a spreadsheet, when a number
+in the report wants explaining. Opened again, it is the same report, pages and
+3D film included, shown the way the view is set now. **Save page as
+picture...** keeps the page on show as a PNG.
 
 While it runs, the panel keeps a clock of how long it has been going and says
 what it is doing, and once the compromise is being sought it charts **every
@@ -1014,6 +1068,21 @@ peak, with the others well short of theirs; the best worst region never
 sacrifices one, and pays for that in the average. Both only ever go up when a
 single share does, so the search is the same for either.
 
+**A region's peak can go up while the search runs.** Its peak is the best it
+has read *anywhere* -- its fine tune, or any probe of the search -- and the walk
+across crosses every region's peak, read the same way every later reading
+is. A region the search reads higher than its fine tune did has that for its
+peak from then on, picture and all, and the log says so. It matters beyond
+the report showing more than 100%: a peak read low makes that region's share
+too big, so the average leans towards it and the worst region protected may
+not be the one that needs it. Everything the search judges by is worked out
+again from the readings with the new peak; only the way home keeps the peaks
+it set out with, since it matches readings against a profile and a profile has
+to hold still. The report measures everything against the peaks as they
+finally stood, and where one was raised it says by how much, next to what the
+fine tune alone found -- a fine tune that keeps reading a region lower than the
+search is worth looking into, and `readings.csv` is where to look.
+
 ### Why the compromise is not a fine tune on the average
 
 That was the first version, and two things about the average that are not
@@ -1061,7 +1130,8 @@ So the search is three legs, and none of them counts a step across a reversal:
 - **Home**, back again. The way home retraces the profile, but how much play
   was taken up first is not known, and it is the one number the walk needs.
   So it is measured: every reading on the way home is matched against the
-  profile, and the play is whatever lines them up. The walk goes on an
+  profile, and the play is whatever lines them up -- the arithmetic the fine
+  tune now goes home by as well (`ui/homing.py`). The walk goes on an
   increment at a time, matching again with every reading, until the best is
   less than half an increment away. If the reading there does not agree --
   the top was one increment wide, or the walk passed the best before it could
@@ -1576,3 +1646,6 @@ They need no camera attached.
 
 
 
+## TODO
+- 3d looks buggy
+- sometimes calibrated compromise shows actually better sharpness than initially found "best" fine tuned.

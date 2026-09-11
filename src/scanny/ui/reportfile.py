@@ -10,12 +10,15 @@ probe by probe, and the activity log of the run.
 The file is a zip archive, so that what is in it can be got at without this
 program as well: ``report.json`` holds the numbers, ``pictures/`` the regions
 as they were cut out of the live view -- in the camera's own orientation and
-tones, as :class:`scanny.ui.regions.Look` keeps them -- and ``activity.log``
-the log.
+tones, as :class:`scanny.ui.regions.Look` keeps them -- ``activity.log`` the
+log, and ``readings.csv`` every reading of every region the calibration took,
+one to a row, for a spreadsheet (:class:`scanny.ui.regions.Reading`).
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import os
@@ -27,7 +30,7 @@ from pathlib import Path
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage
 
-from .regions import CalibrationReport, Look, Region, RegionResult
+from .regions import CalibrationReport, Look, Reading, Region, RegionResult
 
 __all__ = [
     "REPORT_FILTER",
@@ -49,6 +52,10 @@ _VERSION = 1
 
 _NUMBERS = "report.json"
 _LOG = "activity.log"
+_READINGS = "readings.csv"
+
+#: The columns of ``readings.csv``, which are the fields of a reading.
+_COLUMNS = ("region", "stage", "position", "value", "at", "after")
 
 
 class ReportFileError(Exception):
@@ -117,8 +124,21 @@ def save_report(path: "str | Path", report: CalibrationReport, aspect: float) ->
                     # JSON has no infinity: an unknown doubt is written as none.
                     "doubt": one.doubt if math.isfinite(one.doubt) else None,
                     "edge": one.edge,
+                    "tuned": one.tuned,
                 }
                 for one in report.results
+            ],
+            "readings": [
+                [
+                    one.region,
+                    one.stage,
+                    one.position,
+                    one.value,
+                    one.at,
+                    # Nor a not-a-number: a time not known is none as well.
+                    one.after if math.isfinite(one.after) else None,
+                ]
+                for one in report.readings
             ],
         },
     }
@@ -127,6 +147,7 @@ def save_report(path: "str | Path", report: CalibrationReport, aspect: float) ->
         with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr(_NUMBERS, json.dumps(numbers, indent=1))
             archive.writestr(_LOG, "".join(f"{line}\n" for line in report.log))
+            archive.writestr(_READINGS, _table(report.readings))
             for name, data in pictures.items():
                 # Already compressed; deflating them again only costs time.
                 archive.writestr(name, data, compress_type=zipfile.ZIP_STORED)
@@ -193,8 +214,21 @@ def _report_from(
             depth=None if one["depth"] is None else float(one["depth"]),
             doubt=float("inf") if one["doubt"] is None else float(one["doubt"]),
             edge=bool(one["edge"]),
+            # Not in reports saved before it was kept.
+            tuned=None if one.get("tuned") is None else float(one["tuned"]),
         )
         for one in saved["results"]
+    )
+    readings = tuple(
+        Reading(
+            region=int(region),
+            stage=str(stage),
+            position=int(position),
+            value=float(value),
+            at=float(at),
+            after=float("nan") if after is None else float(after),
+        )
+        for region, stage, position, value, at, after in saved.get("readings", [])
     )
     return CalibrationReport(
         results=results,
@@ -215,7 +249,27 @@ def _report_from(
         depths_measured=bool(saved["depths_measured"]),
         began=float(saved.get("began", 0.0)),
         log=tuple(log),
+        readings=readings,
     )
+
+
+def _table(readings: "tuple[Reading, ...]") -> str:
+    """Every reading as comma-separated text, a header first."""
+    text = io.StringIO()
+    writer = csv.writer(text, lineterminator="\n")
+    writer.writerow(_COLUMNS)
+    for one in readings:
+        writer.writerow(
+            [
+                one.region,
+                one.stage,
+                one.position,
+                f"{one.value:.6g}",
+                f"{one.at:.3f}",
+                f"{one.after:.3f}" if math.isfinite(one.after) else "",
+            ]
+        )
+    return text.getvalue()
 
 
 def _png(picture: QImage) -> bytes:

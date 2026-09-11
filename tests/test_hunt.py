@@ -348,6 +348,64 @@ def test_a_peak_on_the_far_side_of_the_autofocus_is_still_the_one_it_stands_on()
         assert tune.confirmed >= tune.best * 0.99
 
 
+def _came_home(af_error, slack, noise, seed, width) -> float:
+    """What the optics read where a walk stopped, against the best they read
+    anywhere on it -- which is as near the top as the play and the increment
+    ever let it stand."""
+    rng = np.random.default_rng(seed)
+    tune = FineTune(STEP)
+    optics = driver = float(af_error) * 3.0
+    visited = []
+    while True:
+        visited.append(curve(optics, width=width))
+        move = tune.step(max(curve(optics, width=width) * (1 + rng.normal(0, noise)), 0.0))
+        if move is None:
+            return curve(optics, width=width) / max(visited)
+        if move.autofocus:
+            optics = float(af_error)
+            driver = optics - slack / 2
+        else:
+            driver += move.steps
+            optics = min(max(optics, driver), driver + slack)
+        assert tune.probes < 400
+
+
+def test_the_way_back_is_not_ended_by_the_reading_wandering_in_the_play():
+    """What a real calibration found: the fine tunes stood seven per cent
+    below the best they had seen, on three regions of four.
+
+    The walk turns for home once the reading has sagged a twentieth or so
+    below its best, so it crosses the play on the way back at around nine
+    tenths of it -- where a rise of a per cent and a fall of two is ordinary
+    grain, and read as "climbed to the top and went over it". It goes back
+    along the stretch it last walked instead, measuring the play as it goes,
+    and the grain on one reading no longer decides where it stops."""
+    shares = [
+        _came_home(af, slack, 0.01, seed, width)
+        for af in (-18, 18)
+        for slack in (20, 40)
+        for width in (30.0, 60.0)
+        for seed in range(5)
+    ]
+    assert np.mean(shares) >= 0.996, np.mean(shares)
+    assert min(shares) >= 0.97, min(shares)
+
+
+def test_asked_not_to_come_back_it_stops_once_the_peak_is_known():
+    """For a calibration, which wants each region's best reading and walks the
+    lens somewhere else straight after: once the reading has fallen away on
+    both sides of the best, there is nothing a walk back would add."""
+    home, _error, _ = _run(FineTune(STEP), af_error=-24, slack=30)
+    stays = FineTune(STEP, come_back=False)
+    stays, _error, _ = _run(stays, af_error=-24, slack=30)
+    assert stays.outcome == "found"
+    assert stays.best == pytest.approx(home.best, rel=0.02)
+    assert stays.probes < home.probes
+    assert not stays.coming_back, "it never set off back"
+    # It stopped on the reading that proved the far side, below the best.
+    assert stays.confirmed == stays.trail[-1][1] < stays.best
+
+
 # -- the whole thing, through the worker -------------------------------------
 
 W, H = 96, 72

@@ -14,12 +14,20 @@ the first.
 **First, each region's best, by fine tuning on it alone.** The same search the
 button runs -- magnified onto the region, the camera's autofocus aimed at it,
 then walked one increment at a time by what the picture reads -- once per
-region. What it stood on at the end is that region's *peak*: the reading, and
-the picture of the region at that moment. Along with where the camera was
-pointed when it read it, because a reading is only comparable with another
-taken through the same crop at the same magnification: the same piece of
-sensor magnified further has its detail spread over more pixels, and reads
+region. The best reading the walk saw is that region's *peak*: the reading,
+and the picture of the region at that moment. The best it *saw*, not the one
+it would walk back to and stand on: where the lens is left does not matter,
+since the compromise walks it somewhere else next, and walking back only ever
+lands a little off the top -- seven per cent off, on a real calibration, which
+every share of it was then wrongly measured against. Along with where the
+camera was pointed when it read it, because a reading is only comparable with
+another taken through the same crop at the same magnification: the same piece
+of sensor magnified further has its detail spread over more pixels, and reads
 differently for it.
+
+**A peak can still go up.** The search for the compromise reads every region at
+many focus positions, and a region it reads higher than its peak has that for
+its peak from then on -- see :class:`_Search`.
 
 **Then one position for all of them.** At every probe the camera is panned to
 each region's view in turn -- panning moves the focus point and nothing else,
@@ -60,6 +68,11 @@ from PySide6.QtGui import QImage
 
 from ..camera.nikon import LiveViewFrame
 from .film import FilmSurface
+from .homing import TALL_ENOUGH as _TALL_ENOUGH
+from .homing import TOP_READINGS as _TOP_READINGS
+from .homing import WayHome
+from .homing import middle_of_top as _middle_of_top
+from .homing import run_around_top as _run_around_top
 from .hunt import FineTune, Move
 from .orientation import Orientation
 from .sharpness import format_reading
@@ -72,6 +85,7 @@ __all__ = [
     "Calibration",
     "CalibrationReport",
     "Look",
+    "Reading",
     "Region",
     "RegionResult",
     "Tilt",
@@ -259,6 +273,37 @@ def combine(shares: Sequence[float], objective: str = "average") -> float:
 
 
 @dataclass(frozen=True)
+class Reading:
+    """One reading of one region during a calibration, kept for looking into.
+
+    Every reading a calibration takes, in the order it takes them -- the fine
+    tunes' walks as well as the compromise's -- with when it was taken and how
+    long after the lens last moved. The report is made of the best of these,
+    and a best that is out of line with the rest is only explained by the
+    rest: a fine tune that reads a region lower than the compromise later
+    does, say, is either reading too soon after its moves or watching
+    something change over the minutes between them, and which of those it is
+    is in :attr:`after` and :attr:`at`.
+    """
+
+    #: Which region, by number from 1.
+    region: int
+    #: ``tune`` for its fine tune; the search's ``out``, ``across``, ``home``
+    #: or ``climb`` for the compromise.
+    stage: str
+    #: Where, in drive steps: a fine tune's from where its autofocus left the
+    #: lens, the compromise's from where it began. Comparable within one
+    #: stretch of walking in one direction, and nowhere else.
+    position: int
+    value: float
+    #: Seconds since the calibration began.
+    at: float
+    #: Seconds since the lens was last driven or autofocused, or not a number
+    #: when that is not known.
+    after: float = float("nan")
+
+
+@dataclass(frozen=True)
 class RegionResult:
     """What a calibration made of one region."""
 
@@ -279,11 +324,28 @@ class RegionResult:
     #: Whether its best reading on the walk across was at an end of it, which
     #: makes the depth a bound rather than an answer.
     edge: bool = False
+    #: What its fine tune read at best, on its own. The same as :attr:`best`
+    #: unless the search for the compromise read it higher since; None if
+    #: not known.
+    tuned: "float | None" = None
 
     @property
     def usable(self) -> bool:
         """Whether it had a peak to be measured against."""
         return self.best is not None and self.best.reading > 0.0
+
+    @property
+    def bettered(self) -> "float | None":
+        """How far above its fine tune's best the compromise's search read it.
+
+        As a fraction -- 0.06 is six per cent higher -- or None when it did
+        not, which is the ordinary case. When it did, the fine tune stopped
+        short of the region's peak, or read it lower than the search could.
+        """
+        if not self.usable or self.tuned is None or self.tuned <= 0.0:
+            return None
+        above = self.best.reading / self.tuned - 1.0
+        return above if above > 0.0 else None
 
     @property
     def fraction(self) -> "float | None":
@@ -426,6 +488,8 @@ class CalibrationReport:
     began: float = 0.0
     #: Everything that was said while it ran, as the activity log has it.
     log: "tuple[str, ...]" = ()
+    #: Every reading of every region it took; see :class:`Reading`.
+    readings: "tuple[Reading, ...]" = ()
 
     @property
     def stopped(self) -> bool:
@@ -599,10 +663,17 @@ def summarise(result: "RegionResult | None", number: int) -> str:
             "Draw it round something with detail in it."
         )
         return "\n".join(lines)
-    lines.append(
-        f"Best: {format_reading(result.best.reading)} when fine tuned on its own"
-        + _HOW.get(result.outcome, "")
-    )
+    if result.bettered is not None:
+        lines.append(
+            f"Best: {format_reading(result.best.reading)}, read on the walk for "
+            f"the compromise -- {result.bettered:.0%} above the "
+            f"{format_reading(result.tuned)} fine tuning it on its own found"
+        )
+    else:
+        lines.append(
+            f"Best: {format_reading(result.best.reading)} when fine tuned on its own"
+            + _HOW.get(result.outcome, "")
+        )
     if result.fraction is not None:
         lines.append(
             f"At the compromise: {format_reading(result.compromise.reading)}, "
@@ -709,58 +780,9 @@ _CLIMBING_OVER = 3
 _DEPTH_FALL = 0.25
 _DEPTH_PATIENCE = 25
 
-#: Where, between the lower end of the leg across and the top of it, the
-#: line is drawn that marks out the top whose middle is wanted.
-#:
-#: High, because the middle of a top is only the best of it where the top is
-#: symmetrical, and the average of several regions seldom is: a line half way
-#: down took in enough of a lopsided top to pull its middle several steps off
-#: the best, and once the walk across had to take in every region's whole
-#: curve for their depths, the half-way line took in more still. Across a
-#: few hundred made-up scenes, drawing it near the top halved what the
-#: compromise gave away. But a parabola needs three readings and the top of
-#: a magnified subject can be a single increment wide, so the line comes down
-#: until the top holds that many, or as far as it will go.
-_ON_TOP = (0.85, 0.7, 0.5, 0.25)
-_TOP_READINGS = 3
-
-#: How far a reading on the way home has to be from what the far end of the
-#: leg across read before it says the optics are moving, as a share of
-#: everything the leg read, top to bottom -- and how many of those it takes
-#: before the play is worked out from them. The readings before the play is
-#: taken up are all the same, and are no help at all in saying how much of it
-#: there was.
-#:
-#: *From*, not *above*: the leg may end on another region's hill, and then
-#: the way home goes down before it goes up. Waiting for readings above the
-#: far end waited through the whole of that valley for evidence that was
-#: there from its first step.
-#:
-#: And one of them is enough. The best may be a single increment from where
-#: the leg ended, and waiting for three walked straight past it. The
-#: readings that have not moved yet still count in the fit, and they are
-#: what keeps one grainy reading from being taken for the play running out.
-_ON_THE_WAY = 0.25
-_ENOUGH_ON_THE_WAY = 1
-
 #: How many times the walk home may turn round and go home again, from the
 #: profile the last walk home made, before giving the search to a climb.
 _HOMECOMINGS = 2
-
-#: How finely the play is worked out, in drive steps. Far finer than an
-#: increment, so that rounding it is not where the error comes from.
-_PLAY_RESOLUTION = 0.5
-
-#: How far below the top the leg across saw the reading may be where the
-#: walk home ends, before it is not believed to be there. Well outside the
-#: grain on an average; well inside what one increment off the top of a
-#: steep hill costs.
-_ARRIVED = 0.05
-
-#: How far the top has to rise above the ends of the leg before it is worth
-#: going home to, as a fraction of it. Less than that and the shape of it is
-#: the grain's, and there is nothing to match the way home against.
-_TALL_ENOUGH = 0.03
 
 
 class _Search:
@@ -797,24 +819,32 @@ class _Search:
       So it is a true profile of the average against focus, and it says
       where on it the average is best -- the best of all of it, not the
       nearest.
-    - **Home**: turn round again. The way home retraces the leg across, but
-      how much play was taken up first is not known, and that is the one
-      number the walk needs. So it is *measured*, the way everything else
-      here is: the readings on the way home are matched against the profile
-      the leg across made, and the play is whatever lines them up. Then the
-      rest of the way to the best is honest travel, and the walk goes on an
-      increment at a time, matching again with every reading, until the best
-      is less than half an increment away.
+    - **Home**: turn round again, and go back along the leg across to the
+      best of it, measuring the play on the way; see
+      :class:`~scanny.ui.homing.WayHome`.
 
     If the way home loses the top -- the scene moved, or the readings would
     not hold still -- it is not the end of the search: a
     :class:`~scanny.ui.hunt.FineTune` takes over from wherever it is and
     climbs the hill it is on, which is what it is good at.
+
+    **What each region's share is a share of can go up while it walks.** It is
+    handed every region's reading, not its share, and each share is of the
+    best that region has read *anywhere* -- its fine tune or this walk. The
+    walk across crosses every region's peak, read the way every later reading
+    will be read, and it can read a region higher than its fine tune did: a
+    real calibration had one region a sixth over. Its old best would leave it
+    counting for more than its share in the average, and being protected when
+    it needs no protecting in the worst -- so its best is raised, and
+    everything the walk judges by is worked out again from the readings.
+    Only the way home is judged by the bests as they stood when it set out:
+    it matches readings against a profile, and a profile has to hold still.
     """
 
     def __init__(
         self,
         unit: int,
+        peaks: "Sequence[float]",
         objective: str = "average",
         *,
         longest: int = _LONGEST_LEG,
@@ -823,6 +853,12 @@ class _Search:
     ) -> None:
         self._unit = abs(int(unit)) or 1
         self._objective = objective
+        #: Every region's best reading: what its share is a share of. Raised
+        #: whenever a reading beats it.
+        self.peaks = [float(peak) for peak in peaks]
+        #: The bests the way home and the climb are judged by, held as they
+        #: were when they set out.
+        self._held: "list[float]" = list(self.peaks)
         #: Whether the walks go on far enough to place every region's peak.
         self._depths = bool(depths)
         self._longest = max(4, int(longest))
@@ -839,21 +875,11 @@ class _Search:
         #: Step counts, for saying where a reading was within a leg. Never
         #: driven to, and never compared across a reversal.
         self._position = 0
-        self._leg: "list[tuple[int, float, tuple[float, ...]]]" = []
-        self._leg_best: "list[float]" = []
-        self._leg_top = 0.0
-        # The profile the leg across made, as steps back from its far end
-        # against the average there; where on it the best is; and how high a
-        # reading on the way home has to be to say the optics are moving.
-        self._profile: "tuple[np.ndarray, np.ndarray]" = (np.zeros(1), np.zeros(1))
-        self._best_at = 0.0
-        self._peak = 0.0
-        self._far_end = 0.0
-        self._moving = 0.0
-        # Every reading on the way home, against how far it had driven.
-        self._way_home: "list[tuple[float, float]]" = []
-        self._travel = 0.0
-        self._reach = 0.0
+        #: The leg being walked: where, and what every region read there.
+        self._leg: "list[tuple[int, tuple[float, ...]]]" = []
+        #: What every region read at every probe, for the best of them.
+        self._probed: "list[tuple[float, ...]]" = []
+        self._way: "WayHome | None" = None
         self._homecomings = _HOMECOMINGS
         self._climb: "FineTune | None" = None
         self.probes = 0
@@ -870,48 +896,75 @@ class _Search:
         return self._unit
 
     @property
+    def position(self) -> int:
+        """Where the next reading is taken, in step counts from where it began."""
+        return self._position
+
+    @property
     def done(self) -> bool:
         return self._state == "done"
 
-    def step(self, shares: "Sequence[float]") -> "Move | None":
-        """Every region's share of its own peak, here; answer the next move."""
+    def shares(
+        self, readings: "Sequence[float]", peaks: "Sequence[float] | None" = None
+    ) -> "tuple[float, ...]":
+        """Every region's reading as a share of its best -- as it is now, or *peaks*."""
+        peaks = self.peaks if peaks is None else peaks
+        return tuple(
+            reading / peak if peak > 0.0 else 0.0
+            for reading, peak in zip(readings, peaks)
+        )
+
+    def score(
+        self, readings: "Sequence[float]", peaks: "Sequence[float] | None" = None
+    ) -> float:
+        """The one number climbed, for what every region read at one probe."""
+        return combine(self.shares(readings, peaks), self._objective)
+
+    def step(self, readings: "Sequence[float]") -> "Move | None":
+        """What every region read here; answer the next move."""
         if self._state == "done":
             return None
+        readings = tuple(float(reading) for reading in readings)
         self.probes += 1
-        score = combine(shares, self._objective)
-        self.best = max(self.best, score)
+        self.peaks = [max(peak, reading) for peak, reading in zip(self.peaks, readings)]
+        self._probed.append(readings)
+        self.best = max(self.score(seen) for seen in self._probed)
         if self._state == "home":
-            return self._home(score)
+            return self._home(readings)
         if self._state == "climb":
-            return self._climbing(score)
-        return self._walk(score, tuple(float(share) for share in shares))
+            return self._climbing(readings)
+        return self._walk(readings)
 
     # -- out and across ----------------------------------------------------
 
-    def _walk(self, score: float, shares: "tuple[float, ...]") -> "Move | None":
-        self._leg.append((self._position, score, shares))
-        if len(self._leg) == 1:
-            self._leg_best, self._leg_top = list(shares), score
-        else:
-            self._leg_best = [max(a, b) for a, b in zip(self._leg_best, shares)]
-            self._leg_top = max(self._leg_top, score)
-        if not (self._past(score, shares) or len(self._leg) > self._longest):
+    def _walk(self, readings: "tuple[float, ...]") -> "Move | None":
+        self._leg.append((self._position, readings))
+        if not (self._past(readings) or len(self._leg) > self._longest):
             return self._drive()
         if self._state == "out":
             # The leg across begins where this one ended, with this reading.
             self._state = "across"
             self._direction = -self._direction
             self._leg = [self._leg[-1]]
-            self._leg_best, self._leg_top = list(shares), score
             self._waited = 0
             return self._drive()
         self.survey = (
-            np.array([position for position, _s, _r in self._leg], dtype=float),
-            np.array([seen for _p, _s, seen in self._leg], dtype=float),
+            np.array([position for position, _r in self._leg], dtype=float),
+            np.array([self.shares(seen) for _p, seen in self._leg], dtype=float),
         )
-        return self._turn_for_home(score)
+        return self._turn_for_home(readings)
 
-    def _past(self, score: float, shares: "tuple[float, ...]") -> bool:
+    def _leg_top(self) -> float:
+        """The best number this leg has read, by every region's best as it is now."""
+        return max(self.score(seen) for _p, seen in self._leg)
+
+    def _leg_best(self) -> "list[float]":
+        """Each region's best share on this leg, of its best as it is now."""
+        return list(
+            self.shares([max(column) for column in zip(*(seen for _p, seen in self._leg))])
+        )
+
+    def _past(self, readings: "tuple[float, ...]") -> bool:
         """Whether this walk has gone far enough the way it is going.
 
         Far enough is when the number the search climbs has fallen below the
@@ -933,15 +986,16 @@ class _Search:
         on to where a sharp region was at a third of its best: the broad ones
         around it had barely begun to fall.
         """
-        if len(self._leg) < 2 or score >= self._turn_back * self._leg_top:
+        if len(self._leg) < 2 or self.score(readings) >= self._turn_back * self._leg_top():
             self._waited = 0
             return False
         self._waited += 1
+        shares, best = self.shares(readings), self._leg_best()
         if self._depths:
-            if all(self._seen(share, best) for share, best in zip(shares, self._leg_best)):
+            if all(self._seen(share, most) for share, most in zip(shares, best)):
                 return True
             return self._waited > _DEPTH_PATIENCE
-        if self._rising(shares):
+        if self._rising(shares, best):
             return self._waited > _CLIMB_PATIENCE
         return True
 
@@ -958,93 +1012,48 @@ class _Search:
             return fallen and best >= _NEAR_ITS_BEST
         return fallen
 
-    def _rising(self, shares: "tuple[float, ...]") -> bool:
+    def _rising(self, shares: "tuple[float, ...]", best: "list[float]") -> bool:
         """Whether some region is visibly on its way up to its own best."""
-        recent = [seen for _p, _s, seen in self._leg[-_CLIMBING_OVER - 1 :]]
-        for region, (share, best) in enumerate(zip(shares, self._leg_best)):
+        recent = [self.shares(seen) for _p, seen in self._leg[-_CLIMBING_OVER - 1 :]]
+        for region, (share, most) in enumerate(zip(shares, best)):
             lowest = min(seen[region] for seen in recent)
-            if share >= best - 0.01 and share - lowest >= _CLIMBING:
+            if share >= most - 0.01 and share - lowest >= _CLIMBING:
                 return True
         return False
 
-    def _turn_for_home(self, score: float) -> "Move | None":
-        """Make a profile of the leg across, find its best, and start back."""
-        where = np.array([position for position, _s, _r in self._leg], dtype=float)
-        read = np.array([value for _p, value, _r in self._leg], dtype=float)
-        best = _best_of(where, read)
-        if best is None:
-            return self._start_climb(score)
-        end = where[-1]
-        # Steps back from the far end, which is the way the walk home counts,
-        # in the order it will meet them.
-        back = np.abs(where - end)[::-1]
-        self._profile = (back, read[::-1])
-        self._best_at = abs(best - end)
-        self._peak = float(read.max())
-        self._far_end = float(read[-1])
-        self._moving = _ON_THE_WAY * (self._peak - float(read.min()))
-        self._way_home = [(0.0, score)]
-        self._travel = 0.0
-        self._reach = 2.0 * float(back[-1]) + 4 * self._unit
+    def _turn_for_home(self, readings: "tuple[float, ...]") -> "Move | None":
+        """Make a profile of the leg just walked, find its best, and start back."""
+        self._held = list(self.peaks)
+        way = WayHome.along(
+            [position for position, _r in self._leg],
+            [self.score(seen, self._held) for _p, seen in self._leg],
+            self._unit,
+        )
+        if way is None:
+            return self._start_climb(readings)
+        self._way = way
         self._state = "home"
         self._direction = -self._direction
         # The walk home is a leg of its own, and if it has to it will be the
         # profile for another way home; see _arrived.
-        self._leg = [(self._position, score, ())]
+        self._leg = [(self._position, readings)]
         return self._drive_home()
 
     # -- home --------------------------------------------------------------
 
-    def _home(self, score: float) -> "Move | None":
-        self._way_home.append((self._travel, score))
-        self._leg.append((self._position, score, ()))
-        moving = sum(
-            1 for _t, value in self._way_home
-            if abs(value - self._far_end) > self._moving
-        )
-        if moving >= _ENOUGH_ON_THE_WAY:
-            left = self._play() + self._best_at - self._travel
-            if left < self._unit / 2:
-                return self._arrived(score)
-        if self._travel >= self._reach:
-            return self._start_climb(score)
+    def _home(self, readings: "tuple[float, ...]") -> "Move | None":
+        assert self._way is not None
+        self._leg.append((self._position, readings))
+        score = self.score(readings, self._held)
+        verdict = self._way.heard(score)
+        if verdict == "home":
+            return self._arrived(readings, score)
+        if verdict == "lost":
+            return self._start_climb(readings)
         return self._drive_home()
 
-    def _play(self) -> float:
-        """How much play was taken up before the way home started moving.
-
-        Whatever lines the readings on the way home up with the profile the
-        leg across made. Until the play is taken up the optics are at the far
-        end of that leg, reading what it read there; after it, they are as
-        far back along it as the walk has driven, less the play. Every
-        reading counts, so the grain on any one of them is shared out.
-        """
-        back, profile = self._profile
-        travel = np.array([t for t, _value in self._way_home])
-        seen = np.array([value for _t, value in self._way_home])
-        # Largest first, so that of two that fit as well the larger is taken:
-        # readings that have not changed say the optics have not moved, and
-        # the play that says that is the one that is at least as long as the
-        # walk that read them.
-        candidates = np.arange(self._travel, -_PLAY_RESOLUTION, -_PLAY_RESOLUTION)
-        misses = [
-            float(
-                np.sum(
-                    (seen - np.interp(np.maximum(travel - play, 0.0), back, profile))
-                    ** 2
-                )
-            )
-            for play in candidates
-        ]
-        return float(max(candidates[int(np.argmin(misses))], 0.0))
-
-    def _arrived(self, score: float) -> "Move | None":
+    def _arrived(self, readings: "tuple[float, ...]", score: float) -> "Move | None":
         """Home, if the reading here agrees; otherwise, go home again.
-
-        It will not agree when the top is a single increment wide and the
-        play was placed a step out -- a steep enough hill loses a quarter of
-        its reading in one increment -- or when the walk home went past the
-        best before it could tell how much play there had been.
 
         The walk home is an honest leg in one direction once its play was
         taken up, and it has usually crossed the best by then: so it is a
@@ -1054,27 +1063,30 @@ class _Search:
         still -- is the search handed to a climb, which is what a fine tune
         does best and which climbs whatever hill it is next to.
         """
-        if score >= (1.0 - _ARRIVED) * self._peak:
+        assert self._way is not None
+        if self._way.agrees(score):
             return self._finish("found")
         if self._homecomings > 0 and len(self._leg) >= 5:
             self._homecomings -= 1
-            return self._turn_for_home(score)
-        return self._start_climb(score)
+            return self._turn_for_home(readings)
+        return self._start_climb(readings)
 
     def _drive_home(self) -> Move:
-        self._travel += self._unit
+        assert self._way is not None
+        self._way.drive()
         return self._drive()
 
     # -- when the way home is lost -----------------------------------------
 
-    def _start_climb(self, score: float) -> "Move | None":
+    def _start_climb(self, readings: "tuple[float, ...]") -> "Move | None":
         self._state = "climb"
+        self._held = list(self.peaks)
         self._climb = FineTune(self._unit, autofocus=False)
-        return self._climbing(score)
+        return self._climbing(readings)
 
-    def _climbing(self, score: float) -> "Move | None":
+    def _climbing(self, readings: "tuple[float, ...]") -> "Move | None":
         assert self._climb is not None
-        move = self._climb.step(score)
+        move = self._climb.step(self.score(readings, self._held))
         if move is None:
             return self._finish(self._climb.outcome or "found")
         self._position += move.steps
@@ -1091,75 +1103,6 @@ class _Search:
         self._state = "done"
         self.outcome = outcome
         return None
-
-
-def _best_of(where: np.ndarray, read: np.ndarray) -> "float | None":
-    """Where along a leg across the average is best, or None if it cannot say.
-
-    None when the leg is too short to have a shape, or its top stands so
-    little above its ends that the shape is the grain's.
-    """
-    if len(read) < 5:
-        return None
-    peak = float(read.max())
-    ends = max(float(read[0]), float(read[-1]))
-    if peak <= 0.0 or peak - ends < _TALL_ENOUGH * peak:
-        return None
-    for share in _ON_TOP:
-        level = ends + share * (peak - ends)
-        first, last = _run_around_top(list(read), level)
-        if last - first + 1 >= _TOP_READINGS:
-            break
-    return _middle_of_top(list(where), list(read), level)
-
-
-def _run_around_top(read: "list[float]", level: float) -> "tuple[int, int]":
-    """The first and last index of the run of readings above *level* that
-    holds the highest of them."""
-    first = last = int(np.argmax(read))
-    while first > 0 and read[first - 1] >= level:
-        first -= 1
-    while last + 1 < len(read) and read[last + 1] >= level:
-        last += 1
-    return first, last
-
-
-def _middle_of_top(
-    where: "list[int]", read: "list[float]", level: float
-) -> "float | None":
-    """Where the highest hill of the leg is highest, from every reading on it.
-
-    Only the run of readings above *level* that holds the highest of them:
-    another hill that also clears the line is another answer, and averaging
-    the two would put the result in the valley between.
-
-    Over that run, one of two estimators, chosen by how many readings are on
-    the top. A top of several readings is found as
-    their middle, weighted by how far above the line each stands, which
-    divides the grain on them between them -- on a broad top every reading is
-    within the grain of the others, and which is highest is the grain's
-    choice. A top of three is found as the parabola through them, which is
-    the better estimator when the hill is narrow against the step.
-    """
-    if not read:
-        return None
-    first, last = _run_around_top(read, level)
-    xs = np.array(where[first : last + 1], dtype=float)
-    ys = np.array(read[first : last + 1], dtype=float)
-    weights = ys - level
-    total = float(weights.sum())
-    centre = float((xs * weights).sum() / total) if total > 0.0 else float(xs.mean())
-    if len(xs) != 3 or np.ptp(xs) <= 0.0:
-        return centre
-    # Fitted about the centre, which keeps the arithmetic well conditioned
-    # however far from zero the step counts have wandered.
-    curvature, slope, _height = np.polyfit(xs - centre, ys, 2)
-    if curvature >= 0.0:
-        return centre
-    vertex = centre - slope / (2.0 * curvature)
-    if not xs.min() <= vertex <= xs.max():
-        return centre
-    return float(vertex)
 
 
 # -- the calibration as a whole ----------------------------------------------
@@ -1196,7 +1139,12 @@ class Calibration:
         self._turn_back = min(max(float(turn_back), TURN_BACK_RANGE[0]), TURN_BACK_RANGE[1])
         self._measure_depths = bool(depths)
         count = len(self._regions)
+        #: Each region's best reading and the picture of it: its fine tune's
+        #: to begin with, then any the compromise reads higher.
         self._best: "list[Look | None]" = [None] * count
+        #: What each region's fine tune found on its own, kept for saying so
+        #: when the compromise has read it higher since.
+        self._tuned: "list[float | None]" = [None] * count
         self._outcomes = [""] * count
         self._views: "list[View | None]" = [None] * count
         self._index = 0
@@ -1212,7 +1160,15 @@ class Calibration:
         self._autofocuses = 0
         self._moves = 0
         self._travel = 0
-        self._history: "list[tuple[str, tuple[float, ...], float]]" = []
+        #: The compromise probe by probe: what the search was doing, and what
+        #: every usable region read. Readings rather than shares, because
+        #: what a share is a share of can go up while it runs.
+        self._history: "list[tuple[str, tuple[float, ...]]]" = []
+        #: Every reading of every region, for the report; see :class:`Reading`.
+        self._readings: "list[Reading]" = []
+        #: The regions, by index, whose best the last probe of the compromise
+        #: read higher than, so the worker can say so.
+        self.bettered: "tuple[int, ...]" = ()
         #: Whether the compromise has driven the lens yet, which is what says
         #: the next probe has to wait for the picture to settle first.
         self.moved = False
@@ -1260,6 +1216,11 @@ class Calibration:
 
     def view(self, index: int) -> "View | None":
         return self._views[index]
+
+    def best_of(self, index: int) -> float:
+        """Region *index*'s best reading so far, or 0 if it has none."""
+        look = self._best[index]
+        return look.reading if look is not None else 0.0
 
     @property
     def usable(self) -> "list[int]":
@@ -1321,7 +1282,9 @@ class Calibration:
     @property
     def shares(self) -> "tuple[float, ...]":
         """Every usable region's share of its best at the last probe."""
-        return self._history[-1][1] if self._history else ()
+        if not self._history or self._search is None:
+            return ()
+        return self._search.shares(self._history[-1][1])
 
     @property
     def history_regions(self) -> "tuple[int, ...]":
@@ -1337,13 +1300,43 @@ class Calibration:
         """The camera's own autofocus was run, which drives an unknown way."""
         self._autofocuses += 1
 
+    def noted(
+        self,
+        index: int,
+        stage: str,
+        position: int,
+        value: float,
+        after: float = float("nan"),
+    ) -> None:
+        """One reading of region *index*, for the report's record of them all.
+
+        The compromise's readings are noted by :meth:`take`; this is for the
+        fine tunes', which only the worker sees. See :class:`Reading`.
+        """
+        self._readings.append(
+            Reading(
+                region=index + 1,
+                stage=stage,
+                position=int(position),
+                value=float(value),
+                at=self.elapsed,
+                after=float(after),
+            )
+        )
+
     def region_tuned(
         self, look: Look, outcome: str, view: "View | None", probes: int = 0
     ) -> bool:
-        """Keep what the fine tune on this region found; say if another follows."""
+        """Keep what the fine tune on this region found; say if another follows.
+
+        *look* is its best reading and the picture that came with it, and
+        *view* the view it was read through -- which every later reading of
+        the region is taken through.
+        """
         if self._index >= len(self._regions):
             raise RuntimeError("every region has been tuned already")
         self._best[self._index] = look
+        self._tuned[self._index] = look.reading
         self._outcomes[self._index] = outcome
         self._views[self._index] = view
         self._tune_probes.append(int(probes))
@@ -1357,7 +1350,7 @@ class Calibration:
 
         It takes two regions with a peak each to have anything to compromise
         between. The search starts wherever the last fine tune left the lens,
-        on that region's peak, and without an autofocus: there is no one
+        near that region's peak, and without an autofocus: there is no one
         place for the camera to focus on. See :class:`_Search`.
         """
         usable = self.usable
@@ -1368,6 +1361,7 @@ class Calibration:
         self._order = sorted(usable, reverse=True)
         self._search = _Search(
             self._step,
+            [self._best[index].reading for index in usable],
             self._objective,
             longest=self._longest,
             turn_back=self._turn_back,
@@ -1386,11 +1380,20 @@ class Calibration:
         self._order.reverse()
         return now
 
-    def take(self, looks: "dict[int, Look]") -> "Move | None":
+    def take(
+        self,
+        looks: "dict[int, Look]",
+        after: "dict[int, float] | None" = None,
+    ) -> "Move | None":
         """Every usable region read at one focus position; answer the next move.
 
         None means it is standing on the compromise, and *looks* are what
-        every region reads there.
+        every region reads there. *after* is how long after the lens last
+        moved each was read, for the record; see :class:`Reading`.
+
+        A region read higher than its best has that for its best from here
+        on, picture and all -- see :class:`_Search` for why -- and is listed
+        in :attr:`bettered` until the next probe.
         """
         search = self._search
         if search is None:
@@ -1398,15 +1401,29 @@ class Calibration:
         if search.done:
             return None
         usable = self.usable
-        readings = [
+        readings = tuple(
             looks[index].reading if index in looks else 0.0 for index in usable
-        ]
-        peaks = [self._best[index].reading for index in usable]
-        shares = [reading / peak for reading, peak in zip(readings, peaks)]
+        )
+        bettered = []
+        for index in usable:
+            look = looks.get(index)
+            if look is not None and look.reading > self._best[index].reading:
+                self._best[index] = look
+                bettered.append(index)
+        self.bettered = tuple(bettered)
+        for index, reading in zip(usable, readings):
+            self.noted(
+                index,
+                search.state,
+                search.position,
+                reading,
+                (after or {}).get(index, float("nan")),
+            )
         self._latest = dict(looks)
-        self._score = combine(shares, self._objective)
-        self._history.append((search.state, tuple(shares), self._score))
-        return search.step(shares)
+        self._history.append((search.state, readings))
+        move = search.step(readings)
+        self._score = search.score(readings)
+        return move
 
     # -- what it all came to -----------------------------------------------
 
@@ -1436,6 +1453,12 @@ class Calibration:
         }
 
     def report(self, stopped: bool = False) -> CalibrationReport:
+        """What it all came to.
+
+        Every share in it is of each region's best as it finally stood --
+        the search's history included, which the search itself saw against
+        bests that were still going up.
+        """
         search = self._search
         settled = search is not None and search.done and not stopped
         depths = self.depths()
@@ -1449,9 +1472,19 @@ class Calibration:
                 depth=depths[index][0] if index in depths else None,
                 doubt=depths[index][1] if index in depths else float("inf"),
                 edge=depths[index][2] if index in depths else False,
+                tuned=self._tuned[index],
             )
             for index, region in enumerate(self._regions)
         )
+        history: "tuple[tuple[str, tuple[float, ...], float], ...]" = ()
+        score = None
+        if search is not None:
+            history = tuple(
+                (stage, search.shares(readings), search.score(readings))
+                for stage, readings in self._history
+            )
+            if settled and self._history:
+                score = search.score(self._history[-1][1])
         if stopped:
             outcome = "stopped"
         elif search is not None:
@@ -1460,7 +1493,7 @@ class Calibration:
             outcome = "single" if len(self.usable) == 1 else "nothing"
         return CalibrationReport(
             results=results,
-            score=self._score if settled else None,
+            score=score,
             outcome=outcome,
             probes=self.probes,
             objective=self._objective,
@@ -1469,10 +1502,11 @@ class Calibration:
             autofocuses=self._autofocuses,
             moves=self._moves,
             travel=self._travel,
-            history=tuple(self._history),
+            history=history,
             history_regions=self.history_regions if search is not None else (),
             depths_measured=self._measure_depths,
             began=self._began,
+            readings=tuple(self._readings),
         )
 
 

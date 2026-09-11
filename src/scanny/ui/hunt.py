@@ -44,6 +44,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .homing import WayHome
+
 __all__ = ["FineTune", "Move"]
 
 #: How much better a reading has to be before it counts as better.
@@ -145,6 +147,11 @@ _PATIENCE_TRAVEL = 400
 #: answer and one that ends on whichever direction it was last walking down.
 _MOST_TURNS = 10
 
+#: How many times the way home may be set off on again, from the stretch the
+#: last way home walked, when it arrives somewhere the reading says is not
+#: the top -- before the rest of the way is walked by the reading alone.
+_HOMECOMINGS = 2
+
 #: Bounds, because the body does not report the end of its travel: a lens
 #: driven into its stop keeps answering "moved". About 6000 steps covers the
 #: whole range on a D750, and the travel here is measured from the best
@@ -188,10 +195,17 @@ class FineTune:
       way, and that is the only thing it can mean.
     - Once the reading has fallen away on **both sides of the best**, the best
       is a peak rather than a slope, and there is nothing left to explore.
-    - **Walk back to it**, still turning round whenever the reading gets
-      worse, and stop when the reading is back to what it was.
+    - **Go back to it** along the stretch it last walked in one direction,
+      which crossed the peak: see :class:`~scanny.ui.homing.WayHome`. Only if
+      that loses the way is the rest walked by the reading alone -- turning
+      round whenever it gets worse, and stopping when it is back to what it
+      was.
     - If what it ends on is worse than the baseline after all, **autofocus
       once more** and say so.
+
+    Asked not to *come back*, it stops as soon as there is nothing left to
+    explore, wherever that leaves the lens: for a calibration, which wants
+    each region's best reading and walks the lens somewhere else next anyway.
 
     Three things about it are worth keeping.
 
@@ -228,8 +242,12 @@ class FineTune:
         patience: int = _PATIENCE_PROBES,
         patience_travel: int = _PATIENCE_TRAVEL,
         most_turns: int = _MOST_TURNS,
+        come_back: bool = True,
     ) -> None:
         self._unit = abs(int(step)) or 1
+        #: Whether it goes back to stand on the best once it has found it, or
+        #: stops where the finding left it.
+        self._come_back = bool(come_back)
         self._improvement = improvement
         #: Which way the walk sets off. Nothing recommends one over the other
         #: -- it turns round of its own accord -- so it is a parameter for the
@@ -284,6 +302,13 @@ class FineTune:
         #: and a step past a peak cannot be taken back without crossing the
         #: whole of the gearing's play again.
         self._target = 0.0
+        #: Where in :attr:`trail` the stretch walked in one direction since the
+        #: last reversal begins: the profile the way home is read off.
+        self._leg_start = 0
+        #: The way home, while it is being walked by the profile rather than
+        #: by the reading alone.
+        self._home: "WayHome | None" = None
+        self._homecomings = _HOMECOMINGS
         #: Where the reading has been seen to fall away, in step counts from
         #: where the walk began. **Read, never driven to**: they answer one
         #: question, which is whether the best reading has been walked past on
@@ -357,6 +382,8 @@ class FineTune:
         # autofocus already asked for has to be allowed to finish.
         if self._state == "walking" and self._probes > self._max_probes:
             if not self._going_back:
+                if not self._come_back:
+                    return self._stop_here(reading, "exhausted")
                 # Out of probes to explore with, but not out of the walk: it
                 # still has to go and stand on the best reading it found.
                 self._turn_for_home()
@@ -403,6 +430,7 @@ class FineTune:
         self._baseline = self._best = self._previous = reading
         self._leg_best = reading
         self._best_position = self._position
+        self._leg_start = len(self.trail) - 1
         self._state = "walking"
         return self._drive()
 
@@ -410,6 +438,8 @@ class FineTune:
 
     def _walking(self, reading: float) -> "Move | None":
         """One settled reading, and what it says about where to step next."""
+        if self._home is not None:
+            return self._homing(reading)
         previous, self._previous = self._previous, reading
         if reading > self._best:
             self._best, self._best_position = reading, self._position
@@ -439,6 +469,7 @@ class FineTune:
             self._going_back
             and self._rose
             and falling
+            and previous >= self._target * (1 - _SAGGED)
             and reading >= self._target * (1 - _COLLAPSED)
         ):
             # It climbed towards what it came back for and went over the top
@@ -446,12 +477,16 @@ class FineTune:
             # walk is the luckiest of them and may not come again; this is as
             # near to it as stepping is going to get.
             #
-            # Only when it is genuinely near, though, and that condition is
+            # Only when it is genuinely near, though, and both conditions are
             # doing real work. Crossing a lens's play the reading wanders, so
             # a rise of two per cent followed by a fall of three is ordinary
-            # -- and without the test it reads as "climbed to the target and
-            # went over it" while standing at a tenth of the target, which
-            # ends the whole search a dozen steps from focus.
+            # -- and without them it reads as "climbed to the target and
+            # went over it" while standing anywhere in the play. The walk
+            # turns for home once the reading has sagged a twentieth or so
+            # below the best, so the play is crossed at around nine tenths of
+            # the target: a test of the reading alone let a real calibration
+            # stop there, seven per cent short of each region's best. The top
+            # it went over has to have been near the target too.
             return self._settle_on(reading, "found")
 
         if collapsed:
@@ -520,7 +555,11 @@ class FineTune:
         if not self._going_back and (
             self._straddled() or self._turns >= self._most_turns
         ):
+            if not self._come_back:
+                return self._stop_here(reading, "found")
             self._turn_for_home()
+            if self._set_off_home():
+                return self._drive_home()
         elif self._going_back and self._turns >= self._most_turns + _MOST_TURNS:
             # Sent back and forth more than any single-humped reading can
             # account for: the reading is too unsteady to walk by.
@@ -550,7 +589,7 @@ class FineTune:
         else:
             self._turns += 1
         self._best_at_last_turn = self._best
-        self._direction = -self._direction
+        self._reverse()
         self._fresh_leg(reading)
         return self._drive()
 
@@ -560,10 +599,100 @@ class FineTune:
         self._rose = False
         self._leg_best = reading
 
+    def _reverse(self) -> None:
+        """Turn round: the reading just taken is where the next stretch starts."""
+        self._direction = -self._direction
+        self._leg_start = len(self.trail) - 1
+
     def _turn_for_home(self) -> None:
         """Stop exploring and go and stand on the best reading there was."""
         self._going_back = True
         self._target = self._best
+
+    # -- the way home ------------------------------------------------------
+
+    def _set_off_home(self) -> bool:
+        """Turn round for home along the stretch just walked, if it has a top.
+
+        The stretch since the last reversal was walked in one direction, and
+        the walk turned because the reading had fallen away on the far side
+        of the best -- so it went over the top, and its readings are an
+        honest profile of it. False when they are not: too few, or no top
+        standing clear of the grain, which leaves the way home to be walked by
+        the reading alone.
+
+        Or a top that is not the best: a stretch spent crossing a long play
+        reads the same thing all the way along, give or take the grain, and
+        the grain can make a hump in it that looks like a top. The best was
+        somewhere else, and this is not the way to it. Not *exactly* the
+        best, though: the best of a walk is its luckiest reading, and on a
+        top one increment wide where the play leaves the increments across it
+        decides how near the top any of them comes. A top within a tenth of
+        the best is the top.
+        """
+        stretch = self.trail[self._leg_start :]
+        home = WayHome.along(
+            [where for where, _reading in stretch],
+            [reading for _where, reading in stretch],
+            self._unit,
+        )
+        if home is None or home.peak < self._best * (1 - _COLLAPSED):
+            return False
+        self._home = home
+        self._reverse()
+        return True
+
+    def _homing(self, reading: float) -> "Move | None":
+        """One reading on the way home, walked by the profile of the stretch.
+
+        Arriving where the profile says the top is and reading what the top
+        read there is home. Arriving and reading something else is a way
+        home that was misjudged -- the play placed a step out on a top a
+        step wide -- and the way just walked is an honest stretch in one
+        direction of its own, so it is set off along again, from the other
+        side. Only when that too has failed, or the way was lost altogether,
+        is the rest of it walked by the reading alone.
+        """
+        home = self._home
+        assert home is not None
+        if reading > self._best:
+            self._best, self._best_position = reading, self._position
+        verdict = home.heard(reading)
+        if verdict == "on":
+            self._previous = reading
+            return self._drive_home()
+        if verdict == "home":
+            if home.agrees(reading):
+                return self._settle_on(reading, "found")
+            if self._climbing_home(reading):
+                # Arrived by the count, short of the top by the reading, and
+                # still climbing towards it: the play was longer than it
+                # looked. Carry on over the top; the stretch has one to go
+                # back to once it has.
+                self._previous = reading
+                return self._drive_home()
+            if self._homecomings > 0 and self._set_off_home():
+                self._homecomings -= 1
+                self._previous = reading
+                return self._drive_home()
+        # Walked by the reading from here, towards the best there was.
+        self._home = None
+        self._fresh_leg(reading)
+        return self._walking(reading)
+
+    def _climbing_home(self, reading: float) -> bool:
+        """Whether this reading is the highest the way home has read, and a rise."""
+        way = [value for _where, value in self.trail[self._leg_start :]]
+        return (
+            len(way) >= 2
+            and reading >= max(way)
+            and reading > self._previous * (1 + self._improvement)
+        )
+
+    def _drive_home(self) -> Move:
+        assert self._home is not None
+        self._home.drive()
+        return self._drive()
 
     def _proven(self, reading: float) -> bool:
         """Whether this turn is evidence that the best has been walked past.
@@ -611,6 +740,11 @@ class FineTune:
     def _restoring(self, reading: float) -> "Move | None":
         self._confirmed = reading
         return self._stop("restored")
+
+    def _stop_here(self, reading: float, outcome: str) -> None:
+        """Stop without going back: what was wanted was the best, not to stand on it."""
+        self._confirmed = reading
+        return self._stop(outcome)
 
     # -- driving -----------------------------------------------------------
 
