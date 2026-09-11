@@ -136,6 +136,34 @@ def test_a_click_aims_at_what_is_under_the_pointer(view, orientation):
     assert back[1] * target.height() == pytest.approx(30, abs=1.0)
 
 
+@pytest.mark.parametrize(
+    "orientation",
+    [Orientation(turns=t, mirrored=m) for t in range(4) for m in (False, True)],
+)
+def test_the_arrow_keys_pan_the_way_they_point_on_the_screen(view, orientation):
+    """The camera pans across the sensor, so the step goes out in the frame's
+    coordinates -- and must still carry the view the way the key points."""
+    steps = []
+    view.panStepped.connect(lambda dx, dy: steps.append((dx, dy)))
+    view.set_orientation(orientation)
+    QApplication.processEvents()
+
+    start = (0.3, 0.6)
+    for key, screen in (
+        (Qt.Key.Key_Left, (-1, 0)),
+        (Qt.Key.Key_Right, (1, 0)),
+        (Qt.Key.Key_Up, (0, -1)),
+        (Qt.Key.Key_Down, (0, 1)),
+    ):
+        QTest.keyClick(view, key)
+        dx, dy = steps[-1]
+        a = orientation.to_view(*start)
+        b = orientation.to_view(start[0] + 0.1 * dx, start[1] + 0.1 * dy)
+        moved = ((b[0] - a[0]) / 0.1, (b[1] - a[1]) / 0.1)
+        assert moved == pytest.approx(screen, abs=1e-9)
+    assert len(steps) == 4
+
+
 def test_the_overlays_are_turned_with_the_picture(view):
     """They arrive in the frame's coordinates and are drawn on a turned picture.
 

@@ -199,6 +199,21 @@ class Orientation:
             x = 1.0 - x
         return x, y
 
+    def step_from_view(self, dx: int, dy: int) -> "tuple[int, int]":
+        """A direction on the screen as a direction in the frame.
+
+        What the arrow keys are read through: the camera pans by moving its
+        focus point across the sensor, so *right* has to become whichever way
+        across the frame is right on a picture that has been turned. A
+        direction and not a place, so only the turning part of
+        :meth:`from_view` applies and none of its shifting back into 0 to 1.
+        """
+        for _ in range(self.turns):
+            dx, dy = dy, -dx
+        if self.mirrored:
+            dx = -dx
+        return dx, dy
+
     def rect_to_view(
         self, rect: "tuple[float, float, float, float]"
     ) -> "tuple[float, float, float, float]":

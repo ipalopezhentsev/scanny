@@ -81,7 +81,7 @@ class LiveViewWidget(QWidget):
     zoomToggled = Signal()
     #: Esc or 0: always back to the whole frame, whatever the current state.
     zoomReset = Signal()
-    #: Arrow keys: pan by (dx, dy) steps of -1, 0 or +1.
+    #: Arrow keys: pan by (dx, dy) steps of -1, 0 or +1, across the frame.
     panStepped = Signal(int, int)
     #: Ctrl-click: put a point to be measured here, or take away the one
     #: already here. Ctrl because every other button and modifier on the
@@ -482,7 +482,9 @@ class LiveViewWidget(QWidget):
         The camera has no separate pan control: it centres the magnified view
         on the focus point, so moving that point is what scrolls the view.
         Held keys repeat, which is what makes this feel like panning rather
-        than nudging.
+        than nudging. The keys name directions on the screen and the step goes
+        out in the frame's, like every other signal here, so *right* still
+        pans towards what is to the right of the picture however it is turned.
         """
         key = Qt.Key(event.key())
         if key in (Qt.Key.Key_Escape, Qt.Key.Key_0):
@@ -517,7 +519,7 @@ class LiveViewWidget(QWidget):
         if step is None or self._frame is None:
             super().keyPressEvent(event)
             return
-        self.panStepped.emit(*step)
+        self.panStepped.emit(*self._orientation.step_from_view(*step))
         event.accept()
 
     def wheelEvent(self, event) -> None:  # noqa: N802

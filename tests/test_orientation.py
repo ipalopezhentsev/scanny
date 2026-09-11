@@ -127,6 +127,22 @@ def test_every_arrangement_round_trips(orientation):
 
 
 @pytest.mark.parametrize("orientation", arrangements())
+def test_a_step_on_the_screen_moves_that_way_on_the_screen(orientation):
+    """An arrow key names a screen direction; the frame step has to honour it.
+
+    Checked by taking the step in the frame from a place off the middle and
+    seeing which way ``to_view`` moves that place on the screen.
+    """
+    start = (0.3, 0.6)
+    for screen in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        dx, dy = orientation.step_from_view(*screen)
+        assert {abs(dx), abs(dy)} == {0, 1}
+        a = orientation.to_view(*start)
+        b = orientation.to_view(start[0] + 0.1 * dx, start[1] + 0.1 * dy)
+        assert close(((b[0] - a[0]) / 0.1, (b[1] - a[1]) / 0.1), screen)
+
+
+@pytest.mark.parametrize("orientation", arrangements())
 def test_the_pixels_go_where_the_coordinates_say(orientation):
     """Qt turns the picture; arithmetic turns the overlays. They must agree.
 
