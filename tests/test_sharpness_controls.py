@@ -197,7 +197,7 @@ def test_the_area_is_remembered_for_next_time(window):
 
 
 def test_a_nonsense_stored_area_is_ignored(window):
-    QSettings().setValue("focus/sharpness_rect", "not, an, area")
+    QSettings().setValue(mw._MEASURE_AREA_KEY, "not, an, area")
     again = mw.MainWindow()
     try:
         again.measure_sharpness.setChecked(True)
@@ -366,7 +366,7 @@ def test_a_remembered_choice_reaches_the_worker_at_startup(started):
 def test_a_remembered_area_reaches_the_worker_at_startup(started):
     QSettings().setValue("focus/sharpness", True)
     QSettings().setValue("focus/sharpness_area", True)
-    QSettings().setValue("focus/sharpness_rect", "0.2,0.3,0.4,0.25")
+    QSettings().setValue(mw._MEASURE_AREA_KEY, "0.2,0.3,0.4,0.25")
     made = mw.MainWindow()
     try:
         assert ("set_sharpness_area", ((0.2, 0.3, 0.4, 0.25),)) in started.calls

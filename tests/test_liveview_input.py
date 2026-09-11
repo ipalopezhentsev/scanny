@@ -186,6 +186,42 @@ def test_shift_drag_marks_out_an_area_to_measure_instead_of_magnifying(
     assert 0.0 <= x < 1.0 and 0.0 <= y < 1.0 and w > 0 and h > 0
 
 
+def test_a_measured_area_is_reported_in_the_frame_s_coordinates(widget, events):
+    """Unlike every other rectangle the widget emits.
+
+    The measured area has to stay on the subject when the view magnifies or
+    pans, so it goes out as a place on the sensor. Magnified onto the frame's
+    top left quadrant, a rectangle drawn in the middle of the screen is in the
+    middle of *that quadrant*, which is a quarter of the way across the frame
+    -- not half.
+    """
+    widget.set_frame(
+        LiveViewFrame(
+            jpeg=_jpeg(),
+            width=640, height=424,
+            image_width=6016, image_height=4016,
+            crop_width=1504, crop_height=1004,
+            crop_center_x=1504, crop_center_y=1004,
+            af_width=324, af_height=270, af_x=1504, af_y=1004,
+        )
+    )
+    QApplication.processEvents()
+    shift = Qt.KeyboardModifier.ShiftModifier
+    middle = widget._target.center()
+    QTest.mousePress(widget, Qt.MouseButton.LeftButton, shift,
+                     middle - QPoint(40, 30))
+    QTest.mouseMove(widget, middle + QPoint(40, 30))
+    QTest.mouseRelease(widget, Qt.MouseButton.LeftButton, shift,
+                       middle + QPoint(40, 30))
+    assert len(events["measure"]) == 1
+    x, y, w, h = events["measure"][0]
+    assert x + w / 2 == pytest.approx(0.25, abs=0.02)
+    assert y + h / 2 == pytest.approx(0.25, abs=0.02)
+    # And it is a quarter of the frame across, so the rectangle is a quarter
+    # of the size the same drag would have marked out unmagnified.
+    assert 0 < w < 0.1 and 0 < h < 0.1
+
+
 def test_letting_go_of_shift_midway_does_not_turn_a_measurement_into_a_zoom(
     widget, events
 ):

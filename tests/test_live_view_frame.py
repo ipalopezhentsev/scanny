@@ -193,3 +193,37 @@ def test_a_point_at_the_edge_is_pulled_in_to_where_the_box_fits():
     frame = make_frame()
     assert frame.to_af_coords_in_frame(0.0, 0.0) == (162, 135)
     assert frame.to_af_coords_in_frame(1.0, 1.0) == (6016 - 162, 3376 - 135)
+
+
+# -- a place on the sensor, on whatever crop is on show ---------------------
+
+
+def test_a_place_on_screen_becomes_a_place_on_the_sensor():
+    """The inverse of the crop rectangle, and what a shift-drag goes out as."""
+    whole = make_frame()
+    assert whole.to_frame_fraction(0.5, 0.5) == pytest.approx((0.5, 0.5))
+    quadrant = make_frame(crop=(1504, 844), crop_centre=(752, 422))
+    assert quadrant.to_frame_fraction(0.5, 0.5) == pytest.approx((0.125, 0.125))
+    assert quadrant.to_frame_fraction(1.0, 1.0) == pytest.approx((0.25, 0.25))
+
+
+def test_a_sensor_rectangle_comes_back_as_the_part_of_it_that_is_on_screen():
+    area = (0.1, 0.1, 0.1, 0.1)
+    whole = make_frame()
+    assert whole.area_normalised(area) == pytest.approx(area)
+    # The same rectangle fills half of a view showing a quarter of the frame.
+    quadrant = make_frame(crop=(1504, 844), crop_centre=(752, 422))
+    assert quadrant.area_normalised(area) == pytest.approx((0.4, 0.4, 0.4, 0.4))
+
+
+def test_a_sensor_rectangle_the_view_has_left_behind_is_not_on_the_picture():
+    """Which has to be told apart from "the whole picture", because the meter
+    answers one with a reading and the other with nothing."""
+    far = make_frame(crop=(1504, 844), crop_centre=(4512, 2532))
+    assert far.area_normalised((0.0, 0.0, 0.1, 0.1)) is None
+
+
+def test_a_sensor_rectangle_half_off_the_picture_is_clipped_to_it():
+    quadrant = make_frame(crop=(1504, 844), crop_centre=(752, 422))
+    clipped = quadrant.area_normalised((0.2, 0.2, 0.2, 0.2))
+    assert clipped == pytest.approx((0.8, 0.8, 0.2, 0.2))

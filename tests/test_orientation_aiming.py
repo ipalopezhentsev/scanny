@@ -255,8 +255,13 @@ def test_shift_dragging_the_patch_measures_the_patch(window, orientation, view_o
     The meter reads the picture the camera sent, never the turned copy, so the
     rectangle it is given has to be in the camera's own axes. Drawn round the
     patch on screen, it has to come out as the rectangle that holds the patch
-    in the frame -- and with a positive width, since a right angle swaps which
-    corner is the top left one.
+    -- and with a positive width, since a right angle swaps which corner is
+    the top left one.
+
+    In fractions of the **whole frame**, which is why the expected answer goes
+    through the crop: the measured area is a place on the sensor, so at
+    magnification the fractions it comes out as are not the fractions of the
+    picture the patch occupies.
     """
     areas = []
     window.requestSharpnessArea.connect(lambda area: areas.append(area))
@@ -281,8 +286,8 @@ def test_shift_dragging_the_patch_measures_the_patch(window, orientation, view_o
     x, y, w, h = areas[-1]
     assert w > 0 and h > 0
     # The patch's middle is inside the rectangle the meter was given, in the
-    # coordinates the meter reads the camera's picture in.
-    px, py = patch_centre_in_frame()
+    # coordinates the meter keeps its area in: the whole sensor frame.
+    px, py = shown.to_frame_fraction(*patch_centre_in_frame())
     assert x <= px <= x + w, f"{px} not within {x}..{x + w}"
     assert y <= py <= y + h, f"{py} not within {y}..{y + h}"
 

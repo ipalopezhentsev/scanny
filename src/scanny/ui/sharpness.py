@@ -66,10 +66,15 @@ __all__ = [
 #: put an ordinary subject in the tens rather than at three decimal places.
 SCALE = 1000.0
 
-#: The area to measure, as (x, y, width, height) fractions of the displayed
-#: picture. Fractions of what is on screen rather than sensor coordinates: it
-#: is a region of the picture the user is looking at, and it stays where they
-#: put it when the camera magnifies or pans underneath it.
+#: An area as (x, y, width, height) fractions.
+#:
+#: Two coordinate systems wear this type, and which one is meant is worth
+#: being careful about. :func:`measure` and :func:`grain_reading` take
+#: fractions of the **displayed picture**, because that is what they have in
+#: their hands. :class:`SharpnessMeter` is given fractions of the **whole
+#: frame** -- a place on the sensor -- and turns them into the other kind for
+#: whatever crop each frame happens to be showing. See
+#: :meth:`SharpnessMeter.set_area` for why.
 Area = "tuple[float, float, float, float]"
 
 #: How far above the grain the signal has to be before it is a reading at all.
@@ -203,11 +208,27 @@ class SharpnessMeter:
 
     @property
     def area(self) -> "Area | None":
-        """The part of the picture being read, or None for all of it."""
+        """The part of the **frame** being read, or None for all of it."""
         return self._area
 
     def set_area(self, area: "Area | None") -> bool:
-        """Read only this part of the picture; say whether that was a change.
+        """Read only this part of the frame; say whether that was a change.
+
+        **Fractions of the whole frame, not of the picture on screen**, and
+        that is the one thing about this class that was rebuilt rather than
+        added to. Screen fractions look right until the view is magnified: a
+        rectangle drawn round one letter of a caption at full frame stays a
+        third of the way across whatever strip the camera shows at 18.8x,
+        which is a different piece of the world entirely -- so the area jumps
+        to somewhere nobody chose every time the magnification changes, and
+        the readings either side of that have nothing to do with each other.
+
+        Sensor coordinates cannot do that. They are what the camera's own
+        focus point lives in, they do not move when the view magnifies or
+        pans, and :meth:`scanny.camera.nikon.LiveViewFrame.area_normalised`
+        turns them back into screen fractions for whichever crop is on show.
+        What was a place on the screen is now a place on the subject, which is
+        what someone drawing a box round their subject meant.
 
         The best reading goes with it: a different region is a different
         measurement, and its numbers have nothing to do with the old ones.
@@ -234,6 +255,16 @@ class SharpnessMeter:
         self._peak = 0.0
         self._key = None
 
+    def shown_in(self, frame: LiveViewFrame) -> "Area | None":
+        """Where the measured area falls on *frame*'s picture, in its fractions.
+
+        ``None`` means the whole picture, exactly as it does everywhere else
+        here -- so the one case that has to be told apart from it, the area
+        being off screen altogether, is answered by
+        :meth:`measure` reading nothing rather than by a third value.
+        """
+        return None if self._area is None else frame.area_normalised(self._area)
+
     def measure(
         self, frame: LiveViewFrame, image: QImage, noise_variance: float = 0.0
     ) -> "tuple[float, float] | None":
@@ -243,10 +274,19 @@ class SharpnessMeter:
         key = (_view_key(frame), self._area)
         if key != self._key:
             # A different crop is a different measurement, and its numbers are
-            # nothing to do with the ones before it.
+            # nothing to do with the ones before it: the same piece of sensor
+            # magnified further has its detail spread over more pixels.
             self._key = key
             self._peak = 0.0
-        self._value = measure(image, self._area, noise_variance)
+        area = self.shown_in(frame)
+        if area is None and self._area is not None:
+            # The area is a place on the sensor and the view has been
+            # magnified somewhere else. Reading the whole picture instead
+            # would answer a question nobody asked, and answer it with a
+            # number that looks just like the ones being compared.
+            self._value = 0.0
+            return self._value, self._peak
+        self._value = measure(image, area, noise_variance)
         self._peak = max(self._peak, self._value)
         return self._value, self._peak
 

@@ -29,7 +29,7 @@ from .depth import (
     tile_sums,
     tiling_for,
 )
-from .hunt import Walk
+from .hunt import FineTune
 from .integration import FrameIntegrator
 from .naming import NameSequence, unique
 from .points import Point, PointSurvey, area_for, ordering
@@ -300,8 +300,7 @@ class CameraWorker(QObject):
         self._sharpness = SharpnessMeter()
         # Focusing by hunting the reading rather than by hand. Advanced by
         # frames, not by a loop of its own, so the grab keeps running.
-        self._hunt: "FocusHunt | None" = None
-        self._hunt_opening = False
+        self._hunt: "FineTune | None" = None
         self._settling = False
         self._settle_seen = 0
         self._settle_last: "float | None" = None
@@ -980,12 +979,15 @@ class CameraWorker(QObject):
 
     @Slot(object)
     def set_sharpness_area(self, area: object) -> None:
-        """Measure only this part of the picture, or all of it when None.
+        """Measure only this part of the frame, or all of it when None.
 
-        The area arrives as fractions of the displayed picture, which is what
-        makes it usable past the camera's strongest magnification: there is no
-        more zooming to be had there, but a rectangle drawn on what is already
-        on screen can be as small as the subject is.
+        The area arrives as fractions of the **whole frame** -- a place on the
+        sensor -- which is what makes it usable past the camera's strongest
+        magnification: there is no more zooming to be had there, but a
+        rectangle drawn round what is already on screen can be as small as the
+        subject is, and it stays on that subject when the view magnifies or
+        pans instead of jumping to whatever the same fractions of the new crop
+        happen to cover. See :meth:`scanny.ui.sharpness.SharpnessMeter.set_area`.
         """
         if not self._sharpness.set_area(area):
             return
@@ -1019,9 +1021,13 @@ class CameraWorker(QObject):
 
     @Slot(int)
     def fine_tune(self, step: int) -> None:
-        """Walk to focus in one increment, for focus that is already close."""
+        """Autofocus over the measured area, then better it one increment at a time."""
         step = abs(int(step)) or 1
-        self._start_hunt(Walk(step), f"Fine tuning focus in steps of {step}...")
+        self._start_hunt(
+            FineTune(step),
+            f"Fine tuning focus: magnified onto the measured area, autofocus "
+            f"first, then steps of {step}...",
+        )
 
     def _start_hunt(self, hunt, announcement: str) -> None:
         camera = self._require()
@@ -1033,19 +1039,67 @@ class CameraWorker(QObject):
         if not self._sharpness.enabled:
             self.failed.emit("Switch sharpness measuring on before hunting for focus.")
             return
+        # Magnified before anything is read, and never again after: every
+        # reading a search makes has to be of the same picture as the last.
+        before = self._magnify_on_measured_area(camera)
         self._hunt = hunt
         self._pipeline_lag = None
-        # Whether the camera's own autofocus is needed first is decided on the
-        # first settled reading rather than here: the meter may simply not have
-        # read anything yet, and assuming that means "defocused" would throw
-        # away good focus the moment the button was pressed.
-        self._hunt_opening = True
         # A fresh line for the hunt, so what is plotted is the hunt itself.
         self._sharpness.reset()
         self.sharpnessChanged.emit(0.0, 0.0)
-        self._settle()
+        self._settle(before)
         self.huntChanged.emit(True)
         self.status.emit(announcement)
+
+    def _magnify_on_measured_area(self, camera: NikonCamera) -> "float | None":
+        """Magnify as far as the body will go and still show the measured area.
+
+        This is the single largest thing that can be done for the quality of
+        the answer, and it costs one command. **A drive step moves the picture
+        far more when the view is magnified**, so the same focus error that is
+        lost in the grain at full frame is obvious at 18.8x -- which is the
+        difference between a search that can tell one step from the next and
+        one reading its own noise. It is the same reason the depth map
+        magnifies before comparing two points that are close together.
+
+        As far as it will go *and still show the area*, rather than simply as
+        far as it will go. Magnifying past the area would leave the reading
+        taken over the part of it that happened to stay on screen, which is a
+        different question from the one the rectangle was drawn to ask, and
+        one nobody chose. With no area marked out there is nothing chosen to
+        magnify onto and the view is left alone -- going to 18.8x there would
+        silently replace "the whole frame" with a twentieth of it.
+
+        Answers with what the picture read beforehand, which is what the
+        settle that follows waits to see change. Magnifying rewrites the
+        picture completely, and the frames still in flight from before it
+        agree with each other perfectly.
+        """
+        area = self._sharpness.area
+        frame = self._last_frame
+        if area is None or frame is None:
+            return None
+        x, y, w, h = area
+        # A level's magnification is the same in both axes, so the area fits
+        # whole while the magnification is no more than one over its long side.
+        level = self._level_for_magnification(1.0 / max(w, h, 1e-6))
+        if level == self._zoom_level:
+            return None
+        before = self._frame_reading(frame)
+        try:
+            # The body centres its magnified view on the focus point, so the
+            # point goes first: it is what decides where the magnified view
+            # lands.
+            camera.set_af_area(*frame.to_af_coords_in_frame(x + w / 2, y + h / 2))
+            camera.set_zoom_level(level)
+        except CameraError as exc:
+            # Worth saying, not worth stopping for: the search still works at
+            # whatever magnification the view is already at.
+            self.failed.emit(str(exc))
+            return None
+        self._zoom_level = level
+        self.zoomChanged.emit(level)
+        return before
 
     @Slot()
     def cancel_hunt(self) -> None:
@@ -1103,29 +1157,30 @@ class CameraWorker(QObject):
             return
         if reading is None or not self._integrator.last_image_was_whole:
             return
-        if self._hunt_opening:
-            self._hunt_opening = False
-            if reading <= 0.0:  # nothing above the grain to climb
-                # Nothing to climb yet. Get roughly there and read again.
-                self._open_with_autofocus(camera)
-                return
 
         move = hunt.step(reading)
         if move is None:
             self._finish_hunt(hunt)
             return
+        if move.autofocus:
+            self._autofocus_on_measured_area(camera, frame)
+            return
         before = self._frame_reading(frame)
         try:
-            camera.drive_focus(move)
+            camera.drive_focus(move.steps)
         except CameraError as exc:
             self._cancel_hunt("")
             self.failed.emit(f"Focus hunt stopped: {exc}")
             return
         self._settle(before)
         probes = hunt.probes
+        # Which half of the walk it is in, because they take very different
+        # lengths of time and a long search that says nothing but a rising
+        # probe count reads as a hang.
+        doing = "coming back to" if hunt.coming_back else "looking, best"
         self.status.emit(
-            f"Hunting focus: {probes} probe{'' if probes == 1 else 's'}, "
-            f"best {hunt.best:.0f}, steps of {hunt.step_size}"
+            f"Fine tuning focus: {probes} probe{'' if probes == 1 else 's'} in "
+            f"steps of {hunt.step_size}, {doing} {hunt.best:.0f}"
         )
 
     def _watch_for_stillness(self, frame: LiveViewFrame) -> None:
@@ -1208,52 +1263,88 @@ class CameraWorker(QObject):
         image = QImage.fromData(frame.jpeg, "JPG")
         if image.isNull():
             return None
-        area = self._sharpness.area
+        # The measured area is a place on the sensor, so where it falls on
+        # this picture depends on the crop this frame was sent with.
+        area = self._sharpness.shown_in(frame)
+        if area is None and self._sharpness.area is not None:
+            return None
         self._grain_scale = grain_reading(image, area, self._noise_variance)
         return measure(image, area, self._noise_variance)
 
-    def _open_with_autofocus(self, camera: NikonCamera) -> None:
-        """Let the camera get roughly there, when there is no hill to climb.
+    def _autofocus_on_measured_area(
+        self, camera: NikonCamera, frame: LiveViewFrame
+    ) -> None:
+        """Put the camera's own focus box on the measured area, and focus there.
 
-        A thoroughly defocused frame reads zero -- rightly, it has no detail
-        above its own grain -- and zero is nothing to climb. The camera's own
-        autofocus uses its own big box, which is exactly why it is the opening
-        move and not the whole job.
+        The opening move of a fine tune, and its reset between the two
+        directions it searches. The box is 324 sensor pixels wide, which is
+        why this is only ever the opening move -- but it is a rough answer
+        arrived at in one go, and somewhere to improve on beats somewhere to
+        start walking from.
+
+        Aiming it is worth the trouble rather than focusing wherever the box
+        was left: the measured area is what the reading is about, and a camera
+        focusing on something else in the frame hands the search a starting
+        point with no relation to what it is climbing. Moving the focus point
+        is also what pans a magnified view, so this has the second effect of
+        bringing the measured area on screen.
         """
-        self.status.emit("Nothing to measure yet - letting the camera get close first")
+        self.status.emit("Fine tuning focus: letting the camera get close first")
+        self.focusStateChanged.emit("busy")
+        # What the picture read as the camera was let loose on it, so the
+        # settling below waits for the move to come through the pipeline
+        # rather than believing the frames that still show where focus was.
+        before = self._frame_reading(frame)
         try:
-            camera.autofocus()
+            self._aim_at_measured_area(camera)
+            focused = camera.autofocus()
         except CameraError as exc:
+            self.focusStateChanged.emit("idle")
             self._cancel_hunt("")
             self.failed.emit(str(exc))
             return
-        self._settle()
+        self.focusStateChanged.emit("focused" if focused else "idle")
+        self._settle(before)
 
-    def _finish_hunt(self, hunt: Walk) -> None:
+    def _aim_at_measured_area(self, camera: NikonCamera) -> None:
+        """Move the focus box to the middle of the measured area, if there is one."""
+        area = self._sharpness.area
+        frame = self._last_frame
+        if area is None or frame is None:
+            return
+        x, y, w, h = area
+        camera.set_af_area(*frame.to_af_coords_in_frame(x + w / 2, y + h / 2))
+
+    def _finish_hunt(self, hunt: FineTune) -> None:
         self._hunt = None
         self._settling = False
         self.huntChanged.emit(False)
+        stopped_on = hunt.confirmed if hunt.confirmed is not None else hunt.best
         self.status.emit(
             {
                 "found": (
-                    f"Focus found: {hunt.best:.0f} after {hunt.probes} probes, "
-                    f"{hunt.best_position:+d} steps from where it started"
+                    f"Focus found: {stopped_on:.0f} against {hunt.baseline:.0f} "
+                    f"from the camera's own autofocus, after {hunt.probes} probes"
                 ),
                 "nothing": (
                     "Nothing in the measured area to focus on - put it on "
                     "something with detail in it, or magnify further"
                 ),
                 "exhausted": (
-                    f"Gave up after {hunt.probes} probes; best was {hunt.best:.0f}"
+                    f"Stopped at {stopped_on:.0f} after {hunt.probes} probes, "
+                    f"the most it will take; the best it saw was {hunt.best:.0f}"
                 ),
                 "lost": (
-                    f"Walked back {hunt.probes} probes without finding the "
-                    f"{hunt.best:.0f} it saw again -- the picture may have moved "
-                    f"under it, or the lens may have more play than it can walk "
-                    f"through"
+                    f"Stopped at {stopped_on:.0f} against the {hunt.best:.0f} it "
+                    f"saw: it was sent back and forth {hunt.turns} times, so the "
+                    f"reading is too unsteady to walk by -- integrate more "
+                    f"frames, or measure a patch with more detail in it"
                 ),
-                "limit": "Ran as far as it is allowed to without finding focus",
-            }.get(hunt.outcome, "Focus hunt finished")
+                "restored": (
+                    f"Nothing bettered the camera's own {hunt.baseline:.0f}, so "
+                    f"focus was put back where its autofocus had it"
+                ),
+            }.get(hunt.outcome, "Fine tuning finished")
         )
 
     # -- mapping the depth of the scene ------------------------------------

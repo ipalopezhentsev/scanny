@@ -106,6 +106,12 @@ _DEPTH_DETAIL = (("Coarse", 0), ("Medium", 1), ("Fine", LEVELS - 1))
 #: big enough to have some subject in it before it is dragged anywhere.
 _DEFAULT_MEASURE_AREA = (1 / 3, 1 / 3, 1 / 3, 1 / 3)
 
+#: Where the measured area is remembered. A key of its own rather than the old
+#: ``focus/sharpness_rect``, because the numbers under it changed meaning: they
+#: were fractions of the picture on screen and are now fractions of the whole
+#: frame, and one read as the other is a rectangle nobody drew.
+_MEASURE_AREA_KEY = "focus/sharpness_frame_rect"
+
 #: The shape of a live-view picture: what a D750 sends in its photo position,
 #: 640x424. The window opens this shape so the picture fills the image area
 #: instead of sitting in it between two black strips -- strips are not merely
@@ -943,7 +949,9 @@ class MainWindow(QMainWindow):
         self.measure_area = QCheckBox("Only a selected area")
         self.measure_area.setToolTip(
             "Read one rectangle of the picture instead of all of it. Shift-drag "
-            "on the image to put it where you want it."
+            "on the image to put it where you want it. It marks a place on the "
+            "sensor, so it stays on the same part of the subject when the view "
+            "is magnified or panned."
         )
         self.measure_area.toggled.connect(self._on_measure_area_toggled)
         column.addWidget(self.measure_area)
@@ -961,12 +969,17 @@ class MainWindow(QMainWindow):
         self.sharpness_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         column.addWidget(self.sharpness_label)
 
-        self.fine_tune_button = QPushButton("Fine tune from here")
+        self.fine_tune_button = QPushButton("Fine tune focus")
         self.fine_tune_button.setToolTip(
-            "The same hunt, in minimum steps and nothing coarser, for when "
-            "focus is already close. What a macro subject wants: the depth of "
-            "focus is a hair, so a search in medium steps spends its time "
-            "somewhere no part of the picture could be sharp."
+            "Magnify onto the measured area as far as the body will go and "
+            "still show it, autofocus there, then better it: a walk in minimum "
+            "steps and nothing coarser that turns round whenever the reading "
+            "gets worse, and stops standing on the best reading there is. It "
+            "will not leave focus worse than the camera's own autofocus "
+            "managed. What a macro subject wants -- the depth of focus is a "
+            "hair, so a search in coarser steps spends its time somewhere no "
+            "part of the picture could be sharp. The view is left magnified "
+            "afterwards; Esc or 0 goes back to the whole frame."
         )
         self.fine_tune_button.clicked.connect(self._toggle_fine_tune)
         column.addWidget(self.fine_tune_button)
@@ -995,7 +1008,7 @@ class MainWindow(QMainWindow):
         return holder
 
     def _stored_measure_area(self) -> "tuple[float, float, float, float]":
-        stored = QSettings().value("focus/sharpness_rect", None)
+        stored = QSettings().value(_MEASURE_AREA_KEY, None)
         try:
             area = tuple(float(part) for part in str(stored).split(","))
         except (TypeError, ValueError):
@@ -1006,14 +1019,16 @@ class MainWindow(QMainWindow):
 
     @Slot(float, float, float, float)
     def _on_measure_area_selected(self, x: float, y: float, w: float, h: float) -> None:
-        """A rectangle shift-dragged on the image.
+        """A rectangle shift-dragged on the image, in fractions of the frame.
 
         Drawing one is a clear enough request that it also switches measuring
         on: there is nothing else the gesture could mean.
         """
         self._measure_area = (x, y, w, h)
         settings = QSettings()
-        settings.setValue("focus/sharpness_rect", ",".join(f"{v:.5f}" for v in self._measure_area))
+        settings.setValue(
+            _MEASURE_AREA_KEY, ",".join(f"{v:.5f}" for v in self._measure_area)
+        )
         settings.setValue("focus/sharpness", True)
         settings.setValue("focus/sharpness_area", True)
         # Ticked without their handlers running: the request they would send is
@@ -1041,7 +1056,7 @@ class MainWindow(QMainWindow):
         self.requestSharpnessArea.emit(wanted)
 
     def _toggle_fine_tune(self) -> None:
-        """Walk to focus from close by, or stop the hunt that is running."""
+        """Autofocus and better it, or stop the search that is running."""
         if self._hunting:
             self.requestHuntCancel.emit()
             return
@@ -1050,7 +1065,7 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_hunt_changed(self, hunting: bool) -> None:
         self._hunting = hunting
-        self.fine_tune_button.setText("Stop" if hunting else "Fine tune from here")
+        self.fine_tune_button.setText("Stop" if hunting else "Fine tune focus")
 
     def _on_sharpness_toggled(self, enabled: bool) -> None:
         QSettings().setValue("focus/sharpness", enabled)

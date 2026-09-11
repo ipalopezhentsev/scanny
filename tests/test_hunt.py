@@ -1,16 +1,18 @@
-"""Tests for hunting focus by driving it to the top of the sharpness reading.
+"""Tests for fine tuning focus: autofocus, then better it a step at a time.
 
-Two halves. The walk itself has no camera in it, so it is run against
+Two halves. The search itself has no camera in it, so it is run against
 modelled focus curves -- a peak somewhere, the reading falling away either
-side of it, and a gearing with play in it. Then the whole thing through the
-worker against a simulated lens, because the part that is easy to get wrong is
-not the arithmetic but the waiting: live view lags the lens, and an integrated
-picture is a stack of frames that may straddle a focus move.
+side of it, a camera autofocus that gets roughly there, and a gearing with
+play in it. Then the whole thing through the worker against a simulated lens,
+because the part that is easy to get wrong is not the arithmetic but the
+waiting: live view lags the lens, and an integrated picture is a stack of
+frames that may straddle a focus move.
 
 Nothing here checks that focus was driven to a remembered position, because
-nothing does that any more. What is checked is where the *optics* ended up,
-which on a lens with play in its gearing is not the same as where the step
-counts say it is.
+nothing does that. What is checked is where the *optics* ended up, which on a
+lens with play in its gearing is not the same as where the step counts say it
+is -- and, in the two places it matters most, what the picture actually read
+when the search stopped against the best it ever saw.
 """
 
 from __future__ import annotations
@@ -24,159 +26,326 @@ from PySide6.QtCore import QBuffer, QByteArray  # noqa: E402
 from PySide6.QtGui import QImage  # noqa: E402
 
 from scanny.camera.nikon import CameraError, LiveViewFrame  # noqa: E402
-from scanny.ui.hunt import Walk  # noqa: E402
+from scanny.ui.hunt import FineTune, Move  # noqa: E402
 
 #: What the panel's minimum increment is by default.
 STEP = 6
 
 
-# -- the walk ----------------------------------------------------------------
+# -- the search --------------------------------------------------------------
 
 
-def curve(position: float, peak: int, width: float = 120.0, height: float = 400.0,
+def curve(position: float, width: float = 120.0, height: float = 400.0,
           floor: float = 0.0) -> float:
-    """Sharpness against focus position: one hill, and not much either side."""
-    return floor + height * float(np.exp(-((position - peak) / width) ** 2))
+    """Sharpness against focus position: one hill at zero, and not much else."""
+    return floor + height * float(np.exp(-(position / width) ** 2))
 
 
-def _drive(hunt, start_offset, *, slack=0, noise=0.0, seed=0, width=30.0, limit=80):
-    """Run *hunt* against a modelled lens; answer it and where the optics went.
+def _run(tune, *, af_error=12, slack=0, noise=0.0, seed=0, width=30.0,
+         limit=400):
+    """Run *tune* against a modelled lens; answer it and where the optics went.
 
-    The optics are carried between two faces of the driver, so a reversal
-    moves nothing until the play is taken up -- which is the whole thing the
-    walk is built not to care about.
+    Focus is at zero. The optics are carried between two faces of the driver,
+    so a reversal moves nothing until the play is taken up -- which is the
+    whole thing the search is built not to care about -- and the camera's own
+    autofocus drives them itself, to *af_error* steps off, leaving the driver
+    with nothing useful to say about where they are.
     """
     rng = np.random.default_rng(seed)
-    driver = optics = 0.0
+    optics = float(af_error) * 3.0  # wherever the button was pressed
+    driver = optics
+    autofocused = 0
     while True:
-        reading = curve(optics - start_offset, 0, width=width)
+        reading = curve(optics, width=width)
         if noise:
             reading *= 1 + rng.normal(0, noise)
-        move = hunt.step(reading)
+        move = tune.step(max(reading, 0.0))
         if move is None:
-            return hunt, abs(optics - start_offset)
-        driver += move
-        optics = min(max(optics, driver), driver + slack)
-        assert hunt.probes < limit, "it has to stop on its own"
+            return tune, abs(optics), autofocused
+        if move.autofocus:
+            autofocused += 1
+            optics = float(af_error)
+            # The camera drove the optics itself: the play is wherever it left
+            # it, and the step count knows nothing about any of it.
+            driver = optics - slack / 2
+        else:
+            driver += move.steps
+            optics = min(max(optics, driver), driver + slack)
+        assert tune.probes < limit, "it has to stop on its own"
 
 
-def _walk(start_offset, *, unit=6, patience=12, **modelled):
-    return _drive(Walk(unit, patience=patience), start_offset, **modelled)
+def _tune(**modelled):
+    kept = {k: modelled.pop(k) for k in ("first", "patience") if k in modelled}
+    return _run(FineTune(STEP, **kept), **modelled)
 
 
-def test_the_walk_goes_out_until_the_reading_turns_over_and_comes_back_to_it():
-    """The shape of it: out one way, over the top, back to the best of it."""
-    walk, error = _walk(24)
-    positions = [position for position, _ in walk.trail]
-    readings = [reading for _, reading in walk.trail]
-    top = positions[readings.index(walk.best)]
-    assert error == 0
-    assert positions[-1] == top, "it has to finish where the best reading was"
-    assert max(positions) > top, "having gone past it first"
+def test_the_first_thing_it_does_is_autofocus():
+    """It improves on the camera's answer rather than on wherever it was left."""
+    tune = FineTune(STEP)
+    assert tune.step(10.0) == Move(autofocus=True)
 
 
-def test_the_walk_turns_round_when_it_starts_out_the_wrong_way():
-    walk, error = _walk(-24)
-    assert walk.outcome == "found"
-    assert error == 0
+@pytest.mark.parametrize("af_error", [12, -12, 30, -30, 6, -6])
+def test_it_lands_on_focus_from_either_side_of_the_autofocus(af_error):
+    """The peak may be on either side of where the camera left it, and which
+    one it is is exactly what a search that only looks one way cannot tell."""
+    tune, error, _ = _tune(af_error=af_error)
+    assert tune.outcome == "found"
+    assert error <= STEP
 
 
-@pytest.mark.parametrize("offset", [6, -6, 18, -30, 48])
-def test_the_walk_lands_on_focus_from_either_side(offset):
-    assert _walk(offset)[1] == 0
+def test_it_searches_both_ways_round_without_autofocusing_again():
+    """One autofocus, at the start. There used to be a second one to reset
+    between searching one way and the other, and it was a mistake: autofocus
+    on the same patch does not land on the same place twice, so everything the
+    walk had learnt about which way things lay was worthless the moment it
+    ran. A walk that turns itself round needs no datum to return to."""
+    tune, _, autofocused = _tune(af_error=-18)
+    assert autofocused == 1
+    # It still saw both sides of the best: that is what turning round is for.
+    assert any(where > tune.best_position for where in tune._fell_at)
+    assert any(where < tune.best_position for where in tune._fell_at)
+
+
+def test_it_never_takes_a_longer_step_than_the_one_it_was_given():
+    """A step that grows through a lens's play is also the step that takes up
+    the last of it, and it moves the optics by whatever was left. That is how
+    a search walks over the peak it is looking for."""
+    tune, _, _ = _tune(af_error=-30, slack=60, patience=20)
+    strides = {abs(b - a) for (a, _), (b, _) in zip(tune.trail, tune.trail[1:])}
+    # Zero is the pair of readings either side of an autofocus, which moves
+    # the optics without moving the step count.
+    assert strides <= {0, STEP}
+
+
+def test_it_stops_on_the_best_reading_it_saw_and_not_a_slope_below_it():
+    """The whole complaint about what was here before: it came back to within
+    three per cent of the peak, which on a magnified subject is a focus error
+    anybody can better by hand."""
+    tune, _, _ = _tune(af_error=-24)
+    assert tune.confirmed is not None
+    assert tune.confirmed >= tune.best * 0.99
+
+
+@pytest.mark.parametrize("af_error", [18, -18])
+def test_it_ends_no_worse_than_the_camera_managed_on_its_own(af_error):
+    tune, _, _ = _tune(af_error=af_error)
+    assert tune.confirmed is not None
+    assert tune.confirmed >= tune.baseline
 
 
 @pytest.mark.parametrize("slack", [30, 90])
 def test_play_in_the_gearing_is_simply_walked_through(slack):
-    """The whole reason it comes back by reading rather than by step count:
-    the play is taken up by walking, and nothing has to know how much of it
-    there is -- only how long to keep walking before giving up on it."""
-    walk, error = _walk(24, slack=slack, patience=slack // 6 + 3)
-    assert error == 0
+    """The reason it comes back by reading rather than by step count: the play
+    is taken up by walking, and nothing has to know how much of it there is --
+    only how long to keep walking before giving up on it."""
+    tune, error, _ = _tune(af_error=-24, slack=slack, patience=slack // STEP + 4)
+    assert error <= STEP
     # Somewhere in there are the steps that moved nothing at all.
-    readings = [reading for _, reading in walk.trail]
+    readings = [reading for _, reading in tune.trail]
     assert any(a == b for a, b in zip(readings, readings[1:]))
 
 
-def test_more_play_than_it_will_walk_through_is_said_rather_than_hidden():
-    walk, error = _walk(24, slack=120, patience=4)
-    assert walk.outcome == "lost"
-    assert error > 0
-
-
-def test_the_walk_drives_a_fraction_of_what_counting_steps_would():
-    walk, _ = _walk(24, slack=30, patience=8)
-    positions = [position for position, _ in walk.trail]
-    driven = sum(abs(b - a) for a, b in zip(positions, positions[1:]))
-    assert driven < 400
-
-
-def test_the_step_grows_through_the_play_on_the_way_out():
-    """Every probe in the play reads exactly what the last one did, so there is
-    nothing to be learnt by taking them one small step at a time."""
-    # Focus behind where it starts, so the walk turns round and then has the
-    # play to take up on its way out.
-    walk, error = _walk(-24, slack=90, patience=20)
-    strides = [abs(b - a) for (a, _), (b, _) in zip(walk.trail, walk.trail[1:])]
-    assert max(strides) > 6, "it should have lengthened its step in the play"
-    assert error == 0
-
-
-def test_the_step_never_grows_on_the_way_back():
-    """The step that finally takes up the last of the play also moves the
-    optics by whatever is left of it, so a long step on the way back can carry
-    the lens clean past the reading it came back for -- which is the error the
-    walk exists to avoid."""
-    walk, error = _walk(24, slack=90, patience=20)
-    turned = [reading for _, reading in walk.trail].index(walk.best)
-    coming_back = [
-        abs(b - a)
-        for (a, _), (b, _) in zip(walk.trail[turned:], walk.trail[turned + 1 :])
-    ]
-    assert coming_back, "it has to have come back at all"
-    assert set(coming_back) == {6}, "in the step it was asked for, every one"
-    assert error == 0
-
-
 @pytest.mark.parametrize("seed", range(6))
-def test_a_reading_that_wanders_does_not_send_the_walk_off(seed):
+def test_a_reading_that_wanders_does_not_send_the_search_off(seed):
     """One falling reading is as likely to be the noise as the lens going the
     wrong way, so it takes two in a row to turn round."""
-    assert _walk(18, slack=30, noise=0.01, seed=seed, patience=8)[1] <= 18
+    tune, error, _ = _tune(af_error=-18, slack=30, noise=0.01, seed=seed,
+                           patience=10)
+    assert error <= 3 * STEP
 
 
-def test_a_walk_that_is_getting_nowhere_still_lands_where_it_looked_best():
-    """Whatever happens, it ends at the best reading it saw rather than
-    wherever the last probe left it."""
-    walk, _ = _walk(24, slack=200, patience=6)
-    positions = [position for position, _ in walk.trail]
-    assert abs(walk.position - walk.best_position) <= abs(
-        max(positions) - min(positions)
-    )
-    assert walk.outcome in {"found", "lost", "exhausted"}
+def test_the_direction_that_says_nothing_at_all_is_given_up_on():
+    """A lens with more play than the search will walk through, one way."""
+    tune, _, _ = _tune(af_error=-24, slack=300, patience=4)
+    assert tune.outcome in {"found", "lost", "restored"}
 
 
-def test_the_walk_gives_up_rather_than_walking_for_ever():
-    """A picture that says the same thing however far it is driven."""
-    walk = Walk(6, patience=4)
-    while walk.step(100.0) is not None:
-        assert walk.probes < 60
-    assert walk.outcome in {"found", "nothing"}
-    assert abs(walk.position) <= 6 * 20, "and it does not wander off doing it"
+def test_a_picture_that_never_changes_stops_rather_than_walking_for_ever():
+    """It looks further and further for something to climb -- that is the
+    point of the growing reach -- but it is still bounded, and it still ends
+    on the best reading it saw rather than wherever it ran out."""
+    tune = FineTune(STEP, patience=4, max_probes=60)
+    while True:
+        move = tune.step(100.0)
+        if move is None:
+            break
+        assert tune.probes < 120
+    assert tune.outcome == "found"
+    assert tune.confirmed == 100.0
 
 
 def test_a_reading_of_nothing_at_all_is_said_to_be_nothing():
-    walk = Walk(6, patience=3)
-    while walk.step(0.0) is not None:
-        assert walk.probes < 60
-    assert walk.outcome == "nothing"
+    """Zero is not a hill to climb, but it is not a reason to refuse to look.
+
+    It used to stop on the spot, and that was wrong: zero means the picture
+    has no detail above its own grain, which is true of anything far enough
+    out of focus -- including a subject whose focus is a couple of hundred
+    steps from wherever the camera's autofocus stopped. So it walks its reach
+    both ways first, and only then says there is nothing there.
+    """
+    tune = FineTune(STEP, patience=3, max_probes=40)
+    assert tune.step(0.0) == Move(autofocus=True)
+    walked = 0
+    while tune.step(0.0) is not None:
+        walked += 1
+        assert walked < 100
+    assert walked > 6, "it has to have looked before saying there is nothing"
+    assert tune.outcome == "nothing"
 
 
-def test_a_coarse_walk_gives_up_on_distance_rather_than_on_probes():
-    """A step of two hundred and fifty spends the travel of a whole lens in
-    the dozen probes a fine walk takes to cross its own play."""
-    walk, _ = _walk(0, unit=250, width=30.0)
-    assert max(abs(position) for position, _ in walk.trail) <= 1000
+def test_focus_is_put_back_when_nothing_it_found_beat_the_autofocus():
+    """The floor enforced rather than hoped for: a picture that reads worse
+    every time it is looked at leaves the search standing somewhere worse than
+    it started, and the only way back is the camera's own autofocus."""
+    tune = FineTune(STEP, patience=3, max_probes=40)
+    readings = iter([100.0, 100.0] + [40.0] * 400)
+    autofocused = 0
+    reading = next(readings)
+    while True:
+        move = tune.step(reading)
+        if move is None:
+            break
+        if move.autofocus:
+            autofocused += 1
+            reading = 100.0 if autofocused >= 2 else next(readings)
+        else:
+            reading = next(readings)
+        assert tune.probes < 200
+    assert tune.outcome == "restored"
+    assert autofocused == 2, "one to start with, one to put focus back"
+    assert tune.confirmed == 100.0
+
+
+def test_one_reading_off_a_cliff_is_enough_to_turn_it_round():
+    """What waiting for a second fall costs on a subject with depth to it.
+
+    A steep peak: the reading goes over the top at the best it will ever read,
+    and is a fifth of that one step later. Taking a confirming step from there
+    means standing somewhere nothing could be sharp, and then walking back
+    through the whole of the lens's play to undo it.
+    """
+    tune = FineTune(STEP)
+    assert tune.step(100.0) == Move(autofocus=True)
+    assert tune.step(100.0) == Move(steps=STEP), "the camera's answer, then out"
+    assert tune.step(400.0) == Move(steps=STEP), "climbing, so keep climbing"
+    assert tune.step(80.0) == Move(steps=-STEP), "off a cliff: back, at once"
+
+
+def test_a_cliff_on_the_very_first_step_turns_it_round_as_well():
+    """It does not need to have climbed anything first. A direction that has
+    already halved the reading holds nothing worth walking towards."""
+    tune = FineTune(STEP)
+    tune.step(100.0)
+    assert tune.step(100.0) == Move(steps=STEP)
+    assert tune.step(45.0) == Move(steps=-STEP)
+
+
+def _legs(trail):
+    """The trail split wherever the walk turned round or autofocused.
+
+    What the rule below is about is one stretch of walking the same way: a
+    walk that has turned round is *meant* to be reading far below the best it
+    has seen, because that is what walking back across a lens's play looks
+    like. Every step here is one increment or none, so a step that differs
+    from the one before it is a reversal or an autofocus either way.
+    """
+    steps = [b - a for (a, _), (b, _) in zip(trail, trail[1:])]
+    start = 0
+    for at in range(1, len(steps) + 1):
+        if at == len(steps) or steps[at] != steps[at - 1]:
+            yield [reading for _, reading in trail[start : at + 1]]
+            start = at
+
+
+@pytest.mark.parametrize("af_error", [-30, -18, 18, 30])
+@pytest.mark.parametrize("width", [8.0, 15.0, 30.0])
+def test_it_never_walks_on_from_a_picture_that_has_fallen_apart(af_error, width):
+    """The complaint this answers, as a property of every walk it makes.
+
+    One reading a tenth below the best of the stretch it is on is allowed --
+    that is how it finds out -- and the step after it has to be a step back.
+    Two in a row means it went on walking while the picture it was reading was
+    already unusable.
+    """
+    tune, _, _ = _run(FineTune(STEP), af_error=af_error, width=width)
+    for leg in _legs(tune.trail):
+        best, collapsed = 0.0, 0
+        for reading in leg:
+            best = max(best, reading)
+            collapsed = collapsed + 1 if reading < 0.9 * best else 0
+            assert collapsed <= 1, (
+                f"it kept walking at {reading:.0f} against {best:.0f} in "
+                f"{[f'{r:.0f}' for r in leg]}"
+            )
+
+
+def test_a_direction_that_is_not_working_turns_round_rather_than_giving_up():
+    """The complaint this answers. A reading getting worse does not mean the
+    search has failed; it means the other way, and that is the only thing it
+    can mean. It used to end the whole search wherever it was standing --
+    which, the direction being the wrong one, was as far from focus as that
+    direction had managed to drag it."""
+    tune = FineTune(STEP)
+    tune.step(100.0)
+    assert tune.step(100.0) == Move(steps=STEP), "the camera's answer, then out"
+    assert tune.step(60.0) == Move(steps=-STEP), "worse: the other way"
+    assert not tune.done, "and it is nowhere near finished"
+
+
+def test_it_keeps_turning_round_for_as_long_as_it_is_allowed_to():
+    """However often it is sent the wrong way, it answers with a step. What
+    ends a walk is standing on the best reading it has seen, not running out
+    of patience with a direction."""
+    tune = FineTune(STEP, most_turns=6, autofocus=False)
+    reading, moves = 100.0, 0
+    while tune.step(reading) is not None:
+        moves += 1
+        reading *= 0.8  # every step the walk takes makes it worse
+        assert moves < 60
+    assert tune.turns > 6, "it went on turning rather than stopping"
+    assert moves > 10, "and it kept walking while it did"
+
+
+@pytest.mark.parametrize("away", [30, 60, 90, 150])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_a_peak_outside_its_first_look_is_found_by_looking_further(away, sign):
+    """The complaint this answers.
+
+    The reach used to be fixed -- sixteen probes of the minimum increment,
+    which is ninety drive steps on a lens with six thousand of travel. A peak
+    further out than that sat outside the box, and the walk went back and
+    forth inside the box a few times and announced it was done. It doubles its
+    reach now, every time a direction is walked to the end of it without the
+    reading ever falling away: a direction that said nothing is a direction
+    not yet explored.
+    """
+    tune, error, _ = _run(
+        FineTune(STEP), af_error=sign * away, width=15.0, limit=500
+    )
+    assert tune.outcome == "found"
+    assert error <= STEP, f"a peak {away} steps out left it {error} steps away"
+
+
+def test_a_direction_that_said_nothing_is_walked_further_next_time():
+    """What "explored" means. Falling away is evidence; saying nothing is not,
+    and the answer to a direction that said nothing is to go further in it."""
+    tune = FineTune(STEP, patience=4)
+    tune.step(10.0)
+    reach = dict(tune._reach)
+    for _ in range(60):
+        if tune.step(10.0) is None:  # a picture that says the same thing always
+            break
+    assert min(tune._reach.values()) > min(reach.values())
+
+
+def test_a_peak_on_the_far_side_of_the_autofocus_is_still_the_one_it_stands_on():
+    """Whichever way it sets off, the walk turns round and finds it."""
+    for first in (1, -1):
+        tune, error, _ = _tune(af_error=-24, first=first)
+        assert error <= STEP, f"setting off {first:+d} left it {error} steps out"
+        assert tune.confirmed is not None
+        assert tune.confirmed >= tune.best * 0.99
 
 
 # -- the whole thing, through the worker -------------------------------------
@@ -231,14 +400,16 @@ class _Lens:
 
     Everything about it that matters is real: frames come out of a pipeline
     and lag the lens, the gearing has play in it so the first steps after a
-    reversal move nothing at all, and the reading has grain on it.
+    reversal move nothing at all, the reading has grain on it, and the body's
+    own autofocus gets close rather than right.
     """
 
     live_view_active = True
     exposure_preview = True
 
     def __init__(self, best: int = 0, start: int = 40, lag: int = 2,
-                 noise: float = 6.0, slack: int = 0, depth: float = 20.0) -> None:
+                 noise: float = 6.0, slack: int = 0, depth: float = 20.0,
+                 af_error: int = 14) -> None:
         self.blank = False
         self.best = best
         self.slack = slack
@@ -248,7 +419,12 @@ class _Lens:
         self.position = start
         self.lag = lag
         self.noise = noise
+        self.af_error = af_error
         self.autofocused = 0
+        self.aimed: "list[tuple[int, int]]" = []
+        self.zoomed: "list[int]" = []
+        self.magnification = 1.0
+        self.centre = (3008, 2008)
         self.drives: "list[int]" = []
         self._history = [start] * (lag + 1)
         self._rng = np.random.default_rng(17)
@@ -262,13 +438,25 @@ class _Lens:
         return True
 
     def set_zoom_level(self, level: int) -> None:
-        pass
+        self.zoomed.append(int(level))
+        self.magnification = _MAGNIFICATION[int(level)]
 
     def zoom_level(self) -> int:
-        return 0
+        return self.zoomed[-1] if self.zoomed else 0
+
+    def set_af_area(self, x: int, y: int) -> None:
+        self.aimed.append((int(x), int(y)))
+        # The body centres its magnified view on the focus point.
+        self.centre = (int(x), int(y))
 
     def autofocus(self) -> bool:
         self.autofocused += 1
+        if self.blank:
+            return False
+        # The body drives the optics itself, close but not right, and leaves
+        # the play wherever it happens to leave it.
+        self.optics = self.best + self.af_error
+        self.position = self.optics - self.slack // 2
         return True
 
     def stop_live_view(self) -> None:
@@ -296,10 +484,24 @@ class _Lens:
         else:
             pixels = _defocused(shown - self.best, self.depth)
         pixels = pixels + self._rng.normal(0, self.noise, pixels.shape)
-        return _frame(np.clip(pixels, 0, 255))
+        return _frame(
+            np.clip(pixels, 0, 255), self.magnification, self.centre
+        )
 
 
-def _frame(pixels: np.ndarray) -> LiveViewFrame:
+#: What each zoom level magnifies by, as measured on a D750.
+_MAGNIFICATION = {0: 1.0, 2: 2.35, 3: 3.13, 4: 4.7, 5: 6.27, 6: 9.4, 7: 18.8}
+
+
+def _frame(
+    pixels: np.ndarray, magnification: float = 1.0, centre=(3008, 2008)
+) -> LiveViewFrame:
+    """One frame, reporting the crop the camera would be showing.
+
+    The crop fields are what everything that keeps a place on the sensor reads
+    -- the measured area above all -- so a fake that always claims the whole
+    frame would test the mapping by never using it.
+    """
     grey = pixels.astype(np.uint8)
     buffer = np.zeros((H, W, 4), np.uint8)
     for channel in range(3):
@@ -310,11 +512,17 @@ def _frame(pixels: np.ndarray) -> LiveViewFrame:
     sink = QBuffer(data)
     sink.open(QBuffer.OpenModeFlag.WriteOnly)
     image.save(sink, "JPG", 95)
+    crop_w = int(6016 / magnification)
+    crop_h = int(4016 / magnification)
+    # The body will not show a crop that runs off the sensor.
+    x = min(max(centre[0], crop_w // 2), 6016 - crop_w // 2)
+    y = min(max(centre[1], crop_h // 2), 4016 - crop_h // 2)
     return LiveViewFrame(
         jpeg=bytes(data.data()), width=W, height=H,
-        image_width=6016, image_height=4016, crop_width=6016, crop_height=4016,
-        crop_center_x=3008, crop_center_y=2008,
-        af_width=324, af_height=270, af_x=3008, af_y=2008,
+        image_width=6016, image_height=4016,
+        crop_width=crop_w, crop_height=crop_h,
+        crop_center_x=x, crop_center_y=y,
+        af_width=324, af_height=270, af_x=centre[0], af_y=centre[1],
     )
 
 
@@ -327,7 +535,7 @@ def worker():
 
 
 def _ready(worker, lens, *, frames: int = 4, area=None):
-    """A camera, a reading to start from, and nothing walking yet."""
+    """A camera, a reading to start from, and nothing searching yet."""
     worker._camera = lens
     if frames:
         worker.set_integration(True, frames)
@@ -339,62 +547,186 @@ def _ready(worker, lens, *, frames: int = 4, area=None):
     return lens
 
 
-def _run(worker, lens, *, frames: int = 4, grabs: int = 3000, area=None) -> None:
-    """Watch a whole walk, one grab at a time."""
+def _tuned(worker, lens, *, frames: int = 4, grabs: int = 9000, area=None) -> None:
+    """Watch a whole fine tune, one grab at a time."""
     _ready(worker, lens, frames=frames, area=area)
     worker.fine_tune(STEP)
     for _ in range(grabs):
         if worker._hunt is None:
             break
         worker._grab()
-    assert worker._hunt is None, "the walk has to finish on its own"
+    assert worker._hunt is None, "the search has to finish on its own"
 
 
-@pytest.mark.parametrize("start", [12, -12, 40, -40])
-def test_it_finds_focus_through_the_whole_machinery(worker, start):
-    lens = _Lens(start=start)
-    _run(worker, lens)
-    assert lens.error <= 12, f"the walk left the optics at {lens.optics}, not near 0"
+@pytest.mark.parametrize("af_error", [14, -14, 30, -30])
+def test_it_finds_focus_through_the_whole_machinery(worker, af_error):
+    lens = _Lens(start=90, af_error=af_error)
+    _tuned(worker, lens)
+    assert lens.error <= 12, f"it left the optics at {lens.optics}, not near 0"
+
+
+@pytest.mark.parametrize("af_error", [12, -12])
+def test_it_finds_focus_on_a_subject_with_almost_no_depth_to_it(worker, af_error):
+    """The subject this button is for: a magnified macro scene where a couple
+    of steps is the whole of the depth of focus, so the reading goes over the
+    top and falls off a cliff rather than down a slope."""
+    lens = _Lens(start=60, depth=6.0, af_error=af_error)
+    _tuned(worker, lens)
+    assert lens.error <= 6
+
+
+def test_it_does_not_walk_on_once_the_picture_has_fallen_apart(worker):
+    """What was wrong with it: on a steep subject it took a confirming step
+    past the peak, and one step past the peak there is a fifth of the reading
+    left. Every probe it takes has to be worth taking."""
+    lens = _Lens(start=60, depth=6.0, af_error=-18)
+    readings = []
+    _ready(worker, lens)
+    worker.sharpnessChanged.connect(
+        lambda value, peak: readings.append(value) if value else None
+    )
+    worker.fine_tune(STEP)
+    tune = worker._hunt
+    for _ in range(9000):
+        if worker._hunt is None:
+            break
+        worker._grab()
+    for leg in _legs(tune.trail):
+        best, collapsed = 0.0, 0
+        for reading in leg:
+            best = max(best, reading)
+            collapsed = collapsed + 1 if reading < 0.9 * best else 0
+            assert collapsed <= 1, f"kept walking at {reading:.0f} of {best:.0f}"
+
+
+def test_it_betters_what_the_camera_managed_on_its_own(worker):
+    """The point of the button. The camera's own autofocus is the starting
+    point and the floor, and what is measured at the end has to clear it."""
+    lens = _Lens(start=90, af_error=24)
+    _tuned(worker, lens)
+    assert lens.error < 24
 
 
 def test_it_finds_focus_without_integration(worker):
-    lens = _Lens(start=30)
-    _run(worker, lens, frames=0)
+    lens = _Lens(start=60, af_error=-18)
+    _tuned(worker, lens, frames=0)
     assert lens.error <= 12
 
 
 @pytest.mark.parametrize("slack", [40, 90])
-def test_play_in_the_gearing_costs_the_walk_nothing(worker, slack):
+def test_play_in_the_gearing_costs_the_search_nothing(worker, slack):
     """No allowance, no compensation, nothing driven past its target and back:
-    the walk takes the play up itself, by walking."""
-    lens = _Lens(start=30, slack=slack)
-    _run(worker, lens)
+    the search takes the play up itself, by walking."""
+    lens = _Lens(start=60, slack=slack, af_error=-20)
+    _tuned(worker, lens)
     assert lens.error <= 12
+
+
+def test_it_starts_by_autofocusing_on_the_measured_area(worker):
+    """Not wherever the focus box was left: the measured area is what the
+    reading is about, and it is also what has to be on screen to be read."""
+    area = (0.25, 0.25, 0.4, 0.4)
+    lens = _Lens(start=60, af_error=-14)
+    _tuned(worker, lens, area=area)
+    assert lens.autofocused >= 1
+    assert lens.aimed, "it never moved the focus box"
+    # The middle of the area, in the frame's own coordinates.
+    assert lens.aimed[0] == (int(0.45 * 6016), int(0.45 * 4016))
+
+
+def test_it_magnifies_onto_the_measured_area_before_it_reads_anything(worker):
+    """The single largest thing that can be done for the answer, for one
+    command: a drive step moves the picture far more when the view is
+    magnified, so the focus error that is lost in the grain at full frame is
+    obvious at 18.8x."""
+    lens = _Lens(start=60, af_error=-14)
+    told = []
+    worker.zoomChanged.connect(told.append)
+    _tuned(worker, lens, area=(0.48, 0.48, 0.04, 0.04))
+    assert lens.zoomed, "it never magnified"
+    assert lens.zoomed[0] == 7, "a twenty-fifth of the frame fits at full zoom"
+    assert told[0] == 7, "and the panel has to be told where the view went"
+    # Once, before the search starts, and never again while it is running.
+    assert set(lens.zoomed) == {7}
+
+
+@pytest.mark.parametrize(
+    "side, level",
+    [(0.02, 7), (0.06, 6), (0.12, 5), (0.2, 4), (0.4, 2), (0.9, 0)],
+)
+def test_it_magnifies_as_far_as_it_can_and_still_show_the_whole_area(
+    worker, side, level
+):
+    """As far as it will go *and still show the area*. Magnifying past the
+    rectangle would read whatever part of it stayed on screen, which is a
+    different question from the one the rectangle was drawn to ask."""
+    lens = _ready(worker, _Lens(start=60), frames=0)
+    worker.set_sharpness_area((0.5 - side / 2, 0.5 - side / 2, side, side))
+    worker.fine_tune(STEP)
+    assert (lens.zoomed[-1] if lens.zoomed else 0) == level
+
+
+def test_the_measured_area_is_on_screen_once_it_has_magnified(worker):
+    """Magnifying is only worth anything if the rectangle is still being read,
+    and the focus point going to its middle first is what puts it there."""
+    area = (0.2, 0.3, 0.05, 0.05)
+    lens = _ready(worker, _Lens(start=60), frames=0)
+    worker.set_sharpness_area(area)
+    worker.fine_tune(STEP)
+    worker._grab()
+    shown = worker._sharpness.shown_in(worker._last_frame)
+    assert shown is not None, "it magnified away from what it is measuring"
+    x, y, w, h = shown
+    assert 0.0 <= x and 0.0 <= y and x + w <= 1.0 and y + h <= 1.0
+    assert w > 0.5 and h > 0.5, "and the area should fill most of the picture"
+
+
+def test_with_no_area_marked_out_the_view_is_left_alone(worker):
+    """There is nothing chosen to magnify onto, and going to 18.8x anyway
+    would quietly replace "the whole frame" with a twentieth of it."""
+    lens = _ready(worker, _Lens(start=60), frames=0)
+    worker.fine_tune(STEP)
+    assert lens.zoomed == []
+
+
+def test_it_autofocuses_once_and_only_once(worker):
+    """Autofocus on the same patch does not land on the same place twice, so a
+    second one half way through would throw away everything the walk had
+    learnt about which way things lie."""
+    lens = _Lens(start=60, af_error=-14)
+    _tuned(worker, lens)
+    assert lens.autofocused == 1
+
+
+def test_every_step_it_drives_is_the_one_increment_it_was_given(worker):
+    lens = _Lens(start=60, slack=40, af_error=-20)
+    _tuned(worker, lens)
+    assert {abs(steps) for steps in lens.drives} == {STEP}
 
 
 def test_no_reading_is_believed_until_the_lens_has_stopped(worker):
     """Live view lags the lens, so the frames straight after a drive show the
-    focus it used to have. Believing one would send the walk the wrong way."""
-    lens = _ready(worker, _Lens(start=40))
+    focus it used to have. Believing one would send the search the wrong way."""
+    lens = _ready(worker, _Lens(start=60))
     worker.fine_tune(STEP)
     settled_at = []
-    for _ in range(3000):
+    for _ in range(9000):
         if worker._hunt is None:
             break
         before = len(lens.drives)
         worker._grab()
         if len(lens.drives) > before:
             settled_at.append(worker._integrator.pending)
-    assert settled_at, "the walk never probed"
+    assert settled_at, "the search never probed"
     assert all(pending == 0 for pending in settled_at)
 
 
 def test_the_stack_a_reading_comes_from_starts_after_the_drive(worker):
     """Otherwise the bottom of the stack is the focus position before it."""
-    lens = _ready(worker, _Lens(start=40), frames=8)
+    lens = _ready(worker, _Lens(start=60), frames=8)
     worker.fine_tune(STEP)
     checked = 0
-    for _ in range(3000):
+    for _ in range(9000):
         if worker._hunt is None:
             break
         drives = len(lens.drives)
@@ -406,16 +738,16 @@ def test_the_stack_a_reading_comes_from_starts_after_the_drive(worker):
             worker._grab()
         assert worker._integrator.pending == 0
         checked += 1
-    assert checked > 3, "the walk has to have driven a few times to mean anything"
+    assert checked > 3, "it has to have driven a few times to mean anything"
 
 
 def test_the_settling_waits_for_the_picture_not_for_a_fixed_time(worker):
-    """Read too soon and the walk is told about the focus position it has just
-    left, so it walks away from focus rather than towards it."""
-    slow = _ready(worker, _Lens(start=40, lag=9))
+    """Read too soon and the search is told about the focus position it has
+    just left, so it walks away from focus rather than towards it."""
+    slow = _ready(worker, _Lens(start=60, lag=9))
     worker.fine_tune(STEP)
     waits = []
-    for _ in range(3000):
+    for _ in range(9000):
         if worker._hunt is None:
             break
         drives = len(slow.drives)
@@ -427,14 +759,14 @@ def test_the_settling_waits_for_the_picture_not_for_a_fixed_time(worker):
             worker._grab()
             frames += 1
         waits.append(frames)
-    assert waits, "the walk never drove"
+    assert waits, "it never drove"
     assert max(waits) > 3, "a lens this far behind has to be waited for"
     assert slow.error <= 12
 
 
 def test_how_far_live_view_runs_behind_is_measured_not_assumed(worker):
-    lens = _Lens(start=40, lag=6)
-    _run(worker, lens)
+    lens = _Lens(start=60, lag=6)
+    _tuned(worker, lens)
     assert worker._pipeline_lag is not None
     assert worker._pipeline_lag >= lens.lag, (
         "waiting less than the pipeline is deep reads the focus it just left"
@@ -445,57 +777,54 @@ def test_grain_is_not_mistaken_for_the_move_arriving(worker):
     """One grain of noise on a reading of nearly nothing is a difference of
     hundreds of per cent. Measuring the pipeline as shorter than it is would
     have every reading after it taken too early."""
-    lens = _Lens(start=40, lag=6, noise=14.0)
-    _run(worker, lens, frames=0)
+    lens = _Lens(start=60, lag=6, noise=14.0)
+    _tuned(worker, lens, frames=0)
     assert lens.error <= 24
 
 
-def test_the_walk_plots_its_own_readings(worker):
-    """The line starts again with the walk, so what is drawn is the walk."""
-    _ready(worker, _Lens(start=30))
+def test_the_search_plots_its_own_readings(worker):
+    """The line starts again with the search, so what is drawn is the search."""
+    _ready(worker, _Lens(start=60))
     told = []
     worker.sharpnessChanged.connect(lambda value, peak: told.append((value, peak)))
     worker.fine_tune(STEP)
     assert told[-1] == (0.0, 0.0)
 
 
-def test_the_camera_gets_it_close_when_there_is_nothing_to_climb(worker):
-    """A reading of zero is no hill at all, so the camera's own autofocus is
-    the opening move -- and only the opening move."""
+def test_it_says_so_when_there_is_nothing_in_the_area_to_focus_on(
+    worker, monkeypatch
+):
+    """A reading of zero is no hill at all -- but it is a reason to go and
+    look, not a reason to refuse. It walks its reach both ways first, and says
+    there is nothing only once that has come back empty.
+
+    The reach is cut down here so the test does not have to sit through three
+    hundred probes of an empty wall; what is being checked is what the worker
+    does with the answer.
+    """
+    from scanny.ui import worker as wk
+
+    monkeypatch.setattr(
+        wk, "FineTune", lambda step: FineTune(step, patience=2, max_probes=6)
+    )
     lens = _Lens()
     lens.blank = True
     worker._camera = lens
     worker.set_sharpness(True)
+    said = []
+    worker.status.connect(said.append)
     worker.fine_tune(STEP)
-    for _ in range(40):
+    for _ in range(3000):
+        if worker._hunt is None:
+            break
         worker._grab()
     assert lens.autofocused == 1
+    assert lens.drives, "it never went to look"
+    assert worker._hunt is None
+    assert "Nothing in the measured area" in said[-1]
 
 
-def test_the_camera_is_left_alone_when_there_is_something_to_climb(worker):
-    lens = _Lens(start=30)
-    worker._camera = lens
-    worker.set_sharpness(True)
-    worker.fine_tune(STEP)
-    for _ in range(12):
-        worker._grab()
-    assert lens.autofocused == 0
-
-
-def test_pressing_the_button_before_the_first_reading_keeps_the_focus(worker):
-    """The meter not having read anything yet is not the same as defocused,
-    and treating it as such would throw away good focus on the first press."""
-    lens = _Lens(start=30)
-    worker._camera = lens
-    worker.set_integration(True, 8)
-    worker.set_sharpness(True)
-    worker.fine_tune(STEP)
-    for _ in range(20):
-        worker._grab()
-    assert lens.autofocused == 0
-
-
-def test_it_will_not_walk_what_it_cannot_measure(worker):
+def test_it_will_not_search_what_it_cannot_measure(worker):
     worker._camera = _Lens()
     said = []
     worker.failed.connect(said.append)
@@ -504,7 +833,7 @@ def test_it_will_not_walk_what_it_cannot_measure(worker):
     assert "sharpness" in said[-1]
 
 
-def test_it_will_not_walk_without_live_view(worker):
+def test_it_will_not_search_without_live_view(worker):
     lens = _Lens()
     lens.live_view_active = False
     worker._camera = lens
@@ -516,8 +845,8 @@ def test_it_will_not_walk_without_live_view(worker):
     assert "live view" in said[-1]
 
 
-def test_taking_the_focus_by_hand_stops_the_walk(worker):
-    _ready(worker, _Lens(start=30), frames=0)
+def test_taking_the_focus_by_hand_stops_the_search(worker):
+    _ready(worker, _Lens(start=60), frames=0)
     worker.fine_tune(STEP)
     assert worker._hunt is not None
     worker.drive_focus(50)
@@ -534,8 +863,8 @@ def test_taking_the_focus_by_hand_stops_the_walk(worker):
         lambda w: w.cancel_hunt(),
     ],
 )
-def test_anything_that_changes_the_picture_stops_the_walk(worker, interrupt):
-    _ready(worker, _Lens(start=30), frames=0)
+def test_anything_that_changes_the_picture_stops_the_search(worker, interrupt):
+    _ready(worker, _Lens(start=60), frames=0)
     worker.fine_tune(STEP)
     told = []
     worker.huntChanged.connect(told.append)
@@ -557,13 +886,13 @@ class _Stuck(_Lens):
         return super().drive_focus(steps)
 
 
-def test_a_camera_that_refuses_to_drive_stops_the_walk(worker):
-    lens = _Stuck(start=30, after=3)
+def test_a_camera_that_refuses_to_drive_stops_the_search(worker):
+    lens = _Stuck(start=60, after=3)
     _ready(worker, lens, frames=0)
     said = []
     worker.failed.connect(said.append)
     worker.fine_tune(STEP)
-    for _ in range(300):
+    for _ in range(600):
         if worker._hunt is None:
             break
         worker._grab()
@@ -572,13 +901,13 @@ def test_a_camera_that_refuses_to_drive_stops_the_walk(worker):
 
 
 def test_the_measured_area_is_read_where_it_was_put(worker):
-    """Nothing moves it about: a walk decides on one reading against the one
+    """Nothing moves it about: a search decides on one reading against the one
     before it, so anything that changed *what* was measured between them would
     corrupt the only comparison it has.
     """
     area = (0.25, 0.25, 0.4, 0.4)
-    lens = _Lens(start=30)
-    _run(worker, lens, area=area)
+    lens = _Lens(start=60, af_error=-16)
+    _tuned(worker, lens, area=area)
     assert worker._sharpness.area == area
     assert lens.error <= 12
 
@@ -587,14 +916,14 @@ def test_nothing_is_shown_or_measured_while_the_lens_is_moving(worker):
     """A frame caught mid-move belongs to no focus position. Stacking one
     blends two positions into a picture and then measures the blend; showing
     one on its own puts a flash of grain on screen where a clean image was."""
-    lens = _ready(worker, _Lens(start=30))
+    lens = _ready(worker, _Lens(start=60))
     pictures, readings = [], []
     worker.frameReady.connect(
         lambda frame, image: pictures.append(image) if not image.isNull() else None
     )
     worker.sharpnessChanged.connect(lambda value, peak: readings.append(value))
     worker.fine_tune(STEP)
-    for _ in range(3000):
+    for _ in range(9000):
         if worker._hunt is None:
             break
         drives = len(lens.drives)
@@ -614,13 +943,13 @@ def test_the_first_frame_after_a_move_is_not_shown_on_its_own(worker):
     the focus position just left. The frame that starts the new one is a
     single unaveraged frame: it must not go to the screen in place of the
     clean picture that is already there."""
-    lens = _ready(worker, _Lens(start=30))
+    lens = _ready(worker, _Lens(start=60))
     pictures = []
     worker.frameReady.connect(
         lambda frame, image: pictures.append(image) if not image.isNull() else None
     )
     worker.fine_tune(STEP)
-    for _ in range(3000):
+    for _ in range(9000):
         if worker._hunt is None:
             break
         drives = len(lens.drives)

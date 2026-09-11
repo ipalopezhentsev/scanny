@@ -95,7 +95,7 @@ trusting that number anywhere:
 | `ui/integration.py` | Averaging consecutive frames to cancel sensor noise |
 | `ui/sharpness.py` | Scoring the contrast in the displayed picture, to focus against |
 | `ui/trend.py` | The plot of recent readings that focus is driven against |
-| `ui/hunt.py` | Walking focus to the top of that reading, without counting steps |
+| `ui/hunt.py` | Autofocus, then bettering it a single step at a time, without counting steps |
 | `ui/depth.py` | Sweeping the travel once and reading every part of the picture: a depth map |
 | `ui/depthview.py` | That map drawn, with the scale to read it by |
 | `ui/points.py` | The same sweep asked about a few places you point at, in order |
@@ -250,15 +250,32 @@ strand of something. So **shift-drag on the image** marks out a rectangle and
 the reading comes from inside it alone. The gesture switches measuring on by
 itself: drawing the box is not an ambiguous thing to be doing.
 
-The rectangle is a fraction of the *displayed picture*, not a place on the
-sensor, so it stays where it was put on screen when the camera magnifies or
-pans underneath it -- which is what you want while hunting focus, where the box
-marks a place to look rather than a subject to follow. It is drawn in its own
-colour, dashed, so it is never mistaken for the focus box: one is where the
-camera would focus, the other is where the sharpness is being read, and they
-are usually not the same rectangle. Anything smaller than 16 pixels across is
-grown to it, because a reading off a handful of pixels is all noise and jumps
-about far too much to focus against.
+### The rectangle is a place on the sensor, not a place on the screen
+
+It used to be a fraction of the *displayed picture*, and that was wrong in a
+way that only shows up the moment you magnify. A rectangle drawn round one
+letter of a caption at full frame is, say, a third of the way across the
+picture; magnify to 18.8x and it is still a third of the way across the strip
+the camera now shows, which is a different piece of the world entirely. So the
+measured area jumped to somewhere nobody chose on every change of
+magnification -- and the readings either side of that jump, which is exactly
+what focusing against a number is comparing, had nothing to do with each
+other.
+
+It is kept in fractions of the **whole frame** now: the same coordinates the
+camera's own focus point lives in, and the same ones `ui/points.py` keeps the
+measured points in, for the same reason. It does not move when the view
+magnifies or pans; where it falls on the picture is worked out afresh for
+every frame from that frame's crop rectangle. Magnify somewhere else entirely
+and it is not on the picture at all, which is drawn as no box and read as no
+reading -- rather than as the whole frame, which is a different question
+answered with a number that looks just like the ones being compared.
+
+The box is drawn in its own colour, dashed, so it is never mistaken for the
+focus box: one is where the camera would focus, the other is where the
+sharpness is being read, and they are usually not the same rectangle. Anything
+smaller than 16 pixels across is grown to it, because a reading off a handful
+of pixels is all noise and jumps about far too much to focus against.
 
 The score is the mean squared difference between neighbouring pixels -- the
 gradient energy contrast autofocus is built on -- with the grain taken off it,
@@ -364,9 +381,9 @@ does -- all of them make a different measurement of a different picture.
 **Reset best** does the same by hand, for when none of those has happened but
 the subject has.
 
-## Walking focus to the sharpest point
+## Fine tuning focus
 
-**Fine tune from here** does by motor what the reading is there to be driven
+**Fine tune focus** does by motor what the reading is there to be driven
 against. It is the camera's contrast autofocus, except that it works on the
 measured area rather than on the body's own focus box -- which is the whole
 point, since that box is 324 sensor pixels wide and the subject may be a tenth
@@ -374,7 +391,36 @@ of that. It is a separate button from **Autofocus** on purpose: that one is
 the camera's own, over the camera's own box, and it is still the right thing
 when the subject is large and roughly where the box is.
 
-### Nothing counts steps
+### What it does
+
+- **It magnifies onto the measured area first**, as far as the body will go
+  and still show the whole of it. One command, and the largest single thing
+  that can be done for the quality of the answer.
+- **Then the camera's own autofocus**, aimed at the measured area rather than
+  at wherever the focus box was left. That is a rough answer got in one go,
+  and it is the *baseline*: the reading taken there is a floor the rest of the
+  procedure is not allowed to end below.
+- **Then it walks**, one increment at a time, keeping the best reading it has
+  seen and where it saw it. While the reading rises it keeps going. When the
+  reading gets worse it **turns round** -- because a reading getting worse
+  means the other way, and that is the only thing it can mean.
+- Once the reading has been watched to fall away on **both sides of the best**,
+  that best is a peak rather than a slope and there is nothing left to explore.
+- **It walks back to it**, still turning round whenever the reading gets worse,
+  and stops when the reading is back to what it was.
+- If what it ends on is worse than the baseline after all, **it autofocuses
+  once more** and says so.
+
+Earlier versions of this walked one way only; grew their step while the picture
+was quiet; came back to within three per cent of the best they saw; waited for
+a second falling reading before turning round; searched the two directions as
+separate excursions with an autofocus in between to reset; and, when a
+direction stopped paying, **gave up on the spot**. Every one of those is now
+different, and the reason each one changed is below. What they had in common is
+the symptom: it stopped somewhere you could better by hand with the minimum
+increment, having already seen the better reading during its own search.
+
+### Nothing counts steps to drive by
 
 Everything below rests on one decision. Focus is driven by **making steps and
 watching what the reading does**, never by remembering that the best reading
@@ -382,10 +428,10 @@ was so many steps back and driving that far.
 
 The reason is the lens. Focus gearing has play in it, so the same number of
 steps moves the optics differently depending on which way they were last
-driven, and a reversal moves nothing at all until the play is taken up. A hunt
-that navigates by step count therefore has to know how much play a lens has,
-and drive past every target and back again to take it up -- a setting to get
-right, an overshoot on every backward move, and readings that are only
+driven, and a reversal moves nothing at all until the play is taken up. A
+search that navigates by step count therefore has to know how much play a lens
+has, and drive past every target and back again to take it up -- a setting to
+get right, an overshoot on every backward move, and readings that are only
 comparable if the setting was right. All of it to make a step count mean
 something it does not naturally mean.
 
@@ -394,75 +440,282 @@ nothing happens, and the walk keeps walking until something does. There is no
 allowance to set, nothing is driven past its target, and a lens with a lot of
 play costs a few extra probes rather than a wrong answer.
 
-### The walk
+Step counts are kept, and they are read for exactly one thing: **which side of
+the best reading a place was on**, which is how the walk knows it has explored
+both sides and can stop. A step count is not trustworthy enough to drive to;
+it is quite trustworthy enough to say which side of something you were
+standing.
 
-What a hand does, in the panel's **minimum** increment:
+### A direction that is not working is never a reason to stop
 
-- step until the reading **rises**; if it falls instead, turn round and walk
-  the other way;
-- keep going while it rises, remembering the best reading seen;
-- when it **turns over**, walk back until the reading is as good as that best
-  one again, and stop there.
+This was the worst of the old faults and the one that showed. Legs that walked
+towards a reading had a probe budget, and running out of it **ended the whole
+search** wherever it happened to be standing -- which, if the direction was the
+wrong one, was as far from focus as that direction had managed to drag it. The
+status line said so in as many words, and it was right: *walked 38 probes
+without finding the 6 it saw again*. It had spent all 38 of them walking away.
 
-It expects focus to be close already -- get roughly there by eye or with the
-camera's own autofocus first. That is not much of a limitation: on a magnified
-macro subject, which is what the measured area is for, focus is either close
-or nowhere, and a search casting about in medium steps spends its probes at
-positions where nothing in the picture could be sharp. There was such a search
-here, in three increments, and it was worse than useless on exactly the
-subjects this is for; the walk replaced it.
+A reading that is getting worse is information, not failure. What it says is
+*go the other way*, and that is now the only thing it does. The walk turns
+round; it does not stop. What ends a walk is standing on the best reading it
+has seen.
 
-Against a simulated lens with twenty steps of depth of focus, from forty steps
-out, with sixty steps of play in its gearing: **two steps** of error, two
-hundred steps of lens travel, about fifteen seconds. Nearer to start with, it
-is exact and quicker.
+There is still a limit on the turns, but it is not a budget to be spent. Two
+turns is what a single-humped reading needs: one to find out the first guess at
+the direction was wrong, and one to come back off the far side of the peak. The
+rest are for a reading unsteady enough to send the walk the wrong way -- and a
+turn only counts against the limit when the walk **got nowhere** with it, since
+a walk that has found something better since it last turned is not thrashing
+whatever its count says. Reaching the limit does not end the search either: it
+ends the *looking*, and the walk then goes and stands on the best reading it
+found.
 
-Four things about it are worth keeping.
+### Looking further, instead of ending the loop
 
-**It comes back by reading, not by step count.** Coming back, the first steps
-take up the play and the picture does not move at all; the walk simply
-continues until it does. That is the whole of what replaced the backlash
-machinery.
+The second thing that showed, and the one that needed the search reshaped
+rather than patched. The walk would go back and forth a few times inside a
+small stretch and announce it was finished -- and moving focus by hand, outside
+that stretch, found something better.
 
-**Rising and falling are judged against the previous reading, not the best
-one.** It sounds like a detail and it is the difference between working and
+Two things were wrong, and they made each other worse.
+
+**Saying nothing counted as evidence.** A direction was marked explored
+whenever the walk turned round in it, for *any* reason: a wobble in the
+reading, or simply having walked a while with nothing happening. Once both
+directions were marked, the walk concluded it had straddled a peak and went
+home. But a direction that said nothing has not been explored, it has been
+glanced at. Only the reading actually **falling away** -- clearly, five per
+cent below the best, while walking outward from it -- is evidence that the best
+has been walked past. Nothing else ends a search now.
+
+**And the reach was a fixed box.** Sixteen probes of the minimum increment is
+about ninety drive steps on a lens with six thousand of travel, so a peak two
+hundred steps from wherever the autofocus stopped was simply outside what the
+walk would ever see. That reach now **doubles** every time a direction is
+walked to the end of it without the reading falling away: sixteen increments
+either side of the best, then thirty-two, then sixty-four. It costs the
+ordinary case nothing, because a peak near the autofocus is found inside the
+first reach and the growth never happens.
+
+Two details make the growth actually reach somewhere:
+
+- **The reach is measured from the best reading, not from where the last leg
+  stopped.** Counting quiet probes from wherever you happen to be makes the
+  legs cancel -- ninety steps out, ninety steps back, thirty probes spent and
+  the walk is where it started. Measured from the best, the legs are a bracket
+  that opens.
+- **A side that has already given its answer is not walked again.** If one
+  direction has been watched to fall away and the other still owes an answer,
+  there is nothing to go back for: the walk carries straight on, further than
+  last time, instead of covering the same ground twice.
+
+Measured against a modelled curve, with the peak a given distance from where
+the autofocus left the lens:
+
+| peak is | before | now |
+| --- | --- | --- |
+| 30 steps away | found | found, 23 probes |
+| 60 steps | **gave up** | found, 56 probes |
+| 90 steps | **gave up** | found, 61 probes |
+| 150 steps | **gave up** | found, 167 probes |
+| 240 steps | gave up | says there is nothing there |
+
+The last row is honest rather than fixed. Two hundred and forty drive steps of
+picture that reads exactly the same all the way across is a blind search, and
+at a six-step increment it is hundreds of probes however it is organised. The
+only way to cover that ground quickly is a coarser step, and a coarser step is
+how a search walks over the peak it is looking for -- so it covers what it can
+and then says so. The reach is counted in *increments*, not steps, so a lens
+whose minimum increment is eighteen reaches three times as far.
+
+### A reading of nothing is a reason to look, not a reason to stop
+
+A thoroughly defocused frame reads zero -- correctly, since it has no detail
+above its own grain. That used to end the search on the spot, on the grounds
+that zero is not a hill that can be climbed.
+
+It is not a hill, but it is not a verdict either: it is what the whole
+neighbourhood reads when focus is a couple of hundred steps away, which is
+exactly the case the growing reach exists for. So the walk covers its reach in
+both directions first, and says there is nothing in the measured area only once
+that has come back empty.
+
+### There is exactly one autofocus, at the start
+
+There used to be a second one, to reset between searching one way and the
+other. It was a mistake, and the reason is worth recording because it is not
+obvious: **autofocus on the same patch does not land on the same place twice.**
+It is a search of its own, with its own noise, and it stops wherever it stops.
+
+So everything the search had learnt about which way things lay was worthless
+the moment the second autofocus ran. Worse, the step-count bookkeeping that
+decided which way to walk afterwards was built on the assumption that it
+*would* land in the same place -- so when it did not, the walk confidently set
+off in the direction away from the peak it was trying to return to.
+
+One walk that turns itself round needs no datum to return to and no second
+opinion about where it is. It also costs one autofocus and a good many fewer
+probes.
+
+### Nothing takes a longer step, either
+
+An earlier version doubled its step while the picture was not answering, up to
+four times the increment, on the reasoning that crawling through a lens's play
+a minimum step at a time is a probe a second spent reading exactly what the
+last one read. There is nothing to lose by hurrying through the play.
+
+Except that the step which finally takes up the *last* of the play is also the
+one that moves the optics, by however much of it was left over -- and a long
+step there walks straight over the peak. What that costs is not a slower
+search but a worse answer, which is the one thing this button exists not to
+give. Every step it makes is the one increment it was given.
+
+### One reading off a cliff is enough
+
+Turning round took **two** falling readings, because one fall is as likely to
+be the reading wandering as the lens going the wrong way -- which means it
+always took one more step in a direction that had already got worse.
+
+On a subject with any depth to it that second step is the expensive one. A
+magnified macro scene has a couple of drive steps of depth of focus, so the
+reading goes over the top at the best it will ever read, is a **fifth** of that
+one step later, and a twentieth the step after. Waiting for confirmation means
+standing somewhere nothing in the picture could be sharp, and then walking all
+the way back through the lens's play to undo it.
+
+So a single reading **a tenth below the best of the stretch being walked**
+turns the walk round on the spot, with no confirming step. A tenth is five
+times the worst grain on an integrated stack, so nothing is lost by acting on
+the first one; it is also the judgement a person watching the trend line makes.
+
+### A fall means two different things, and which one depends on the play
+
+The two-falls rule is still there for *small* falls, and on its own it is not
+enough, because a fall means different things depending on whether the optics
+are moving at all.
+
+Crossing a lens's play they are not. The reading wanders around one value and
+does not trend, and at one per cent of noise against a one per cent threshold
+about one pair of readings in sixteen falls twice in a row by luck alone. A
+walk that turns round on that **never gets out of the play**: it turns, crosses
+back, turns again, and settles in the middle of it having learnt nothing. That
+was measured -- on a shallow subject with sixty steps of play and one per cent
+of noise it was finishing at a ninth of the peak reading.
+
+So a fall only counts once the reading has **sagged a twentieth below the best
+of the stretch it is on**. Below that it is wander and is treated as nothing
+having changed; above it, it is downhill. Note the reference: the best of the
+current stretch, since the last turn. The best of the whole walk is no use,
+because a walk on its way back from far out starts every stretch a long way
+below that -- judging against it calls the entire journey home a collapse.
+
+### Coming back to the peak, and not to three per cent of it
+
+The walk back stops when the reading it left behind is back. How near counts
+as back is the single number that decides how good the answer is, and it used
+to be **three per cent** below the best. On a magnified macro subject three per
+cent is a step short of focus -- reliably, on almost every run, and visibly
+enough that anyone watching could better it by hand. It is **one per cent**
+now.
+
+The target that one per cent is measured against **is frozen when the walk
+turns for home**. Letting it follow the best -- carrying on because the reading
+is still rising and has already beaten what the walk set out for -- is the
+obvious improvement and it is wrong: the step that beats the target is usually
+the peak itself, so carrying on from there steps over it, and a step past a
+peak cannot be taken back without crossing the whole of the gearing's play
+again.
+
+A walk back that goes over the top without ever matching its target stops
+anyway: the best reading of a noisy walk is the luckiest of them and may not
+come again, so having risen and then fallen counts as having arrived. **Only
+when it is genuinely near the target**, though, and that condition is doing
+real work: crossing the play the reading wanders, so a rise of two per cent
+followed by a fall of three is ordinary, and without the test it reads as
+"climbed to the target and went over it" while standing at a tenth of the
+target -- which ends the search a dozen steps from focus. That was a real
+trace, not a hypothetical.
+
+### Turning round, and what a falling reading means
+
+Rising and falling are judged against the **previous reading, not the best
+one**. It sounds like a detail and it is the difference between working and
 not: every reading after the first is below the best, so a walk that asks "is
-this below the best?" answers yes to everything and gives up the moment it
-turns round. That comparison is also the noisiest one available, so it takes
-two falls in a row to turn the walk round -- one is as likely to be the
-reading wandering as the lens going the wrong way.
+this below the best?" answers yes to everything and turns round on the spot,
+for ever.
 
 **A reading that has not changed is not a reading that got worse.** Play shows
 up as readings that are identical, and those are walked through; going the
 wrong way shows up as readings that fall.
 
-**On the way out the step grows while nothing is happening, and drops back the
-instant it does.** Crawling through a lens's play a minimum step at a time is
-a probe a second, every one of them reading exactly what the last one read, so
-after a couple the step doubles, up to four times the increment. The way back
-never grows: the step that finally takes up the last of the play also moves
-the optics by whatever is left of it, so a long step there can carry the lens
-clean past the reading it came back for. That was a real error, watched in a
-trace. Speed where nothing is changing, and never where something is.
+A direction that says nothing at all for sixteen probes, or four hundred steps,
+is turned round too -- not given up on. A direction with nothing in it is a
+direction explored, and the other one is still there to try.
 
-The walk is bounded -- forty probes, three thousand steps from where it began,
-and a direction that says nothing for four hundred steps is abandoned --
-because the body does not report the end of its travel.
+**How much better counts as better** is what decides where it stops climbing.
+Too low and it chases the wander in a steady reading; too high and it stops
+while there is still focus to be had. Two per cent was too high: against a
+modelled focus curve it stopped a fine step short of focus on a broad peak
+almost every time. One per cent finds it.
 
-**How much better counts as better** is what decides where it stops. Too low
-and it chases the wander in a steady reading; too high and it stops while
-there is still focus to be had. Two per cent was too high: against a modelled
-focus curve it stopped a fine step short of focus on a broad peak almost every
-time. One per cent finds it.
+### The floor, and why it is wider than everything else
+
+The baseline is one reading, and so is the one it is compared with at the end.
+A reading wanders. On a subject where it wanders a couple of per cent, a band
+as narrow as the one per cent used everywhere else would call a tie a loss
+about half the time, and every one of those throws away a real improvement in
+order to go back to a rougher answer. So the floor is **five per cent**: what
+it is for is the search having ended up somewhere genuinely worse, which is not
+a thing that happens by one per cent.
+
+### What it costs, and what it is worth
+
+Against a modelled focus curve with a lens whose gearing has play in it, from
+ten starting points either side of focus, taking the true sharpness where the
+camera's own autofocus left it against the true sharpness where the walk
+stopped -- both read noise-free, so what is compared is the focus position
+rather than the luck of a reading. A shallow subject where the whole depth of
+focus is a step or two, which is what the measured area is for, and an ordinary
+one:
+
+| | autofocus | after fine tuning | probes |
+| --- | --- | --- | --- |
+| shallow, no play | 1% of peak | 100% | 9 |
+| shallow, 30 steps of play | 1% | 87% | 22 |
+| shallow, 60 steps of play | 1% | 100% | 34 |
+| shallow, 90 steps of play | 1% | 87% | 47 |
+| ordinary, no play | 70% | 100% | 12 |
+| ordinary, 60 steps of play | 70% | 100% | 37 |
+
+**Those numbers do not move when noise is put on the readings** -- half a per
+cent, one per cent and two per cent all give the same column, which is what the
+two rules about what a fall means bought. The 87% rows are not the search
+falling short: on a curve that narrow, an odd number of steps of play offsets
+the grid by half an increment, and 87% is the best reading any whole number of
+steps can reach. Lower the minimum increment and they go to 100 as well.
+
+A probe costs a drive, the settling and a whole stack -- around a second -- so
+with the peak near where the autofocus left it the whole thing is ten seconds
+on a lens with no play and under a minute on one with a great deal. A peak
+further out costs whatever the reach has to grow to: a minute or two, which is
+what the doubling buys and what the **Stop** button is for. The status line
+says whether it is still looking or on its way back, so a long search is legible
+rather than a rising number.
+
+That is the price of the no-shortcuts rule, and it is the right way round: this
+is the button for the last hair of focus on a subject that took a while to set
+up.
 
 ### Focus breathing, and why the area is left alone
 
 A lens does not only change how sharp the picture is as it focuses. It changes
 how big it is: the frame grows or shrinks a little with every move and
-everything in it slides. The sharpness is read over a rectangle of the
-*screen*, so a picture that slides underneath it is read over different
-content -- and if the subject is one small thing the rectangle was drawn
-snugly around, sliding it a few pixels puts half the subject outside.
+everything in it slides. Keeping the measured area in sensor coordinates does
+not help with this, and it is worth being clear about why -- the subject moves
+*across the sensor*, so a rectangle nailed to the sensor is read over
+different content just as a rectangle nailed to the screen is. If the subject
+is one small thing the rectangle was drawn snugly around, sliding it a few
+pixels puts half the subject outside either way.
 
 The measured area used to follow the picture for that reason, by phase
 correlation against the frame the hunt started from. It is gone, and the
@@ -526,13 +779,12 @@ a **whole** stack. The single frame live view shows the instant a stack
 restarts is deliberately not believed, which is why the integrator says
 whether the picture it handed over was a finished stack or that one frame.
 
-So a probe costs a drive, the settling, and a whole stack. Against a simulated
-lens, a whole hunt takes about **four seconds** with integration off, **six**
-integrating four frames, and **twelve** integrating sixteen -- and the trend
-line draws itself as it goes, so what the hunt is doing is visible rather than
-a frozen button.
+So a probe costs a drive, the settling, and a whole stack: around a second
+with integration off, half as long again integrating four frames, and three
+times as long integrating sixteen. The trend line draws itself as it goes, so
+what is happening is visible rather than a frozen button.
 
-Against a simulated lens, hunting the same subject from six starting points,
+Against a simulated lens, tuning the same subject from six starting points,
 the error is where the optics finished against where focus really was:
 
 | | ordinary lens | live view six frames behind | that, with slack and grain |
@@ -540,28 +792,69 @@ the error is where the optics finished against where focus really was:
 | Fixed three-frame wait | 2 | 122 | 122 |
 | Watching the picture | 2 | 2 | 2 |
 
-### Getting into the neighbourhood
+### Magnifying onto the area before anything is read
 
-A thoroughly defocused frame reads zero -- correctly, since it has no detail
-above its own grain -- and zero is not a hill that can be climbed. So if the
-first settled reading of a hunt is zero, the camera's own autofocus runs to get
-roughly there and the hunt takes over from wherever that left it.
+**A drive step moves the picture far more when the view is magnified.** That
+is the same fact the depth map rests on, and it is worth more here than any
+amount of care in the search: the focus error that is lost in the grain at
+full frame is obvious at 18.8x, which is the difference between a search that
+can tell one step from the next and one reading its own noise. It costs one
+command, so the fine tune now does it for you rather than leaving it as
+something to remember.
 
-That decision waits for a real reading rather than being taken when the button
-is pressed, and the difference matters: the meter having read nothing yet is
-not the same as the picture being defocused, and treating it as such would
-throw away good manual focus on the first press. If the reading is still zero
-after the camera has had its go, the hunt works through its increments once
-and then says there is nothing in the area to focus on, rather than driving
-about hopefully.
+As far as the body will go **and still show the whole area**, rather than
+simply as far as it will go. Magnifying past the rectangle would leave the
+reading taken over whichever part of it stayed on screen -- a different
+question from the one the rectangle was drawn to ask, and one nobody chose.
+For a D750's levels that works out as:
+
+| the area, across the frame | magnification | it shows |
+| --- | --- | --- |
+| a fiftieth | 18.8x | a twentieth of the frame |
+| a sixteenth | 9.4x | a tenth |
+| a fifth | 4.7x | a fifth |
+| two fifths | 2.35x | four tenths |
+
+With **no area marked out the view is left alone**. There is nothing chosen to
+magnify onto, and going to 18.8x anyway would quietly replace "the whole
+frame" with a twentieth of it -- which is a different measurement, not a
+better one.
+
+It happens once, before the first reading is taken, and never again while the
+search is running: every reading a search makes has to be of the same picture
+as the last, which is why changing the magnification by hand stops it. The
+view is **left magnified** when it finishes, which is where you want to be to
+look at what it did; Esc or 0 goes back to the whole frame.
+
+The one cost is frame rate -- a D750 draws 44 frames a second out to 3.13x and
+16 from 4.7x up -- so each probe takes a little longer at the magnifications
+this picks. It buys far more than it costs.
+
+### Aiming the camera's autofocus at the measured area
+
+The autofocus that opens the procedure moves the camera's focus box to the
+**middle of the measured area** first, and so does the one that puts focus
+back if the walk ends below the floor. Focusing wherever the box was last left
+would hand the walk a starting point with no relation to what it is climbing:
+the reading is about the measured area and nothing else.
+
+Moving the focus point is also what pans a magnified view on a D750, so this
+has a second effect worth having -- it brings the measured area on screen.
+That only works because the area is a place on the sensor: a screen-fraction
+rectangle would have panned along with the picture and stayed exactly where it
+was, marking out whatever the pan brought under it.
+
+What the camera leaves behind is not required to be any good. If it reads zero
+the walk still goes and looks -- see *A reading of nothing is a reason to look*
+above.
 
 ### What stops it
 
 Taking the focus by hand, magnifying, moving the measured area, changing the
 integration, changing any camera setting, or stopping live view. All of them
 mean the next reading would be of a different picture from the last one, and
-comparing across that is exactly the mistake the hunt is made of. The button
-says **Stop hunting** while one is running.
+comparing across that is exactly the mistake the whole thing is made of. The
+button says **Stop** while it is running.
 
 ## Distance between a few points you pick
 
@@ -620,7 +913,7 @@ whatever zoom.
 Pointing `ui/hunt.py` at each box in turn is the obvious construction and it is
 worse in both directions at once.
 
-It costs five hunts of twenty to forty probes, where a sweep costs its stops
+It costs five searches of dozens of probes each, where a sweep costs its stops
 once: every box is read off the same frame, so the fifth point is free.
 
 And **its answers would not compare**. A hunt walks out until the reading turns
@@ -769,7 +1062,7 @@ focus positions, and each part answers with the position where it was sharpest
 ### One sweep, not a hunt per zone
 
 The obvious construction is to point the existing hunt at each zone in turn and
-write down where it stopped. It fails twice over. A hunt costs twenty to forty
+write down where it stopped. It fails twice over. A hunt costs dozens of
 probes and every probe is a focus move and a settle, so even a 16x9 grid is
 thousands of camera round trips -- the better part of an hour. And a hunt
 *moves the lens*, so by the time the second zone has been measured the first
@@ -1410,13 +1703,20 @@ Switched off, the camera's own names are kept, and a collision is decorated
   those are of different pictures.
 - **Shift-drag** on the image to measure one rectangle of it rather than the
   whole frame. That is how to focus on something smaller than the camera's
-  focus box, or smaller than its strongest magnification shows.
-- **Fine tune from here** then walks focus to the top of that reading by
-  itself -- contrast autofocus on the area you marked out, rather than on the
-  camera's focus box. Out in minimum steps until the reading turns over, then
-  back until it is as good as the best it saw. Get roughly close first; it is
-  for tidying up, not for finding focus from nowhere. It counts no drive steps
-  at all, so it does not care how much play the lens has. Anything you do to
+  focus box, or smaller than its strongest magnification shows. The rectangle
+  marks a place on the sensor, so it stays on the same part of the subject
+  when you magnify or pan.
+- **Fine tune focus** then drives focus to the top of that reading by itself
+  -- contrast autofocus on the area you marked out, rather than on the
+  camera's focus box. It magnifies onto that area as far as the body will go
+  and still show it, autofocuses there, and then walks in minimum steps and
+  nothing coarser -- turning round whenever the reading gets worse, since that
+  is the only thing a reading getting worse can mean -- until it is standing
+  on the best reading there is. It will not leave focus worse than the
+  camera's own autofocus managed. It counts no drive steps to drive by, so it
+  does not care how much play the lens has; it pays for that in probes
+  instead, ten seconds on a tight lens and under a minute on a loose one. The
+  view is left magnified afterwards; Esc or 0 goes back. Anything you do to
   the focus, the view or the exposure stops it.
 - **Ctrl-click** the picture to put down a point to be measured, up to five,
   and ctrl-click one again to take it away. **Measure points** then sweeps

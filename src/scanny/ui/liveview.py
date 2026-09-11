@@ -65,6 +65,11 @@ class LiveViewWidget(QWidget):
     #: sharpness is to be measured. Separate from magnifying because at full
     #: magnification there is nowhere further to zoom, and picking out
     #: something smaller than the frame is exactly what is wanted there.
+    #:
+    #: In fractions of the **whole frame**, unlike every other rectangle this
+    #: emits: the measured area is a place on the subject that has to survive
+    #: the view magnifying and panning, not a place on the screen. See
+    #: :meth:`scanny.ui.sharpness.SharpnessMeter.set_area`.
     measureAreaSelected = Signal(float, float, float, float)
     #: Mouse wheel: +1 to magnify, -1 to pull back.
     zoomStepped = Signal(int)
@@ -179,7 +184,12 @@ class LiveViewWidget(QWidget):
     def set_measure_area(
         self, area: "tuple[float, float, float, float] | None"
     ) -> None:
-        """Outline the part of the picture being measured, or None for all of it."""
+        """Outline the part being measured, or None for all of it.
+
+        In fractions of the whole frame; where that lands on the picture on
+        screen is worked out afresh for every frame, because the picture on
+        screen is a crop of the frame that moves.
+        """
         if area != self._measure_area:
             self._measure_area = area
             self.update()
@@ -233,7 +243,6 @@ class LiveViewWidget(QWidget):
 
         if self._frame is not None:
             self._draw_focus_box(painter)
-        if self._measure_area is not None:
             self._draw_measure_area(painter)
         if self._points:
             self._draw_points(painter)
@@ -361,12 +370,21 @@ class LiveViewWidget(QWidget):
         Deliberately unlike the focus box: one is where the camera will focus,
         the other is where the sharpness is being read, and they are usually
         not the same rectangle.
+
+        It is kept in the frame's coordinates, so where it falls on the
+        picture depends on the crop this frame arrived with -- and nothing is
+        drawn at all when the view has been magnified somewhere else, because
+        then it is not on the picture.
         """
-        assert self._measure_area is not None
-        box = self._box(self._measure_area)
+        assert self._frame is not None
+        if self._measure_area is None:
+            return
+        shown = self._frame.area_normalised(self._measure_area)
+        if shown is None:
+            return
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(_MEASURE, 2, Qt.PenStyle.DashLine))
-        painter.drawRect(box)
+        painter.drawRect(self._box(shown))
 
     # -- input -------------------------------------------------------------
 
@@ -435,15 +453,22 @@ class LiveViewWidget(QWidget):
         bottom_right = self._normalise(rect.bottomRight())
         if top_left is None or bottom_right is None:
             return
-        # Both corners come back in the frame's coordinates, where a turn or a
-        # mirror may have swapped which of them is the top left one, so the
-        # rectangle is rebuilt from the two rather than subtracted.
-        signal = self.measureAreaSelected if measuring else self.regionSelected
-        signal.emit(
-            min(top_left[0], bottom_right[0]),
-            min(top_left[1], bottom_right[1]),
-            abs(bottom_right[0] - top_left[0]),
-            abs(bottom_right[1] - top_left[1]),
+        # Both corners come back in the displayed picture's coordinates, where
+        # a turn or a mirror may have swapped which of them is the top left
+        # one, so the rectangle is rebuilt from the two rather than subtracted.
+        if not measuring:
+            self.regionSelected.emit(*_rect_between(top_left, bottom_right))
+            return
+        # The measured area is a place on the sensor, so the two corners go
+        # out through the crop this frame was sent with. Without a frame there
+        # is no crop to go through and nothing that could be said.
+        if self._frame is None:
+            return
+        self.measureAreaSelected.emit(
+            *_rect_between(
+                self._frame.to_frame_fraction(*top_left),
+                self._frame.to_frame_fraction(*bottom_right),
+            )
         )
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
@@ -499,6 +524,18 @@ class LiveViewWidget(QWidget):
         delta = event.angleDelta().y()
         if delta:
             self.zoomStepped.emit(1 if delta > 0 else -1)
+
+
+def _rect_between(
+    one: "tuple[float, float]", other: "tuple[float, float]"
+) -> "tuple[float, float, float, float]":
+    """An (x, y, w, h) rectangle from two corners, whichever way round they are."""
+    return (
+        min(one[0], other[0]),
+        min(one[1], other[1]),
+        abs(other[0] - one[0]),
+        abs(other[1] - one[1]),
+    )
 
 
 def _ink_for(colour: QColor) -> QColor:

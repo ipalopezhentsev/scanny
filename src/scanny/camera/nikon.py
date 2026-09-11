@@ -180,6 +180,45 @@ class LiveViewFrame:
         cy = self.crop_center_y / self.image_height
         return (cx - w / 2, cy - h / 2, w, h)
 
+    def to_frame_fraction(self, nx: float, ny: float) -> "tuple[float, float]":
+        """A place on the displayed picture as a fraction of the whole frame.
+
+        The inverse of what :attr:`crop_normalised` describes, and what turns
+        a gesture on screen into somewhere on the sensor -- which is where
+        anything meant to stay on the subject has to be kept, because what is
+        on screen is a crop that moves whenever the view is magnified or
+        panned.
+        """
+        left, top, width, height = self.crop_normalised
+        return (left + nx * width, top + ny * height)
+
+    def area_normalised(
+        self, area: "tuple[float, float, float, float]"
+    ) -> "tuple[float, float, float, float] | None":
+        """A rectangle of the whole frame as fractions of the displayed picture.
+
+        The counterpart of :meth:`to_frame_fraction`, and the same relation
+        :attr:`af_box_normalised` has to the focus box: something kept in
+        sensor coordinates, placed on whatever crop is currently on show.
+        Clipped to that crop, and ``None`` when it lies outside it altogether
+        -- which is the ordinary case for an area drawn at full frame once the
+        view has been magnified somewhere else.
+        """
+        left, top, width, height = self.crop_normalised
+        if width <= 0.0 or height <= 0.0:
+            return None
+        x, y, w, h = area
+        nx = (x - left) / width
+        ny = (y - top) / height
+        nw, nh = w / width, h / height
+        # Clip to the picture, keeping whatever part of it is on screen.
+        right = min(nx + nw, 1.0)
+        bottom = min(ny + nh, 1.0)
+        nx, ny = max(nx, 0.0), max(ny, 0.0)
+        if right <= nx or bottom <= ny:
+            return None
+        return (nx, ny, right - nx, bottom - ny)
+
     @classmethod
     def parse(cls, data: bytes) -> "LiveViewFrame":
         start = data.find(b"\xff\xd8\xff")

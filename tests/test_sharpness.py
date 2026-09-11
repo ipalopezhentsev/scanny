@@ -420,6 +420,123 @@ def test_the_meter_reads_the_area_it_was_given():
     assert detailed > plain
 
 
+# -- the area is a place on the sensor, not a place on the screen -------------
+
+
+def _magnified(*, centre, times=4) -> LiveViewFrame:
+    """A view of one part of the frame, the way the camera sends one."""
+    return LiveViewFrame(
+        jpeg=b"", width=W, height=H,
+        image_width=6016, image_height=4016,
+        crop_width=6016 // times, crop_height=4016 // times,
+        crop_center_x=int(centre[0] * 6016), crop_center_y=int(centre[1] * 4016),
+        af_width=324, af_height=270, af_x=3008, af_y=2008,
+    )
+
+
+def test_the_area_stays_on_the_subject_when_the_view_magnifies():
+    """The whole reason it is kept in the frame's coordinates.
+
+    Half of the frame, drawn unmagnified. Magnify four times onto the middle
+    of that half and the same rectangle covers the whole picture -- because
+    the picture *is* inside it now. Screen fractions would have gone on
+    reading the left half of whatever the camera happened to be showing,
+    which after a magnification is a different piece of the world.
+    """
+    area = (0.0, 0.0, 0.5, 1.0)
+    whole = _frame()
+    assert whole.area_normalised(area) == pytest.approx((0.0, 0.0, 0.5, 1.0))
+    closer = _magnified(centre=(0.25, 0.5))
+    assert closer.area_normalised(area) == pytest.approx((0.0, 0.0, 1.0, 1.0))
+
+
+def test_an_area_the_view_has_magnified_away_from_reads_nothing():
+    """Not the whole picture instead: that is a different question, answered
+    with a number that looks exactly like the ones being compared."""
+    meter = SharpnessMeter(enabled=True)
+    meter.set_area((0.0, 0.0, 0.2, 0.2))
+    elsewhere = _magnified(centre=(0.8, 0.8))
+    assert meter.shown_in(elsewhere) is None
+    value, _ = meter.measure(elsewhere, _image(_subject()))
+    assert value == 0.0
+
+
+def test_an_area_half_off_the_picture_is_read_from_the_half_that_is_on_it():
+    area = (0.2, 0.2, 0.4, 0.4)
+    closer = _magnified(centre=(0.5, 0.5))  # the middle half of the frame
+    shown = closer.area_normalised(area)
+    assert shown is not None
+    x, y, w, h = shown
+    assert (x, y) == pytest.approx((0.0, 0.0)), "its top left is off the picture"
+    assert 0.0 < w <= 1.0 and 0.0 < h <= 1.0
+
+
+#: A scene big enough to be cropped out of, which is what the sensor is. One
+#: sharp patch in an otherwise soft field, at a known place on it.
+_SCENE = (512, 384)
+_PATCH = (200, 150, 60, 50)  # x, y, w, h in scene pixels
+
+
+def _scene() -> np.ndarray:
+    width, height = _SCENE
+    yy, xx = np.mgrid[0:height, 0:width]
+    detail = (40 + 120 * ((xx // 4 + yy // 4) % 2)).astype(np.float64)
+    pixels = _blurred(detail, 8)
+    x, y, w, h = _PATCH
+    pixels[y : y + h, x : x + w] = detail[y : y + h, x : x + w]
+    return pixels
+
+
+def _sent(crop: LiveViewFrame, pixels: np.ndarray) -> QImage:
+    """What the camera would send for *crop*: that part of the scene, uncut.
+
+    Sliced rather than scaled, so the detail in it is the same detail at every
+    magnification -- which is what lets two readings taken through different
+    crops be compared at all.
+    """
+    left, top, width, height = crop.crop_normalised
+    height_px, width_px = pixels.shape
+    cut = pixels[
+        int(top * height_px) : int((top + height) * height_px),
+        int(left * width_px) : int((left + width) * width_px),
+    ]
+    grey = np.clip(cut, 0, 255).astype(np.uint8)
+    buffer = np.zeros((*grey.shape, 4), np.uint8)
+    for channel in range(3):
+        buffer[:, :, channel] = grey
+    buffer[:, :, 3] = 255
+    return QImage(
+        buffer.tobytes(), grey.shape[1], grey.shape[0],
+        grey.shape[1] * 4, QImage.Format.Format_RGB32,
+    ).copy()
+
+
+def test_the_same_subject_is_read_however_the_view_is_panned():
+    """A rectangle round one thing goes on reading that thing while the camera
+    pans underneath it, which is what makes a reading taken before a pan
+    comparable with one taken after it.
+
+    Two crops, both holding the sharp patch and each putting it somewhere else
+    on screen. One area, in the frame's coordinates, and one answer.
+    """
+    scene = _scene()
+    x, y, w, h = _PATCH
+    area = (x / _SCENE[0], y / _SCENE[1], w / _SCENE[0], h / _SCENE[1])
+    meter = SharpnessMeter(enabled=True)
+    meter.set_area(area)
+
+    readings = []
+    for centre in ((0.5, 0.5), (0.55, 0.45)):
+        crop = _magnified(centre=centre, times=2)
+        value, _ = meter.measure(crop, _sent(crop, scene))
+        readings.append(value)
+
+    assert readings[0] == pytest.approx(readings[1], rel=0.1)
+    # And it is the patch being read, not the soft field around it.
+    whole = _magnified(centre=(0.5, 0.5), times=2)
+    assert readings[0] > 5 * measure(_sent(whole, scene))
+
+
 def test_going_back_to_the_whole_frame(worker):
     worker.set_sharpness(True)
     worker.set_sharpness_area((0.0, 0.0, 0.5, 1.0))
