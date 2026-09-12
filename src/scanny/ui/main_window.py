@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from ..camera.nikon import NikonCamera, Setting
 from .activity import ActivityLog, ActivityWindow
+from .aperture import DEFAULT_STOPS, MOST_STOPS, STOP_NAMES
 from .histogram import HistogramWidget
 from .integration import DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES, source_fps
 from .liveview import LiveViewWidget
@@ -266,8 +267,10 @@ class MainWindow(QMainWindow):
     #: aiming for one of scanny.ui.regions.OBJECTIVES, turning a walk back
     #: once it has fallen below this percentage of its best, measuring depths
     #: or not, striding through soft focus in this many increments (one for
-    #: not hurrying) -- and the settings only the panel knows, for the log.
-    requestCalibration = Signal(int, str, int, bool, int, object)
+    #: not hurrying), then looking for the best aperture in steps of one of
+    #: scanny.ui.aperture.STOP_SIZES ("" for not looking for one) -- and the
+    #: settings only the panel knows, for the log.
+    requestCalibration = Signal(int, str, int, bool, int, str, object)
     requestCalibrationCancel = Signal()
     #: Naming for downloaded pictures: on, the prefix, and the next number.
     #: Sent whole on every change, since an override may touch any of them.
@@ -1296,6 +1299,64 @@ class MainWindow(QMainWindow):
         hurry.addWidget(self.regions_hurry, 1)
         column.addLayout(hurry)
 
+        # The other half of the compromise, and off out of the box because it
+        # changes the exposure: one focus position serves the regions only as
+        # far as the depth of field reaches, and how far that is, is the
+        # aperture's to say. See scanny.ui.aperture.
+        self.regions_apertures = QCheckBox("Also find the best aperture")
+        self.regions_apertures.setToolTip(
+            "Once the focus is settled, try the apertures either side of the "
+            "one it ran at and keep the best of them.\n\n"
+            "Stopping down deepens the focus, so the regions the compromise "
+            "left softest come good; and it blurs everything by diffraction, "
+            "so the regions it served best give sharpness up. Which of those "
+            "wins depends on how far apart in focus your regions are, and the "
+            "only honest way to know is to look -- every region is read at "
+            "each aperture, against the best it managed at the aperture the "
+            "calibration ran at, and the aperture with the best combined "
+            "reading is the one the camera is left on.\n\n"
+            "The shutter is moved to match, stop for stop, so that what "
+            "differs between two apertures is the opening and not the light. "
+            "A body metering for itself -- aperture priority -- is left to do "
+            "that itself. A body that will not have its aperture set from "
+            "here says so and the rest of the calibration stands.\n\n"
+            f"It goes at most {MOST_STOPS:.0f} stops either way, and stops as "
+            "soon as a step reads no better. Each aperture costs a probe: a "
+            "pan to every region and a stack of frames at each, the same as a "
+            "probe of the compromise."
+        )
+        self.regions_apertures.setChecked(
+            bool(QSettings().value("regions/apertures", False, bool))
+        )
+        self.regions_apertures.toggled.connect(self._on_apertures_toggled)
+        column.addWidget(self.regions_apertures)
+
+        stops = QHBoxLayout()
+        stops.setContentsMargins(0, 0, 0, 0)
+        stops.addWidget(QLabel("Aperture steps of"))
+        self.regions_aperture_stops = QComboBox()
+        for key, name in STOP_NAMES.items():
+            self.regions_aperture_stops.addItem(name, key)
+        self.regions_aperture_stops.setToolTip(
+            "How big a step to take between apertures.\n\n"
+            "Whole stops to start from: the answer is broad, so a third of a "
+            "stop either side of the best reads within a per cent of it, and "
+            "every finer step is another probe spent. Halves and thirds are "
+            "there for a lens that shows a real difference between "
+            "neighbouring settings -- and the body only offers what it "
+            "offers, so a step finer than its own spacing lands on the "
+            "nearest aperture it has."
+        )
+        kept = str(QSettings().value("regions/aperture_stops", DEFAULT_STOPS))
+        self.regions_aperture_stops.setCurrentIndex(
+            max(0, self.regions_aperture_stops.findData(kept))
+        )
+        self.regions_aperture_stops.currentIndexChanged.connect(
+            self._on_aperture_stops_changed
+        )
+        stops.addWidget(self.regions_aperture_stops, 1)
+        column.addLayout(stops)
+
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
         self.calibrate_button = QPushButton("Calibrate")
@@ -1463,6 +1524,10 @@ class MainWindow(QMainWindow):
         self.regions_turn_back.setEnabled(not self._calibrating)
         self.regions_depths.setEnabled(not self._calibrating)
         self.regions_hurry.setEnabled(not self._calibrating)
+        self.regions_apertures.setEnabled(not self._calibrating)
+        self.regions_aperture_stops.setEnabled(
+            self.regions_apertures.isChecked() and not self._calibrating
+        )
         self.report_button.setEnabled(report is not None)
 
     def _draw_regions(self) -> int:
@@ -1510,8 +1575,25 @@ class MainWindow(QMainWindow):
             self.regions_turn_back.value(),
             self.regions_depths.isChecked(),
             self.regions_hurry.value(),
+            self._aperture_stops(),
             self._panel_settings(),
         )
+
+    def _aperture_stops(self) -> str:
+        """Which steps to walk the aperture in, or "" for not looking for one."""
+        if not self.regions_apertures.isChecked():
+            return ""
+        return str(self.regions_aperture_stops.currentData() or DEFAULT_STOPS)
+
+    def _on_apertures_toggled(self, on: bool) -> None:
+        QSettings().setValue("regions/apertures", on)
+        self.regions_aperture_stops.setEnabled(on and not self._calibrating)
+
+    def _on_aperture_stops_changed(self) -> None:
+        QSettings().setValue(
+            "regions/aperture_stops", self.regions_aperture_stops.currentData()
+        )
+        self.view.setFocus()
 
     def _panel_settings(self) -> "list[tuple[str, str, str]]":
         """The settings only the panel knows, as (group, name, value).

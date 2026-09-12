@@ -30,7 +30,14 @@ from pathlib import Path
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage
 
-from .regions import CalibrationReport, Look, Reading, Region, RegionResult
+from .regions import (
+    ApertureProbe,
+    CalibrationReport,
+    Look,
+    Reading,
+    Region,
+    RegionResult,
+)
 
 __all__ = [
     "REPORT_FILTER",
@@ -47,8 +54,11 @@ REPORT_FILTER = f"Focus report (*{SUFFIX})"
 
 #: What says a file is one of these, and which way of writing it. A file of a
 #: later version than this program knows is refused rather than half read.
+#:
+#: Version 2 added the search for the best aperture. A version 1 file reads
+#: back as a report that had none, which is what it was.
 _FORMAT = "scanny focus report"
-_VERSION = 1
+_VERSION = 2
 
 _NUMBERS = "report.json"
 _LOG = "activity.log"
@@ -111,6 +121,23 @@ def save_report(path: "str | Path", report: CalibrationReport, aspect: float) ->
             "history_regions": list(report.history_regions),
             "depths_measured": report.depths_measured,
             "focus_depth": report.focus_depth,
+            "apertures": [
+                {
+                    "aperture": one.aperture,
+                    "label": one.label,
+                    "stops": one.stops,
+                    "shutter": one.shutter,
+                    "shutter_label": one.shutter_label,
+                    "residual": one.residual,
+                    "shares": list(one.shares),
+                    "score": one.score,
+                }
+                for one in report.apertures
+            ],
+            "aperture_started": report.aperture_started,
+            "aperture_chosen": report.aperture_chosen,
+            "aperture_outcome": report.aperture_outcome,
+            "aperture_note": report.aperture_note,
             "began": report.began,
             "results": [
                 {
@@ -120,6 +147,9 @@ def save_report(path: "str | Path", report: CalibrationReport, aspect: float) ->
                     "best": picture(one.best, f"region-{one.number}-best"),
                     "compromise": picture(
                         one.compromise, f"region-{one.number}-compromise"
+                    ),
+                    "before_aperture": picture(
+                        one.before_aperture, f"region-{one.number}-before-aperture"
                     ),
                     "depth": one.depth,
                     # JSON has no infinity: an unknown doubt is written as none.
@@ -219,6 +249,7 @@ def _report_from(
             edge=bool(one["edge"]),
             # Not in reports saved before it was kept.
             tuned=None if one.get("tuned") is None else float(one["tuned"]),
+            before_aperture=look(one.get("before_aperture")),
         )
         for one in saved["results"]
     )
@@ -262,6 +293,25 @@ def _report_from(
             if saved.get("focus_depth") is None
             else float(saved["focus_depth"])
         ),
+        # None of these are in a file written before there was an aperture
+        # search, and a report that had none is exactly what they then mean.
+        apertures=tuple(
+            ApertureProbe(
+                aperture=int(one["aperture"]),
+                label=str(one.get("label", "")),
+                stops=float(one.get("stops", 0.0)),
+                shutter=int(one.get("shutter", 0)),
+                shutter_label=str(one.get("shutter_label", "")),
+                residual=float(one.get("residual", 0.0)),
+                shares=tuple(float(share) for share in one.get("shares", ())),
+                score=float(one.get("score", 0.0)),
+            )
+            for one in saved.get("apertures", ())
+        ),
+        aperture_started=int(saved.get("aperture_started", 0) or 0),
+        aperture_chosen=int(saved.get("aperture_chosen", 0) or 0),
+        aperture_outcome=str(saved.get("aperture_outcome", "") or ""),
+        aperture_note=str(saved.get("aperture_note", "") or ""),
         began=float(saved.get("began", 0.0)),
         log=tuple(log),
         readings=readings,

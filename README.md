@@ -98,6 +98,7 @@ trusting that number anywhere:
 | `ui/hunt.py` | Autofocus, then bettering it a single step at a time, without counting steps |
 | `ui/homing.py` | Back to the top of a stretch walked one way, measuring the gearing's play on the way |
 | `ui/regions.py` | Each region's best, then the one focus that does best by all of them |
+| `ui/aperture.py` | The aperture that serves the regions best: depth of field against diffraction, tried rather than modelled |
 | `ui/report.py` | That compromise laid out: every region at its best and at the compromise |
 | `ui/reportfile.py` | A report saved whole as one file, and opened again |
 | `ui/film.py` | The film's shape from the regions' depths -- edges' plane and bulge -- drawn in 3D over the sensor |
@@ -979,6 +980,42 @@ mean the next reading would be of a different picture from the last one, and
 comparing across that is exactly the mistake the whole thing is made of. The
 button says **Stop** while it is running.
 
+### A region that reads nothing, and which kind of nothing it is
+
+Zero is not a small reading; it is `measure` refusing to tell the picture from
+its own grain. A walk looks for a hill anyway -- zero is what anything far
+enough out of focus reads -- but only as far as **its reach, out and back
+across**, and then it says there is nothing there. Going further finds more of
+the same, and it is not free: a picture that cannot change also never settles,
+so every probe of one used to wait out the full settling limit. Measured on a
+real five-region calibration, one region ran to the probe cap at 253 probes at
+two seconds each -- nine minutes proving what its first fifty had already
+said, with four regions queued behind it. Bounded to its reach, and released
+from waiting for a change that cannot come, the same region costs about
+twenty-five seconds.
+
+**And then it says which kind of nothing it was**, because two very different
+regions read zero and they want opposite things done about them. A rectangle
+over blank film has nothing in it. A rectangle over a building's edge with a
+graffiti inscription on it has plenty in it -- and read zero all the same, on
+a real calibration, while a person could read the lettering on screen. What
+tells them apart is what a picture of nothing but grain would itself read.
+
+Two things put that region under the line, and they have different answers:
+
+| | reading |
+| --- | --- |
+| the whole rectangle, one frame | **nothing**: energy 7.0 against a grain floor of 6.5 |
+| the whole rectangle, 16 stacked frames | 1.47 -- the grain floor falls to 0.41 |
+| a tile drawn round the lettering, one frame | 2.87 -- **2.8x** the energy of the whole rectangle |
+
+**The grain**, which integrating frames divides by however many are stacked --
+that run had integration switched off twenty-two seconds before it started,
+and every other region had enough contrast not to care. **And the averaging**:
+the reading is the mean over the whole rectangle, so a rectangle that is
+mostly flat brick with the detail in one corner averages that detail away. So
+the log says both, rather than "nothing in it to focus on".
+
 ## One focus for several places: focus regions
 
 Fine tuning answers where one rectangle is sharpest. A frame of film is not one
@@ -1342,6 +1379,80 @@ than a stride can be stepped over without the search seeing it, and a depth
 read off a coarsely sampled curve is placed less finely, which the doubt
 printed beside it says. So it is for calibrating frames on a slow rig, and a
 levelling run is better off without it.
+
+### The aperture is the other half of the compromise
+
+One focus position serves the regions only as far as the depth of field
+reaches, and how far that is, is the aperture's to say. **Also find the best
+aperture**, off out of the box, spends the probes to find out which one.
+
+The trade is real in both directions, which is why there is a best aperture
+rather than a smallest one:
+
+- **Stopping down deepens the focus.** Every region off the compromise plane
+  is off it by however many drive steps the film's tilt and bow put it there,
+  and a smaller opening turns less of that distance into blur. The regions
+  that gave up the most are the ones this helps.
+- **Stopping down blurs everything.** Diffraction is the same everywhere in
+  the frame, so what it costs, it costs the regions that were already sharp.
+
+Which one wins depends on how far apart in focus the regions are, and that is
+a property of the film in the carrier rather than of the lens -- so it is
+measured instead of modelled. Once the focus is settled the regions' bests are
+**frozen**: the whole question is whether another aperture reads higher than
+anything this one could give, and a yardstick that grows with what it measures
+answers nothing. So a region can read over 100% here, and that is the shape of
+the answer -- a defocused region coming good as the depth grows -- just as a
+region reading under its best at f/22 is diffraction, plainly visible as a
+number. Focus is not moved: stopping down deepens the focus about the plane
+the compromise chose rather than shifting it.
+
+**The shutter is moved with the aperture, stop for stop**, so that what
+differs between two probes is the opening and not the light. What the body's
+shutter ladder could not match exactly is kept and printed, and a change it
+cannot cover at all is the end of that direction rather than something to make
+do with: readings divide by the square of the mean level, so a small
+brightness mismatch comes out in the wash and a large one does not. A body
+metering for itself -- aperture priority -- is left to do the compensating,
+and nothing is sent. A body that will not have its aperture set from here says
+so, and the rest of the calibration stands.
+
+The walk is a hill climb from the aperture the calibration ran at: a step down
+while that reads better, then the wide side if it does not, at most four stops
+either way, and then back to the aperture it chose to read the regions there --
+so the pictures in the report are of the aperture the camera is left on. On the
+simulated rig its tests run against -- three regions sixty drive steps apart on
+a lens whose depth of field is thirty -- that is six probes to go from f/5.6 to
+f/11, and from 44% of every region's best to 54%.
+
+Whether any of it is visible at all depends on the magnification, which is why
+this is only ever run on the regions' own magnified views: live view is a
+downscaled picture of the sensor, and diffraction at f/16 is finer than a
+live-view pixel at full frame.
+
+The report's **Aperture** page has every aperture it tried with what each
+region read at it, and then every region side by side twice over -- at the
+opening the calibration ran at, and at the one it was left on, both at the one
+focus position -- with what the change was worth to that region on its own.
+That last part is the whole argument made visible: the combined number can go
+up while one region gives sharpness away, and only looking says whether the
+trade was worth it for the region you care about.
+
+On a real frame, starting from f/18, which is where a scanning rig tends to
+sit:
+
+| aperture | region 1 | region 3 | region 4 | region 5 | combined |
+| --- | --- | --- | --- | --- | --- |
+| f/18, where it ran | 85% | 57% | 96% | 74% | 78% |
+| f/25 | 58% | 25% | 51% | 30% | 41% |
+| **f/13, chosen** | 88% | 64% | **127%** | **111%** | **98%** |
+| f/9 | 60% | 54% | 102% | 92% | 77% |
+
+Five probes, and f/18 turned out to be giving away a quarter of every region's
+sharpness to diffraction -- two regions read better at f/13 than anything f/18
+could give them, which is what a share over 100% means. Note that opening up
+helped even the region furthest off the focus plane: the depth f/18 was being
+paid for was depth this frame did not need.
 
 ### What stops it
 

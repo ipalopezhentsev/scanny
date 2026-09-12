@@ -4,7 +4,11 @@ A percentage says how much sharpness a region gave up for the compromise; it
 does not say whether what is left is good enough, and only looking can. So
 each region is shown twice, side by side at the same size: as it was at its
 own best, fine tuned on alone, and as it is at the one focus position chosen
-for all of them. Two more pages hold what the rest of the calibration found:
+for all of them. The aperture page shows each of them twice again, at the
+opening the calibration ran at and at the one chosen for it, which is the
+same argument about the same regions: a percentage does not say whether what
+diffraction took is worse than what depth of field gave back. Three more
+pages hold what the rest of the calibration found:
 the shape of the film the regions' depths make, drawn over the sensor, with
 what levelling it needs (:mod:`scanny.ui.film`); and every region's
 sharpness through the search, which is what makes the compromise it arrived
@@ -43,6 +47,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..camera.values import format_aperture
 from .film import FilmView, Mark
 from .orientation import Orientation
 from .regionchart import RegionChart
@@ -76,6 +81,9 @@ _WHICH_WAY = (
     "a few steps further with > and check that the edge said to be further "
     "is the one that sharpens."
 )
+
+#: What the number the searches climb is called, by which objective it is.
+_COMBINED = {"average": "Average", "worst": "Worst region"}
 
 #: What the fine tune on a region said about how it ended, in a few words.
 _TUNED = {
@@ -140,10 +148,14 @@ def _wrapped(
 
 
 class CalibrationReportDialog(QDialog):
-    """What a calibration found, on four pages.
+    """What a calibration found, on four pages, or five with an aperture.
 
     **Regions**: every region at its best and at the compromise, side by side,
-    with the numbers. **Film**: the shape the regions' depths make, in three
+    with the numbers. **Aperture**, when one was looked for: every aperture
+    tried and what each region read at it, and then every region side by side
+    again -- at the aperture the calibration ran at and at the one it was left
+    on -- which is the other half of the same compromise. **Film**: the shape
+    the regions' depths make, in three
     dimensions over the sensor, with the lean of its edges and how far it bows
     between them -- what levelling needs. **Search**: every region's sharpness
     through the search, one line each, which is what makes the compromise it
@@ -189,6 +201,12 @@ class CalibrationReportDialog(QDialog):
         self._scroller = QScrollArea()
         self._scroller.setWidgetResizable(True)
         self._tabs.addTab(self._scroller, "Regions")
+
+        # Only there when there was a search for one, since it is asked for
+        # rather than always done; see _fill_aperture.
+        self._aperture_page = QScrollArea()
+        self._aperture_page.setWidgetResizable(True)
+        self._aperture_page.setFrameShape(QScrollArea.Shape.NoFrame)
 
         self._film_page = QWidget()
         film = QVBoxLayout(self._film_page)
@@ -303,6 +321,7 @@ class CalibrationReportDialog(QDialog):
         self._cost.setText(cost)
         self._cost.setVisible(bool(cost))
         self._fill_regions()
+        self._fill_aperture()
         self._fill_film()
         self._chart.set_combined_name(report.objective)
         self._chart.set_history(report.history_regions, report.history)
@@ -341,6 +360,177 @@ class CalibrationReportDialog(QDialog):
         grid.setRowStretch(len(report.results) + 1, 1)
         self._content = content
         self._scroller.setWidget(content)
+
+    def _fill_aperture(self) -> None:
+        """Every aperture tried and what each region read at it, if any were.
+
+        The page comes and goes with the search: looking for an aperture is
+        asked for rather than always done, and a page saying "not asked for"
+        on every report would be a page nobody ever wants to open. A search
+        that was asked for and could not run leaves its reason instead, which
+        is worth a page because it is something to put right.
+        """
+        report = self._report
+        wanted = bool(report.apertures) or bool(report.aperture_note)
+        at = self._tabs.indexOf(self._aperture_page)
+        if not wanted:
+            if at >= 0:
+                self._tabs.removeTab(at)
+            return
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.addWidget(
+            _wrapped(
+                report.describe_aperture(),
+                _WHOLE,
+                "font-weight: 600;",
+                align=Qt.AlignmentFlag.AlignLeft,
+            )
+        )
+        if report.apertures:
+            column.addWidget(self._aperture_table())
+        regions = self._aperture_regions()
+        if regions is not None:
+            column.addWidget(
+                _wrapped(
+                    "What the change of aperture did to each region, at the one "
+                    "focus position both were read at:",
+                    _WHOLE,
+                    "font-weight: 600;",
+                    align=Qt.AlignmentFlag.AlignLeft,
+                )
+            )
+            column.addWidget(regions)
+        column.addWidget(
+            _wrapped(
+                "Each region read at every aperture, as a share of the best it "
+                "managed at the aperture the calibration ran at -- so over "
+                "100% is a region the depth of field has brought further into "
+                "focus than that aperture ever could, and under it, at the "
+                "small end, is diffraction taking back what depth gave. The "
+                "shutter was moved with the aperture, stop for stop, so that "
+                "what differs between two rows is the opening and not the "
+                "light. Focus did not move: stopping down deepens the focus "
+                "about the plane the compromise chose rather than shifting it.",
+                _WHOLE,
+                "color: #888; font-size: 11px;",
+                align=Qt.AlignmentFlag.AlignLeft,
+            )
+        )
+        column.addStretch(1)
+        self._aperture_page.setWidget(page)
+        if at < 0:
+            # Next to the regions: it is the other half of the same answer.
+            self._tabs.insertTab(1, self._aperture_page, "Aperture")
+
+    def _aperture_regions(self) -> "QWidget | None":
+        """Every region at the aperture it started at and the one it ended on.
+
+        The same side-by-side the Regions page uses, and for the same reason:
+        a percentage says how much sharpness the change of aperture bought or
+        cost a region, and only looking says whether that is the picture
+        somebody wants. Both columns are the same region at the same focus
+        position, so the only thing that differs between them is the opening.
+
+        None when there is nothing to show it for -- no search, or one that
+        was stopped before it read anything.
+        """
+        report = self._report
+        rows = [one for one in report.results if one.before_aperture is not None]
+        if not rows:
+            return None
+        # The body's own words for them, from the probes; failing that, the
+        # number itself, so a heading is never blank.
+        started = format_aperture(report.aperture_started)
+        chosen = format_aperture(report.aperture_chosen)
+        for probe in report.apertures:
+            if probe.aperture == report.aperture_started:
+                started = probe.label
+            if probe.aperture == report.aperture_chosen:
+                chosen = probe.label
+        table = QWidget()
+        grid = QGridLayout(table)
+        grid.setHorizontalSpacing(_SPACING)
+        grid.setVerticalSpacing(6)
+        for column, heading in enumerate(
+            ("", f"At {started}, where it ran", f"At {chosen}, where it was left")
+        ):
+            if heading:
+                grid.addWidget(
+                    _wrapped(heading, _SHOWN, "color: #888;"),
+                    0,
+                    column,
+                    Qt.AlignmentFlag.AlignHCenter,
+                )
+        for row, result in enumerate(rows, start=1):
+            grid.addWidget(
+                self._describe_aperture(result), row, 0, Qt.AlignmentFlag.AlignTop
+            )
+            grid.addWidget(
+                self._panel(result.before_aperture, "compromise", result.before_fraction),
+                row,
+                1,
+                Qt.AlignmentFlag.AlignTop,
+            )
+            grid.addWidget(
+                self._panel(result.compromise, "compromise", result.fraction),
+                row,
+                2,
+                Qt.AlignmentFlag.AlignTop,
+            )
+        return table
+
+    def _describe_aperture(self, result: RegionResult) -> QLabel:
+        """What the change of aperture was worth to one region, in a few words."""
+        lines = [f"<b>Region {result.number}</b>"]
+        gain = result.aperture_gain
+        if gain is None:
+            lines.append("not read at both apertures")
+        elif abs(gain) < 0.005:
+            lines.append("<b>no change</b> from the aperture it started at")
+        else:
+            lines.append(
+                f"<b>{gain:+.0%}</b> "
+                + ("sharper" if gain > 0 else "softer")
+                + " than at the aperture it started at"
+            )
+        before, after = result.before_fraction, result.fraction
+        if before is not None and after is not None:
+            lines.append(f"{before:.0%} of its own best, then {after:.0%}")
+        return _wrapped("<br>".join(lines), _NAMES, align=Qt.AlignmentFlag.AlignLeft)
+
+    def _aperture_table(self) -> QWidget:
+        """The apertures tried, one to a row, the chosen one in bold."""
+        report = self._report
+        table = QWidget()
+        grid = QGridLayout(table)
+        grid.setHorizontalSpacing(_SPACING)
+        grid.setVerticalSpacing(4)
+        numbers = report.history_regions
+        headings = ["Aperture", "Stops", "Shutter"]
+        headings += [f"Region {number}" for number in numbers]
+        headings += [_COMBINED.get(report.objective, "Combined")]
+        for column, heading in enumerate(headings):
+            label = QLabel(heading)
+            label.setStyleSheet("color: #888;")
+            grid.addWidget(label, 0, column)
+        for row, probe in enumerate(report.apertures, start=1):
+            chosen = probe.aperture == report.aperture_chosen
+            style = "font-weight: 600;" if chosen else ""
+            cells = [
+                probe.label + (" - chosen" if chosen else ""),
+                "as it was" if abs(probe.stops) < 0.01 else f"{probe.stops:+.2f}",
+                probe.shutter_label or "metered",
+            ]
+            cells += [f"{share:.0%}" for share in probe.shares]
+            cells += [f"{probe.score:.1%}"]
+            for column, text in enumerate(cells):
+                cell = QLabel(text)
+                if style:
+                    cell.setStyleSheet(style)
+                grid.addWidget(cell, row, column)
+        grid.setColumnStretch(len(headings), 1)
+        return table
 
     def _show_film_notes(self, notes: QWidget) -> None:
         """Put *notes* under the drawing, as tall as they are and no taller.

@@ -915,9 +915,10 @@ def test_it_says_so_when_there_is_nothing_in_the_area_to_focus_on(
     look, not a reason to refuse. It walks its reach both ways first, and says
     there is nothing only once that has come back empty.
 
-    The reach is cut down here so the test does not have to sit through three
-    hundred probes of an empty wall; what is being checked is what the worker
-    does with the answer.
+    The reach is cut right down here so that what is being checked is what
+    the worker does with the answer rather than how long it takes to get one.
+    How long it takes is
+    test_an_empty_area_is_given_up_on_in_seconds_rather_than_minutes.
     """
     from scanny.ui import worker as wk
 
@@ -1082,3 +1083,110 @@ def test_the_first_frame_after_a_move_is_not_shown_on_its_own(worker):
         assert pictures == [], "an unaveraged frame went up after the move"
         worker._grab()
         assert len(pictures) == 1, "the completed stack did not go up"
+
+
+# -- a picture with nothing in it --------------------------------------------
+
+
+def _walked_blank(**kept) -> "tuple[FineTune, int]":
+    """A walk against a picture that reads nothing anywhere, and its probes."""
+    tune = FineTune(STEP, **kept)
+    probes = 0
+    while tune.step(0.0) is not None:
+        probes += 1
+        assert probes < 500, "it has to stop on its own"
+    return tune, probes
+
+
+def test_a_picture_of_nothing_is_given_up_on_once_the_reach_has_been_walked():
+    """It looks -- zero is what anything far enough out of focus reads -- but
+    only as far as its reach, out and back across. Past that every further
+    probe is two seconds spent proving the same thing, and on a five-region
+    calibration one blank region ran to the probe cap and took nine minutes."""
+    tune, probes = _walked_blank(patience=16, max_probes=300)
+    assert tune.outcome == "nothing"
+    # The first reach out, then back across to the far side of it: 48 probes
+    # at a reach of 16, against the 300 the cap allowed.
+    assert 30 < probes < 60, probes
+
+
+def test_looking_for_nothing_scales_with_the_reach_it_was_given():
+    """The bound is the reach walked both ways, not a probe count of its own,
+    so a search told to look further does look further."""
+    _short, few = _walked_blank(patience=4, max_probes=300)
+    _long, many = _walked_blank(patience=16, max_probes=300)
+    assert many > 3 * few
+
+
+def test_one_reading_above_the_grain_is_enough_to_go_on_looking():
+    """The give-up is for a picture that reads *nothing*, not for a faint one.
+    A single reading above the grain means there is a hill somewhere, and then
+    the growing reach is what finds it -- so the ordinary bounds take over."""
+    tune = FineTune(STEP, patience=4, max_probes=60)
+    probes = 0
+    while True:
+        # Nothing anywhere except one probe early on, which is all it takes.
+        move = tune.step(3.0 if probes == 2 else 0.0)
+        probes += 1
+        if move is None:
+            break
+        assert probes < 200
+    assert tune.outcome != "nothing"
+    assert probes > 40, "one real reading has to keep it looking"
+
+
+def test_an_empty_area_is_given_up_on_in_seconds_rather_than_minutes(worker):
+    """The whole of it through the worker, with nothing monkeypatched.
+
+    Both halves of what made an empty region cost minutes are checked here:
+    how many probes it spends, and how many frames each probe waits. A picture
+    that reads nothing can never be seen to change, so the settling used to
+    run to its limit on every one of them.
+    """
+    lens = _Lens(start=90)
+    lens.blank = True
+    _ready(worker, lens, frames=0)
+    worker.fine_tune(STEP)
+    grabs = 0
+    for _ in range(4000):
+        if worker._hunt is None:
+            break
+        worker._grab()
+        grabs += 1
+    assert worker._hunt is None, "the search has to finish on its own"
+    assert lens.drives, "it never went to look"
+    assert len(lens.drives) < 60, f"{len(lens.drives)} probes on an empty wall"
+    # Frames per probe: the settling floor is six, and the limit it used to
+    # wait out every time is thirty.
+    per_probe = grabs / len(lens.drives)
+    assert per_probe < 15, f"{per_probe:.0f} frames waited for each probe"
+
+
+def test_a_region_the_grain_is_hiding_is_told_apart_from_an_empty_one(worker):
+    """Two regions read zero for opposite reasons, and want opposite fixes.
+
+    A dark patch of printing whose detail is finer than one frame's grain
+    looks exactly like blank film from the outside -- it reads zero at every
+    focus position either way -- and on a real calibration one was reported as
+    having nothing in it while a person could read the printing on screen. The
+    difference is what a picture of nothing but grain would itself read.
+    """
+    lens = _Lens(start=90)
+    lens.blank = True
+    _ready(worker, lens, frames=0)
+    said = []
+    worker.log.connect(said.append)
+    worker._grain_scale = 1.4  # what this picture's grain alone accounts for
+    line = worker._why_nothing(1)
+    assert "under the grain" in line
+    assert "integration is off" in line, line
+    # A rectangle mostly covering ground with nothing on it averages away the
+    # detail that is there, whatever the grain does.
+    assert "tighter rectangle" in line
+    # Stacked frames divide that grain, so that half of the advice changes.
+    worker.set_integration(True, 16)
+    assert "16 stacked frames" in worker._why_nothing(1)
+    assert "more light" in worker._why_nothing(1)
+    # And with no grain measured at all there is nothing to blame it on.
+    worker._grain_scale = 0.0
+    assert "nothing in it" in worker._why_nothing(1)

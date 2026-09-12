@@ -138,6 +138,26 @@ _CLEARLY_WORSE = 5.0
 _PATIENCE_PROBES = 16
 _PATIENCE_TRAVEL = 400
 
+#: How many times a walk that has **never read anything at all** may turn
+#: round before it says there is nothing there.
+#:
+#: Two, which is its reach walked out and then back across to the far side of
+#: where it started: the whole of the first reach, both ways, which is exactly
+#: the looking a reading of nothing earns and no more. Going further only
+#: finds more of the same, and it is not free -- a picture that cannot change
+#: also never settles, so every probe of it waits the full settling limit.
+#: Measured on a real calibration of five regions, one region of blank film
+#: ran to the probe cap: **253 probes at two seconds each, nine minutes**
+#: spent proving what its first fifty had already said, with four more regions
+#: waiting behind it.
+#:
+#: It applies only to a walk that has read *nothing* -- not a small reading,
+#: zero, which is :func:`scanny.ui.sharpness.measure` refusing to tell the
+#: picture from its own grain. One reading above the grain anywhere and the
+#: ordinary bounds take over, because then there is a hill to climb and the
+#: growing reach is what finds it.
+_NOTHING_TURNS = 2
+
 #: How many times the walk may turn round while it is still exploring, and
 #: again while it is on its way back.
 #:
@@ -589,6 +609,17 @@ class FineTune:
         else:
             self._turns += 1
         self._best_at_last_turn = self._best
+        if (
+            not self._going_back
+            and self._best <= 0.0
+            and self._turns >= _NOTHING_TURNS
+        ):
+            # The reach has been walked out and back across, and nothing
+            # anywhere in it read above the grain. There is no hill here to
+            # go further for; see _NOTHING_TURNS. It stops where it stands
+            # rather than going home, because with no reading anywhere there
+            # is no home to go to.
+            return self._stop_here(reading, "nothing")
         self._reverse()
         self._fresh_leg(reading)
         return self._drive()

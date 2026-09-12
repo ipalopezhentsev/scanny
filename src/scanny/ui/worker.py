@@ -23,6 +23,8 @@ from PySide6.QtGui import QImage
 from ..camera.nikon import CameraError, LiveViewFrame, NikonCamera
 from ..wpd.device import MtpError, WpdCommandError
 from .activity import stamped
+from .aperture import STOP_NAMES, Ladder
+from .aperture import Next as ApertureNext
 from .hunt import FineTune
 from .integration import FrameIntegrator
 from .naming import NameSequence, unique
@@ -198,6 +200,12 @@ _MEASURED_MAGNIFICATION = {
 #: second.
 _AIM_FRESH = 4
 
+#: How many redrawn frames to let go after the aperture is changed, before the
+#: picture is watched for stillness. More than a pan needs: the lens stops
+#: itself down mechanically, and the body then puts live view's own gain back
+#: over several frames, so the first of them are of neither aperture.
+_APERTURE_FRESH = 8
+
 #: How long to wait for a region's view to come back and fill a stack before
 #: giving up on it: a fixed allowance for the body to answer, and so much a
 #: frame on top. Generous, because the body draws sixteen a second magnified
@@ -301,6 +309,7 @@ class CameraWorker(QObject):
         self._settle_before: "float | None" = None
         self._settle_changed = False
         self._settle_moving = False
+        self._settle_blank = True
         # The rectangles someone drew to be kept in focus together, and the
         # calibration finding the one focus position that serves them all.
         self._regions: "list[Region]" = []
@@ -311,6 +320,10 @@ class CameraWorker(QObject):
         # The zoom level and focus point to put back when a calibration ends,
         # since it pans and magnifies the view all over the frame.
         self._view_restore: "tuple[int, int, int] | None" = None
+        # The aperture and shutter to put back if the search for the best
+        # aperture does not run to the end. None once it has chosen one, since
+        # standing on what it chose is the point of it.
+        self._aperture_restore: "tuple[int, int] | None" = None
         # Everything said while a calibration runs -- status, failures and
         # the log -- as the activity log shows it, to go into its report.
         self._calibration_said: "list[str] | None" = None
@@ -570,10 +583,16 @@ class CameraWorker(QObject):
         camera = self._camera
         if camera is None or not camera.live_view_active:
             return
-        if self._calibration is not None and self._calibration.phase == "compromise":
-            # That part of a calibration reads its own frames, one region's
-            # view at a time; see _advance_compromise.
-            self._advance_compromise(camera)
+        if self._calibration is not None and self._calibration.phase in (
+            "compromise",
+            "apertures",
+        ):
+            # Those parts of a calibration read their own frames, one region's
+            # view at a time; see _advance_compromise and _advance_apertures.
+            if self._calibration.phase == "apertures":
+                self._advance_apertures(camera)
+            else:
+                self._advance_compromise(camera)
             return
         try:
             frame = camera.live_view_frame()
@@ -1469,6 +1488,9 @@ class CameraWorker(QObject):
         self._settle_before = before
         self._settle_changed = False
         self._settle_moving = False
+        # Until a frame of this settle reads above its own grain; see
+        # _watch_for_stillness for what a picture of nothing can be waited for.
+        self._settle_blank = True
 
     def _advance_hunt(
         self,
@@ -1595,6 +1617,8 @@ class CameraWorker(QObject):
         """
         self._settle_seen += 1
         previous, self._settle_last = self._settle_last, self._frame_reading(frame)
+        if self._settle_last:
+            self._settle_blank = False
 
         # Two frames in a row showing the move, not one: a single frame can
         # read a quarter high on grain alone, and a pipeline measured short is
@@ -1619,10 +1643,21 @@ class CameraWorker(QObject):
         # With nothing to compare against there is no move to wait for: that
         # is the settle at the start of a hunt, where the lens has not been
         # sent anywhere and only stillness is wanted.
+        #
+        # Nor is there one when the picture reads *nothing* -- not a small
+        # reading, zero, which is the measure refusing to tell the picture
+        # from its own grain. A move cannot show up in a reading that has
+        # nowhere to move to, so waiting for one is waiting for something that
+        # cannot happen, and every probe of an empty region ran to the
+        # settling limit for it: two seconds a probe, against half a second
+        # anywhere there is something to read. The frame floor still has to be
+        # cleared, so this never lets a settle end early -- it only stops one
+        # being extended for evidence that will never come.
         arrived = (
             self._settle_changed
             or self._pipeline_lag is not None
             or self._settle_before is None
+            or self._settle_blank
         )
         settled = (
             self._settle_seen >= floor
@@ -1816,7 +1851,7 @@ class CameraWorker(QObject):
         )
         self.calibrationReady.emit(None)
 
-    @Slot(int, str, int, bool, int, object)
+    @Slot(int, str, int, bool, int, str, object)
     def start_calibration(
         self,
         step: int,
@@ -1824,6 +1859,7 @@ class CameraWorker(QObject):
         turn_back: int = 80,
         depths: bool = False,
         hurry: int = 1,
+        apertures: str = "",
         panel: object = None,
     ) -> None:
         """Find each region's best, then the one focus that does best by all.
@@ -1839,9 +1875,12 @@ class CameraWorker(QObject):
         step is worth while the average sharpness is under
         :data:`scanny.ui.regions.HURRY_BELOW` -- one for no hurrying at all,
         which is what it does unless asked; see
-        :meth:`scanny.ui.regions._Search._hurrying`. See
-        :mod:`scanny.ui.regions` for the two phases, and why the second one
-        walks rather than drives.
+        :meth:`scanny.ui.regions._Search._hurrying`. With *apertures* -- one of
+        :data:`scanny.ui.aperture.STOP_SIZES` -- the best aperture is looked
+        for once there is a compromise, walking the ladder in steps of that
+        size and putting the exposure back with the shutter; see
+        :mod:`scanny.ui.aperture`. See :mod:`scanny.ui.regions` for the phases,
+        and why the compromise walks rather than drives.
 
         *panel* is the settings only the window knows, as ``(group, name,
         value)``, for the log; see :meth:`_log_settings`.
@@ -1873,6 +1912,7 @@ class CameraWorker(QObject):
             turn_back=turn_back / 100.0,
             depths=depths,
             hurry=hurry,
+            apertures=apertures,
         )
         self._view_restore = (self._zoom_level, frame.af_x, frame.af_y)
         # Regions are kept by number, and these are not the last calibration's.
@@ -1894,6 +1934,12 @@ class CameraWorker(QObject):
             + (
                 f", hurrying in strides of {self._calibration.hurry} increments"
                 if self._calibration.hurries
+                else ""
+            )
+            + (
+                f", then the best aperture in "
+                f"{STOP_NAMES.get(apertures, apertures).lower()}"
+                if self._calibration.seeks_aperture
                 else ""
             )
         )
@@ -1943,6 +1989,13 @@ class CameraWorker(QObject):
                 f"strides of {run.hurry} increments below {HURRY_BELOW:.0%}"
                 if run.hurries
                 else "off",
+            )
+            put(
+                "Calibration",
+                "find the best aperture",
+                f"yes, in steps of {run.aperture_stops:.2f} EV"
+                if run.seeks_aperture
+                else "no",
             )
 
         put("Camera", "model", _ask(lambda: camera.model))
@@ -2109,6 +2162,8 @@ class CameraWorker(QObject):
                 else ""
             )
         )
+        if hunt.outcome == "nothing":
+            self._log(self._why_nothing(run.index))
         if run.region_tuned(look, hunt.outcome, view, hunt.probes):
             self._tune_region()
             return
@@ -2124,6 +2179,58 @@ class CameraWorker(QObject):
         self.status.emit(
             "Calibrating: every region has its best, now walking to the one "
             "focus position that does best by all of them..."
+        )
+
+    def _why_nothing(self, index: int) -> str:
+        """Why a region read nothing, put as the thing that would fix it.
+
+        "Nothing in it to focus on" is what a region drawn over blank film
+        deserves, and it is what a region full of detail gets as well when the
+        grain of a single frame is enough to hide that detail -- and those two
+        want opposite things done about them. Telling them apart is worth a
+        line, because from the outside they are identical: a rectangle round a
+        building's edge and a graffiti inscription, plainly legible on screen,
+        reading zero at every focus position there is.
+
+        What tells them apart is the grain. A picture of nothing but grain
+        reads a number of its own
+        (:func:`scanny.ui.sharpness.grain_reading`), and a region whose detail
+        sits under that has something in it the grain is hiding rather than
+        nothing in it at all.
+
+        Two things put it there, and the line says both because they have
+        different answers. **The grain**: on a real calibration that region
+        read a gradient energy of 7.0 against a single frame's grain of 6.5,
+        so nothing was left of it -- and off a stack of sixteen frames, where
+        the grain is a sixteenth of that, the same region reads 1.5 and tunes
+        like anything else. **And the averaging**: the reading is the mean over
+        the whole rectangle, so a rectangle that is mostly flat brick with the
+        detail in one corner of it averages that detail away. The same region
+        read 2.8 times higher over a tile drawn round its lettering, which is
+        enough to read on a single frame.
+        """
+        scale = self._grain_scale
+        number = index + 1
+        if scale <= 0.0:
+            return (
+                f"Region {number} read nothing at any focus position: there is "
+                f"nothing in it the reading can tell from the grain"
+            )
+        frames = self._integrator.frames if self._integrator.enabled else 1
+        grain = (
+            f"It is already read off {frames} stacked frames, so what is left "
+            f"is more light on it"
+            if frames > 1
+            else "Integrating frames divides that grain by however many are "
+            "stacked, and integration is off -- switch it on and calibrate again"
+        )
+        return (
+            f"Region {number} read nothing at any focus position: what is in it "
+            f"is under the grain of the picture it is read from, which on its "
+            f"own accounts for a reading of {format_reading(scale)}. {grain}. "
+            f"A tighter rectangle helps as well, whatever the grain: the "
+            f"reading is the average over the whole of it, so ground with "
+            f"nothing on it averages away the detail that is there"
         )
 
     def _advance_compromise(self, camera: NikonCamera) -> None:
@@ -2155,19 +2262,7 @@ class CameraWorker(QObject):
                 run.moved = True
             if run.moved:
                 self._hold_still(camera)
-            looks: "dict[int, Look]" = {}
-            after: "dict[int, float]" = {}
-            grains: "dict[int, float]" = {}
-            levels: "dict[int, float]" = {}
-            for index in run.order():
-                read = self._read_region(camera, index)
-                if read is None:
-                    raise CameraError(
-                        f"no picture of region {index + 1} the way it was measured"
-                    )
-                looks[index], grains[index], levels[index] = read
-                if self._moved_at is not None:
-                    after[index] = time.monotonic() - self._moved_at
+            looks, after, grains, levels = self._read_every_region(camera)
         except (CameraError, MtpError, WpdCommandError) as exc:
             self._log(f"Compromise probe {run.probes + 1} interrupted: {exc}")
             if self._recover_live_view(camera, exc):
@@ -2197,7 +2292,10 @@ class CameraWorker(QObject):
         if run.searching != doing and run.searching:
             self._log(f"Compromise: now {run.searching}")
         if move is None:
-            self._end_calibration()
+            # The focus is settled. If an aperture was asked for, that is what
+            # the next frames are spent on; otherwise this is the end of it.
+            if not self._begin_apertures(camera):
+                self._end_calibration()
             return
         run.pending = move.steps
         try:
@@ -2218,6 +2316,233 @@ class CameraWorker(QObject):
         if run.score is not None:
             self.sharpnessChanged.emit(100.0 * run.score, 100.0 * run.best)
 
+    def _read_every_region(
+        self, camera: NikonCamera
+    ) -> "tuple[dict[int, Look], dict[int, float], dict[int, float], dict[int, float]]":
+        """Pan to every region in turn and read it where the camera now stands.
+
+        One probe's worth of reading, for whichever search wants it: the
+        compromise, which moves the lens between probes, and the aperture
+        search, which moves nothing but the opening. With how long after the
+        last move each was read, the grain taken off it and its level, for the
+        record; see :meth:`_read_region`.
+        """
+        run = self._calibration
+        looks: "dict[int, Look]" = {}
+        after: "dict[int, float]" = {}
+        grains: "dict[int, float]" = {}
+        levels: "dict[int, float]" = {}
+        if run is None:
+            return looks, after, grains, levels
+        for index in run.order():
+            read = self._read_region(camera, index)
+            if read is None:
+                raise CameraError(
+                    f"no picture of region {index + 1} the way it was measured"
+                )
+            looks[index], grains[index], levels[index] = read
+            if self._moved_at is not None:
+                after[index] = time.monotonic() - self._moved_at
+        return looks, after, grains, levels
+
+    def _begin_apertures(self, camera: NikonCamera) -> bool:
+        """Start looking for the best aperture, if one was asked for and can be.
+
+        Everything this needs is asked of the body rather than assumed: which
+        apertures the lens offers, which shutter speeds the body offers, and
+        whether either is ours to set at all. A body in aperture priority
+        keeps the shutter to itself and compensates the exposure for us, which
+        is fine; a body that will not let the aperture be set -- a lens with
+        an aperture ring off its minimum, or shutter priority -- is not, and
+        says so rather than quietly skipping the phase.
+
+        Anything that goes wrong here ends the aperture search, never the
+        calibration: the compromise is found by this point and is worth
+        reporting whatever the aperture does.
+        """
+        run = self._calibration
+        if run is None or not run.seeks_aperture:
+            return False
+        try:
+            aperture = camera.setting("Aperture")
+            shutter = camera.setting("Shutter")
+        except (CameraError, MtpError, WpdCommandError) as exc:
+            run.no_aperture(f"The aperture could not be read from the body ({exc})")
+            self._log(f"No aperture search: the settings could not be read ({exc})")
+            return False
+        if aperture is None or not aperture.choices:
+            run.no_aperture("The body did not offer an aperture to set")
+            self._log("No aperture search: the body offers no aperture setting")
+            return False
+        if not aperture.writable:
+            run.no_aperture(
+                "The aperture is set on the body, not from here -- take it off "
+                "shutter priority, or off the lens's aperture ring"
+            )
+            self._log(
+                "No aperture search: the body will not have its aperture set "
+                "from here"
+            )
+            return False
+        # A shutter the body keeps to itself is a body that meters for itself,
+        # and then the exposure needs nothing from us. One we can set has to be
+        # moved with the aperture, or every reading is of a different picture.
+        speeds = (
+            shutter.choices
+            if shutter is not None and shutter.writable and shutter.choices
+            else ()
+        )
+        ladder = Ladder(aperture.choices, speeds)
+        at = int(aperture.value)
+        speed = int(shutter.value) if shutter is not None else 0
+        if not run.begin_apertures(ladder, at, speed):
+            self._log("No aperture search: there was nothing to try")
+            return False
+        self._aperture_restore = (at, speed if speeds else 0)
+        self._log(
+            f"Best aperture: starting from {ladder.label(at)}"
+            + (
+                f" at {ladder.shutter_label(speed)}, putting the exposure back "
+                f"with the shutter"
+                if speeds
+                else ", with the body metering the exposure itself"
+            )
+            + f", in steps of {run.aperture_stops:.2f} EV"
+        )
+        if not camera.exposure_preview:
+            # Worth saying, because the picture will not visibly change
+            # brightness and somebody watching would wonder whether the
+            # shutter was being sent at all.
+            self._log(
+                "Best aperture: the exposure preview is off, so live view shows "
+                "every aperture at the body's own brightness -- the depth of "
+                "field is previewed all the same, which is what is being read, "
+                "and the shutter still moves so that a shot taken afterwards is "
+                "exposed right"
+            )
+        self.calibrationProgress.emit(
+            -1, "Focus is settled: trying apertures either side of it"
+        )
+        self.status.emit(
+            "Calibrating: the focus is settled, now trying the aperture either "
+            "side of the one it ran at..."
+        )
+        return True
+
+    def _advance_apertures(self, camera: NikonCamera) -> None:
+        """One probe of the aperture search: set an aperture, read every region.
+
+        The same shape as :meth:`_advance_compromise`, and for the same
+        reasons -- one probe per frame grab, so a Stop pressed in the middle
+        of one still lands, and live view going off part way means the probe
+        is taken again whole rather than half of it being believed. What moves
+        between probes is the opening and the shutter, not the lens: focus
+        stands on the compromise throughout, since stopping down deepens the
+        focus about that plane rather than moving it.
+        """
+        run = self._calibration
+        if run is None or run.phase != "apertures":
+            return
+        try:
+            if run.pending_aperture is not None:
+                self._apply_aperture(camera, run.pending_aperture)
+                run.pending_aperture = None
+            looks, after, grains, levels = self._read_every_region(camera)
+        except (CameraError, MtpError, WpdCommandError) as exc:
+            self._log(f"Aperture probe interrupted: {exc}")
+            if self._recover_live_view(camera, exc):
+                return  # taken again, whole, next time round
+            self._end_calibration(f"Calibration stopped: {exc}", stopped=True)
+            return
+        step = run.take_aperture(looks, after, grains, levels)
+        probe = run.aperture_probes[-1] if run.aperture_probes else None
+        if probe is not None:
+            self._log(
+                f"Aperture {probe.label}"
+                + (f" at {probe.shutter_label}" if probe.shutter_label else "")
+                + (
+                    f" ({probe.stops:+.2f} stops from the start)"
+                    if abs(probe.stops) > 0.01
+                    else " (where it started)"
+                )
+                + ": "
+                + ", ".join(
+                    f"{number}: {share:.0%}"
+                    for number, share in zip(run.history_regions, probe.shares)
+                )
+                + f" -> {probe.score:.0%}"
+                + (
+                    f"; the exposure is {probe.residual:+.2f} EV out, which the "
+                    f"shutter could not match"
+                    if abs(probe.residual) > 0.01
+                    else ""
+                )
+            )
+        if step is None:
+            # It has chosen, and the camera already stands there: the last
+            # probe was taken at the chosen aperture. Nothing to put back.
+            self._aperture_restore = None
+            self._end_calibration()
+            return
+        run.pending_aperture = step
+        if probe is None:
+            return
+        tried = run.aperture_probes
+        best = max(one.score for one in tried)
+        self.calibrationProgress.emit(
+            -1,
+            f"Best aperture: {len(tried)} tried, {probe.label} read "
+            f"{probe.score:.0%}, best so far {best:.0%}",
+        )
+        # The trend line carries on plotting the same number it did through
+        # the compromise: every region's share of its best, combined.
+        self.sharpnessChanged.emit(100.0 * probe.score, 100.0 * best)
+
+    def _apply_aperture(self, camera: NikonCamera, step: ApertureNext) -> None:
+        """Put the camera on one aperture, with the exposure put back to match.
+
+        The shutter goes with it, so that what differs between two probes is
+        the opening and not the light. Then the grain is forgotten: how much
+        of it there is depends on the exposure, and every region's grain has
+        to be measured again at this aperture before its readings mean the
+        same as they did at the last one.
+        """
+        camera.set_setting("Aperture", step.aperture)
+        if step.shutter:
+            camera.set_setting("Shutter", step.shutter)
+        self._grain.forget()
+        self._area_pixels = None
+        self._area_of = None
+        self._stack_pairs = []
+        # The lens stops itself down and the body re-meters; both take frames.
+        self._look_again(camera, _APERTURE_FRESH)
+        self._hold_still(camera)
+        self._moved_at = time.monotonic()
+        self.refresh_settings()
+
+    def _put_the_aperture_back(self) -> None:
+        """Undo a half-finished aperture search, so nothing is left moved.
+
+        A search that ran to the end leaves the camera on the aperture it
+        chose, which is the point of it. One that was stopped part way has
+        driven the exposure somewhere nobody chose, and the honest thing is
+        to put back what it found.
+        """
+        remembered, self._aperture_restore = self._aperture_restore, None
+        camera = self._camera
+        if remembered is None or camera is None:
+            return
+        aperture, shutter = remembered
+        try:
+            camera.set_setting("Aperture", aperture)
+            if shutter:
+                camera.set_setting("Shutter", shutter)
+        except (CameraError, MtpError, WpdCommandError, KeyError) as exc:
+            self._log(f"The aperture could not be put back: {exc}")
+            return
+        self._log("The aperture and the shutter were put back where they were")
+        self.refresh_settings()
+
     def _read_region(
         self, camera: NikonCamera, index: int
     ) -> "tuple[Look, float, float] | None":
@@ -2237,7 +2562,7 @@ class CameraWorker(QObject):
             return None
         frames = self._integrator.frames if self._integrator.enabled else 1
         region = run.regions[index]
-        key = _region_grain_key(index, view.crop[2], view.crop[3])
+        key = _region_grain_key(index, view.crop[2], view.crop[3], run.aperture)
         frame, image = self._show_view(camera, view, frames, (key, region.rect))
         if frame is None or image is None:
             return None
@@ -2378,6 +2703,12 @@ class CameraWorker(QObject):
             self._sharpness.reset()
             self.sharpnessChanged.emit(0.0, 0.0)
         self._restore_view()
+        if self._aperture_restore is not None:
+            run.no_aperture(
+                "The search for the aperture did not finish, so the aperture "
+                "and the shutter were put back where it found them"
+            )
+            self._put_the_aperture_back()
         report = run.report(stopped=stopped)
         message = why if stopped else (why or report.describe())
         if message:
@@ -2674,14 +3005,21 @@ def _view_of(frame: LiveViewFrame) -> "tuple[int, int, int, int]":
     )
 
 
-def _region_grain_key(index: int, width: int, height: int) -> tuple:
+def _region_grain_key(
+    index: int, width: int, height: int, aperture: int = 0
+) -> tuple:
     """What a calibration keeps region *index*'s grain under, at a view's size.
 
     The size and not the whole crop: the compromise puts a region's view back
     to within a pixel or so, not always to it, and its grain is the same
     either way -- but a different magnification is a different grain.
+
+    So is a different *aperture*, which is why the search for one is part of
+    the key: the exposure is put back with the shutter, and a longer exposure
+    of the same scene is not the same grain. 0 while nothing is changing it,
+    which is every phase but that one.
     """
-    return ("region", int(index), int(width), int(height))
+    return ("region", int(index), int(width), int(height), int(aperture))
 
 
 def _inside(

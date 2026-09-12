@@ -50,6 +50,13 @@ its depth, in drive steps, against the others. Fitted with a plane, that is
 how far the frame is tilted against the sensor and how much of the rest is
 curl, which is what levelling the film needs.
 
+**And then, if it is asked to, the aperture.** One focus position is only half
+the compromise; the other half is how deep that position reaches, which is the
+aperture's to decide -- against diffraction, which takes back from every
+region what depth gives the ones off the plane. With the regions' bests frozen
+it can simply be tried, a stop at a time, and the readings say where the trade
+turns. That is :mod:`scanny.ui.aperture`.
+
 What comes out is a :class:`CalibrationReport`: per region, what it read at
 its best and at the compromise, the picture of it at both, and its depth --
 so a person can look at what was possible and what was chosen, rather than
@@ -67,6 +74,10 @@ from PySide6.QtCore import QRect
 from PySide6.QtGui import QImage
 
 from ..camera.nikon import LiveViewFrame
+from .aperture import STOP_SIZES
+from .aperture import ApertureSearch, Ladder
+from .aperture import Next as ApertureNext
+from .aperture import Probe as ApertureProbe
 from .film import FilmSurface
 from .homing import TALL_ENOUGH as _TALL_ENOUGH
 from .homing import TOP_READINGS as _TOP_READINGS
@@ -85,6 +96,8 @@ __all__ = [
     "OBJECTIVES",
     "TURN_BACK",
     "TURN_BACK_RANGE",
+    "ApertureNext",
+    "ApertureProbe",
     "Calibration",
     "CalibrationReport",
     "Look",
@@ -292,11 +305,14 @@ class Reading:
     #: Which region, by number from 1.
     region: int
     #: ``tune`` for its fine tune; the search's ``out``, ``across``, ``home``
-    #: or ``climb`` for the compromise.
+    #: or ``climb`` for the compromise; ``aperture`` for the search for the
+    #: best aperture, which does not move the lens at all.
     stage: str
     #: Where, in drive steps: a fine tune's from where its autofocus left the
     #: lens, the compromise's from where it began. Comparable within one
-    #: stretch of walking in one direction, and nowhere else.
+    #: stretch of walking in one direction, and nowhere else. For an
+    #: ``aperture`` reading it is not a position but the aperture itself, in
+    #: PTP's hundredths of an f-stop.
     position: int
     value: float
     #: Seconds since the calibration began.
@@ -340,6 +356,11 @@ class RegionResult:
     #: unless the search for the compromise read it higher since; None if
     #: not known.
     tuned: "float | None" = None
+    #: What it read at the compromise **at the aperture the calibration ran
+    #: at**, before the search for a better one changed it. None when no
+    #: aperture was looked for -- :attr:`compromise` is then that same
+    #: reading, since nothing about the aperture moved.
+    before_aperture: "Look | None" = None
 
     @property
     def usable(self) -> bool:
@@ -365,6 +386,32 @@ class RegionResult:
         if not self.usable or self.compromise is None:
             return None
         return self.compromise.reading / self.best.reading
+
+    @property
+    def before_fraction(self) -> "float | None":
+        """The same share, at the aperture the calibration ran at.
+
+        What this region had before the aperture was changed, so that what the
+        change was worth to *it* can be read off rather than inferred from the
+        one combined number the search climbed.
+        """
+        if not self.usable or self.before_aperture is None:
+            return None
+        return self.before_aperture.reading / self.best.reading
+
+    @property
+    def aperture_gain(self) -> "float | None":
+        """What the change of aperture was worth to this region, as a fraction.
+
+        0.32 is a third more sharpness than it had at the aperture the
+        calibration ran at; negative is a region that gave something up for
+        the others. None when no aperture was looked for.
+        """
+        if self.before_aperture is None or self.compromise is None:
+            return None
+        if self.before_aperture.reading <= 0.0:
+            return None
+        return self.compromise.reading / self.before_aperture.reading - 1.0
 
 
 @dataclass(frozen=True)
@@ -501,6 +548,19 @@ class CalibrationReport:
     #: to read it off, or the compromise settled at an end of it. The plane it
     #: brings into focus, which the film's shape is to be judged against.
     focus_depth: "float | None" = None
+    #: Every aperture the search for the best one tried, in the order it
+    #: tried them; empty when it was not asked for or could not be run. See
+    #: :mod:`scanny.ui.aperture`.
+    apertures: "tuple[ApertureProbe, ...]" = ()
+    #: The aperture the calibration ran at, and the one it chose, both in
+    #: PTP's hundredths of an f-stop; 0 for neither.
+    aperture_started: int = 0
+    aperture_chosen: int = 0
+    #: How the aperture search ended -- ``found``, ``bounded`` or ``single``
+    #: as :attr:`scanny.ui.aperture.ApertureSearch.outcome` has them -- or ""
+    #: when there was none, and why there was none when something stopped it.
+    aperture_outcome: str = ""
+    aperture_note: str = ""
     #: When it began, in seconds since the epoch, or 0 if not known.
     began: float = 0.0
     #: Everything that was said while it ran, as the activity log has it.
@@ -522,6 +582,8 @@ class CalibrationReport:
             parts.append(f"fine tuning {each} probes")
         if self.probes:
             parts.append(f"the compromise {self.probes}")
+        if self.apertures:
+            parts.append(f"{len(self.apertures)} apertures")
         line = parts[0] + (": " + ", ".join(parts[1:]) if len(parts) > 1 else "")
         driving = f"{self.moves:,} focus moves covering {self.travel:,} drive steps"
         if self.autofocuses:
@@ -542,6 +604,63 @@ class CalibrationReport:
         """The average share of their best the regions have at the compromise."""
         placed = [one.fraction for one in self.results if one.fraction is not None]
         return sum(placed) / len(placed) if placed else None
+
+    # -- the aperture ------------------------------------------------------
+
+    @property
+    def aperture_probe(self) -> "ApertureProbe | None":
+        """The probe at the aperture it chose, or None without a search."""
+        for probe in self.apertures:
+            if probe.aperture == self.aperture_chosen:
+                return probe
+        return None
+
+    @property
+    def aperture_gain(self) -> "float | None":
+        """How much better the chosen aperture reads than the one it started at.
+
+        As a fraction of the starting aperture's score -- 0.08 is eight per
+        cent more of every region's best, on average -- or None when there is
+        nothing to compare. Zero when it chose the aperture it started at,
+        which is an answer: nothing on the ladder beat what was already set.
+        """
+        chosen, started = self.aperture_probe, None
+        for probe in self.apertures:
+            if probe.aperture == self.aperture_started:
+                started = probe
+        if chosen is None or started is None or started.score <= 0.0:
+            return None
+        return chosen.score / started.score - 1.0
+
+    def describe_aperture(self) -> str:
+        """What the search for the aperture came to, in one line."""
+        if not self.apertures:
+            return self.aperture_note
+        chosen = self.aperture_probe
+        if chosen is None:
+            return self.aperture_note
+        started = self.aperture_started
+        gain = self.aperture_gain
+        if chosen.aperture == started:
+            line = (
+                f"Aperture: {chosen.label} is the best of the "
+                f"{len(self.apertures)} tried -- the one it started at"
+            )
+        else:
+            way = "stopped down" if chosen.aperture > started else "opened up"
+            line = (
+                f"Aperture: {way} {abs(chosen.stops):.1f} stops to {chosen.label}"
+            )
+            if gain:
+                line += f", worth {gain:+.0%} against the aperture it started at"
+        if chosen.shutter_label:
+            line += f", at {chosen.shutter_label}"
+        if self.aperture_outcome == "bounded":
+            line += (
+                ". It is as far as the search was let go, so a better one may "
+                "lie beyond it"
+            )
+        return line
 
     # -- depth -------------------------------------------------------------
 
@@ -660,7 +779,8 @@ class CalibrationReport:
             )
         elif self.outcome == "exhausted":
             line += ". It stopped at the most probes it will take"
-        return line
+        aperture = self.describe_aperture()
+        return f"{line}. {aperture}" if aperture else line
 
 
 def summarise(result: "RegionResult | None", number: int) -> str:
@@ -1337,7 +1457,9 @@ class Calibration:
         turn_back: float = TURN_BACK,
         depths: bool = False,
         hurry: int = 1,
+        apertures: str = "",
     ) -> None:
+        apertures = apertures if isinstance(apertures, str) else ""
         if not regions:
             raise ValueError("nothing to calibrate")
         if objective not in OBJECTIVES:
@@ -1352,6 +1474,24 @@ class Calibration:
         #: are in soft focus; one for no hurrying at all. See
         #: :meth:`_Search._hurrying`.
         self._hurry = min(max(int(hurry), HURRY_RANGE[0]), HURRY_RANGE[1])
+        #: Which of :data:`scanny.ui.aperture.STOP_SIZES` the aperture is to
+        #: be walked in once there is a compromise, or "" not to look for one.
+        self._aperture_key = apertures if apertures in STOP_SIZES else ""
+        self._apertures: "ApertureSearch | None" = None
+        #: Why there is no aperture search, when something stopped one that
+        #: was asked for; and the score at the aperture it settled on.
+        self._aperture_note = ""
+        self._aperture_score: "float | None" = None
+        #: Every region as it was read at the **first** aperture tried, which
+        #: is the one the calibration ran at. Kept whole, pictures and all,
+        #: because what the change of aperture did to a region is a thing to
+        #: be looked at rather than taken on the word of a percentage.
+        self._aperture_first: "dict[int, Look]" = {}
+        #: An aperture the search has asked for that the camera has not been
+        #: put to yet. Set before the probe that reads it, like
+        #: :attr:`pending`, so that a live view that ends in the middle of one
+        #: takes the whole probe again rather than reading the wrong aperture.
+        self.pending_aperture: "ApertureNext | None" = None
         count = len(self._regions)
         #: Each region's best reading and the picture of it: its fine tune's
         #: to begin with, then any the compromise reads higher.
@@ -1408,7 +1548,13 @@ class Calibration:
 
     @property
     def phase(self) -> str:
-        """``peaks``, then ``compromise``, then ``done``."""
+        """``peaks``, then ``compromise``, then ``apertures``, then ``done``.
+
+        The aperture phase only exists when one was asked for and the
+        compromise got far enough to be worth one; see :meth:`begin_apertures`.
+        """
+        if self._apertures is not None:
+            return "done" if self._apertures.done else "apertures"
         if self._search is not None:
             return "done" if self._search.done else "compromise"
         return "peaks" if self._index < len(self._regions) else "done"
@@ -1669,6 +1815,116 @@ class Calibration:
         self._score = search.score(readings)
         return move
 
+    # -- the aperture ------------------------------------------------------
+
+    @property
+    def seeks_aperture(self) -> bool:
+        """Whether an aperture is to be looked for once there is a compromise."""
+        return bool(self._aperture_key)
+
+    @property
+    def aperture_stops(self) -> float:
+        """How big a step to take between apertures, in EV."""
+        return STOP_SIZES.get(self._aperture_key, STOP_SIZES["whole"])
+
+    @property
+    def aperture(self) -> int:
+        """The aperture being read now, or 0 when that phase is not running.
+
+        What tells one aperture's readings of a region from another's --
+        the grain on them differs, and so does the picture -- so it is part of
+        what those readings are kept under.
+        """
+        return self._apertures.aperture if self._apertures is not None else 0
+
+    @property
+    def aperture_probes(self) -> "tuple[ApertureProbe, ...]":
+        return self._apertures.probes if self._apertures is not None else ()
+
+    def no_aperture(self, why: str) -> None:
+        """There will be no aperture search, and this is what to say about it."""
+        self._aperture_note = why
+
+    def begin_apertures(
+        self, ladder: Ladder, aperture: int, shutter: int = 0
+    ) -> bool:
+        """Start looking for the aperture; False if there is nothing to look for.
+
+        It takes a compromise to judge an aperture by -- every region read at
+        one focus position, against bests that are now frozen (see
+        :mod:`scanny.ui.aperture`) -- so this only follows a compromise that
+        finished, and only when the body offers more than one aperture to put
+        the lens to.
+        """
+        if not self._aperture_key or self._apertures is not None:
+            return False
+        if self._search is None or not self._search.done:
+            return False
+        if len(self.usable) < 2 or not ladder.holds(aperture):
+            return False
+        if len(ladder.apertures) < 2:
+            self._aperture_note = (
+                "The body offered only one aperture, so there was nothing to try"
+            )
+            return False
+        self._apertures = ApertureSearch(
+            ladder,
+            aperture,
+            shutter,
+            size=self.aperture_stops,
+            objective=self._objective,
+        )
+        return True
+
+    def take_aperture(
+        self,
+        looks: "dict[int, Look]",
+        after: "dict[int, float] | None" = None,
+        grain: "dict[int, float] | None" = None,
+        level: "dict[int, float] | None" = None,
+    ) -> "ApertureNext | None":
+        """Every region read at one aperture; answer the next one to try.
+
+        None means it is done and the camera stands at the aperture it chose.
+        The readings are kept the way the compromise's are, but **nothing here
+        may better a region's best**: those are what the apertures are being
+        compared against, and a yardstick that grows with what it measures
+        measures nothing. A region reading over one is the answer, not a
+        correction to make.
+        """
+        search = self._apertures
+        if search is None:
+            raise RuntimeError("the aperture search has not begun")
+        if search.done:
+            return None
+        if not search.probes:
+            # The first probe is at the aperture the calibration ran at, and
+            # it is the before to everything after it.
+            self._aperture_first = dict(looks)
+        usable = self.usable
+        readings = tuple(
+            looks[index].reading if index in looks else 0.0 for index in usable
+        )
+        unknown = float("nan")
+        for index, reading in zip(usable, readings):
+            self.noted(
+                index,
+                "aperture",
+                search.aperture,
+                reading,
+                (after or {}).get(index, unknown),
+                grain=(grain or {}).get(index, unknown),
+                level=(level or {}).get(index, unknown),
+            )
+        shares = tuple(
+            reading / self.best_of(index) if self.best_of(index) > 0.0 else 0.0
+            for index, reading in zip(usable, readings)
+        )
+        score = combine(shares, self._objective)
+        self._latest = dict(looks)
+        self._aperture_score = score
+        return search.step(score, shares)
+
     # -- what it all came to -----------------------------------------------
 
     def depths(self) -> "dict[int, tuple[float, float, bool]]":
@@ -1744,7 +2000,12 @@ class Calibration:
         bests that were still going up.
         """
         search = self._search
+        hunted = self._apertures
         settled = search is not None and search.done and not stopped
+        if settled and hunted is not None and not hunted.done:
+            # An aperture search that never finished leaves the regions read
+            # at whichever aperture it had got to, which is nobody's answer.
+            settled = False
         depths = self.depths()
         results = tuple(
             RegionResult(
@@ -1757,6 +2018,11 @@ class Calibration:
                 doubt=depths[index][1] if index in depths else float("inf"),
                 edge=depths[index][2] if index in depths else False,
                 tuned=self._tuned[index],
+                before_aperture=(
+                    self._aperture_first.get(index)
+                    if settled and hunted is not None
+                    else None
+                ),
             )
             for index, region in enumerate(self._regions)
         )
@@ -1769,6 +2035,10 @@ class Calibration:
             )
             if settled and self._history:
                 score = search.score(self._history[-1][1])
+        if settled and self._aperture_score is not None:
+            # The regions were read again at the aperture it chose, and those
+            # are the readings the results carry, so this is their number too.
+            score = self._aperture_score
         if stopped:
             outcome = "stopped"
         elif search is not None:
@@ -1790,6 +2060,21 @@ class Calibration:
             history_regions=self.history_regions if search is not None else (),
             depths_measured=self._measure_depths,
             focus_depth=self.focus_depth() if settled else None,
+            apertures=hunted.probes if hunted is not None else (),
+            aperture_started=hunted.start if hunted is not None else 0,
+            # An unfinished search chose nothing: the worker puts the aperture
+            # back where it found it, so there is no answer to report.
+            aperture_chosen=(
+                hunted.chosen.aperture
+                if hunted is not None and hunted.done and hunted.chosen is not None
+                else 0
+            ),
+            aperture_outcome=(
+                ""
+                if hunted is None
+                else (hunted.outcome if hunted.done else "stopped")
+            ),
+            aperture_note=self._aperture_note,
             began=self._began,
             readings=tuple(self._readings),
         )

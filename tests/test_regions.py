@@ -2792,7 +2792,7 @@ def test_every_setting_is_logged_when_a_calibration_starts(worker, monkeypatch):
     reports = []
     worker.calibrationReady.connect(reports.append)
     panel = [("Focus", "coarse increment", "500 steps"), ("View", "shown", "Rotated")]
-    worker.start_calibration(STEP, "worst", 65, True, 1, panel)
+    worker.start_calibration(STEP, "worst", 65, True, 1, "", panel)
     worker.cancel_calibration()
     said = [line.split("  ", 1)[1].strip() for line in reports[-1].log]
     settings = [line for line in said if line.startswith("Setting  ")]
@@ -2824,7 +2824,7 @@ def test_every_setting_is_logged_when_a_calibration_starts(worker, monkeypatch):
 
 def test_the_panel_sends_every_focus_increment_and_the_view_with_a_calibration(window):
     asked = []
-    window.requestCalibration.connect(lambda *args: asked.append(args[5]))
+    window.requestCalibration.connect(lambda *args: asked.append(args[6]))
     window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
     window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
     window._turn_view(1)
