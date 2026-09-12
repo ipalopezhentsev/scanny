@@ -110,6 +110,7 @@ def save_report(path: "str | Path", report: CalibrationReport, aspect: float) ->
             ],
             "history_regions": list(report.history_regions),
             "depths_measured": report.depths_measured,
+            "focus_depth": report.focus_depth,
             "began": report.began,
             "results": [
                 {
@@ -256,6 +257,11 @@ def _report_from(
         ),
         history_regions=tuple(int(number) for number in saved["history_regions"]),
         depths_measured=bool(saved["depths_measured"]),
+        focus_depth=(
+            None
+            if saved.get("focus_depth") is None
+            else float(saved["focus_depth"])
+        ),
         began=float(saved.get("began", 0.0)),
         log=tuple(log),
         readings=readings,

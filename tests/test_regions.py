@@ -38,6 +38,8 @@ from scanny.camera.nikon import CameraError, LiveViewFrame  # noqa: E402
 from scanny.ui import main_window as mw  # noqa: E402
 from scanny.ui.orientation import Orientation  # noqa: E402
 from scanny.ui.regions import (  # noqa: E402
+    HURRY_BELOW,
+    HURRY_STRIDE,
     MAX_REGIONS,
     TURN_BACK,
     Calibration,
@@ -229,7 +231,10 @@ def _walked(
     places=None,
     turn_back: float = TURN_BACK,
     depths: bool = False,
+    hurry: "bool | int" = False,
     tuned=None,
+    moves=None,
+    watch=None,
 ) -> "tuple[Calibration, float]":
     """Run the compromise against modelled regions; answer it and where it ended.
 
@@ -238,12 +243,19 @@ def _walked(
     so a reversal moves nothing until the play is taken up -- and it is where
     the optics end up that is answered, not where the steps say. *tuned* is
     what share of its true peak each region's fine tune read, if not all of
-    it.
+    it. *moves* is filled in, if a list is given, with every move the search
+    asked for as (what it was doing, the steps, what it read there, the best
+    it had read) -- for saying how a walk was paced as well as where it ended.
     """
     rng = np.random.default_rng(seed)
     regions = places or [Region(0.2 * n, 0.2, 0.05, 0.05) for n in range(len(curves))]
     run = Calibration(
-        regions, STEP, objective=objective, turn_back=turn_back, depths=depths
+        regions,
+        STEP,
+        objective=objective,
+        turn_back=turn_back,
+        depths=depths,
+        hurry=HURRY_STRIDE if hurry is True else int(hurry or 1),
     )
     peaks = [max(curve(p) for p in range(-400, 400)) for curve in curves]
     for index, peak in enumerate(peaks):
@@ -260,6 +272,10 @@ def _walked(
         move = run.take(looks)
         if move is None:
             return run, optics
+        if moves is not None:
+            moves.append((run.searching, move.steps, run.score, run.best))
+        if watch is not None:
+            watch(run)
         driver += move.steps
         optics = min(max(optics, driver), driver + slack)
     raise AssertionError("it has to stop on its own")
@@ -507,6 +523,40 @@ def test_the_walk_across_says_how_far_apart_in_focus_the_regions_are(slack):
         r"Depth, in drive steps: 1 nearest,  2 \+5\d ±\d,  3 \+[78]\d ±\d",
         report.ordering(),
     ), report.ordering()
+
+
+@pytest.mark.parametrize("slack", [0, 30])
+def test_the_walk_across_also_says_where_the_compromise_was_placed(slack):
+    """The depths say where each region focuses; this says where the one focus
+    position they all ended at sits among them, in the same steps counted from
+    the same nearest region -- the plane the compromise brings into focus, and
+    the thing the film's shape is to be judged against. It is read off the same
+    walk, as the top of the very number the search climbs, and so lands where
+    the search went home to and climbed from: within an increment of where the
+    lens finally stood, play taken up or not."""
+    curves = [_hill(-40), _hill(10), _hill(40)]
+    run, optics = _walked(
+        curves, start=40.0, slack=slack, noise=0.01, seed=3, depths=True
+    )
+    report = run.report()
+    # The nearest region's peak is the zero the depths are counted from, and
+    # it is the hill at -40; where the lens ended is that much further on.
+    ended = optics - (-40)
+    assert report.focus_depth == pytest.approx(ended, abs=STEP)
+    depths = [one.depth for one in report.results]
+    assert min(depths) < report.focus_depth < max(depths), (
+        "a compromise between them is somewhere among them"
+    )
+
+
+def test_where_the_compromise_was_placed_is_not_said_without_a_walk_across():
+    """No walk across, no axis to say it on: the depths and the focus plane
+    are read off that one walk or not at all."""
+    curves = [_hill(-40), _hill(10), _hill(40)]
+    run, _optics = _walked(curves, start=40.0, depths=False)
+    report = run.report()
+    assert report.focus_depth is None
+    assert all(one.depth is None for one in report.results)
 
 
 def test_a_region_a_little_outside_the_others_is_still_measured():
@@ -1534,6 +1584,291 @@ def test_turning_back_at_four_fifths_means_four_fifths():
     assert len(thorough) > len(quick), "depths walk further, when asked for"
 
 
+# -- hurrying through focus no compromise can be in ---------------------------
+
+
+def _paced(moves) -> "dict[str, set[int]]":
+    """How big a step each leg of a walk was made of, in increments."""
+    paced: "dict[str, set[int]]" = {}
+    for stage, steps, _score, _best in moves:
+        paced.setdefault(stage, set()).add(abs(steps) // STEP)
+    return paced
+
+
+def test_hurrying_crosses_the_soft_ground_in_strides_and_the_top_in_increments():
+    """Two regions twenty steps apart, so their average clears the line at the
+    top, started a long way out on one side. The valley in between is crossed
+    in strides of two increments and the top is walked in single ones, which
+    is the whole of what the option is."""
+    curves = [_hill(-10), _hill(10)]
+    plain_moves, quick_moves = [], []
+    plain, plain_optics = _walked(curves, start=140.0, moves=plain_moves)
+    quick, quick_optics = _walked(curves, start=140.0, hurry=True, moves=quick_moves)
+    assert quick.probes < plain.probes, "hurrying has to save probes"
+    assert abs(quick_optics - plain_optics) <= STEP, (
+        f"hurried to {quick_optics}, walked to {plain_optics}"
+    )
+    paced = _paced(quick_moves)
+    assert HURRY_STRIDE in paced["out"] | paced["across"], "no strides at all"
+    assert _paced(plain_moves) == {stage: {1} for stage in _paced(plain_moves)}, (
+        "without hurrying, every step is one increment"
+    )
+    # On the two walks, which are paced by what they read: at or above the
+    # line, every step is a single increment.
+    near = [
+        abs(steps) // STEP
+        for stage, steps, score, _best in quick_moves
+        if stage in ("out", "across") and score is not None and score >= HURRY_BELOW
+    ]
+    assert near and set(near) == {1}, f"strode where the answer is decided: {near}"
+
+
+def test_a_scene_that_never_clears_the_line_is_strided_throughout_all_the_same():
+    """The price of a fixed line, and why it is affordable at two increments.
+
+    Regions further apart in focus than each is deep have no focus position
+    where the average is four fifths -- eighty steps apart it tops out at
+    two thirds -- so a hurrying walk strides the whole way across, top
+    included. What saves it is that a stride is two increments and that
+    nothing which lands on the answer is hurried: the way home walks the last
+    of it an increment at a time, and it ends where walking ended.
+    """
+    curves = [_hill(-40), _hill(40)]
+    moves = []
+    plain, plain_optics = _walked(curves, start=40.0)
+    quick, quick_optics = _walked(curves, start=40.0, hurry=True, moves=moves)
+    assert max(one for _st, steps, _s, _b in moves for one in [abs(steps) // STEP]) > 1
+    assert abs(quick_optics - plain_optics) <= STEP, (
+        f"hurried to {quick_optics}, walked to {plain_optics}"
+    )
+    assert quick.probes <= plain.probes
+
+
+def test_the_way_home_strides_the_dead_travel_and_lands_an_increment_at_a_time():
+    """The way home is paced by distance, not by what it reads.
+
+    It has to be paced by something: the two walks are two thirds of the
+    probes and the strides cut them to a quarter, and a real calibration gave
+    every bit of that back on a way home that retraced at single increments
+    what the strides had crossed four at a time -- seventy probes home against
+    twenty-four for both walks. What the beginning of the way home is, on a
+    lens with play in it, is dead travel: the optics have not moved yet and
+    every reading says what the far end of the stretch said. What the end of
+    it is, is the answer, so the last of it is walked as it always was.
+    """
+    curves = [_hill(-40), _hill(10, height=40.0), _hill(40)]
+    plain_moves, quick_moves = [], []
+    plain, plain_optics = _walked(curves, start=40.0, slack=18, moves=plain_moves)
+    quick, quick_optics = _walked(
+        curves, start=40.0, slack=18, hurry=True, moves=quick_moves
+    )
+    home = [abs(steps) // STEP for stage, steps, _s, _b in quick_moves if stage == "home"]
+    assert home, "it never went home"
+    assert max(home) > 1, f"the way home never strided: {home}"
+    assert home[-1] == 1 and home[-2:] == [1, 1], f"strode into the answer: {home}"
+    walked = [abs(steps) // STEP for stage, steps, _s, _b in plain_moves if stage == "home"]
+    assert len(home) < len(walked), (
+        f"home took {len(home)} probes hurried and {len(walked)} walked"
+    )
+    assert abs(quick_optics - plain_optics) <= STEP
+    # The climb, when the way home is lost, is a fine tune: never hurried.
+    assert _paced(quick_moves).get("climb", {1}) == {1}
+
+
+def test_one_reading_is_not_enough_to_change_the_pace():
+    """Readings that will not hold still, which is what a real rig had: a
+    region swinging by half between probes put the pace anywhere -- striding
+    over good ground and creeping across dead ground in the same leg -- when a
+    single reading decided it. Two in a row have to agree."""
+    curves = [_hill(-40), _hill(40)]
+    moves = []
+    _run, _optics = _walked(
+        curves, start=40.0, noise=0.25, seed=11, hurry=True, moves=moves
+    )
+    walks = [
+        (steps, score)
+        for stage, steps, score, _best in moves
+        if stage in ("out", "across") and score is not None
+    ]
+    # No stride is ever taken from a reading that was not itself under the
+    # line, however much the readings swing either side of it.
+    for steps, score in walks:
+        if abs(steps) // STEP > 1:
+            assert score < HURRY_BELOW, score
+    assert any(abs(steps) // STEP > 1 for steps, _score in walks), "no strides at all"
+
+
+@pytest.mark.parametrize("start", [-40.0, 40.0])
+def test_a_hurried_walk_meets_a_broad_top_in_the_middle_all_the_same(start):
+    curves = [_hill(-40), _hill(40)]
+    _run, optics = _walked(curves, start=start, hurry=True)
+    assert abs(optics) <= STEP, f"ended at {optics}, not in the middle"
+
+
+def test_hurrying_costs_nothing_it_can_be_held_to_across_many_made_up_scenes():
+    """The same scenes the unhurried search is held to, hurried: what each
+    one gives away against the true best compromise, and what it cost in
+    probes. It has to save real time and lose almost nothing."""
+    given_up, saved = [], []
+    for seed in range(24):
+        rng = np.random.default_rng(seed)
+        curves = [
+            _hill(float(rng.uniform(-70, 70)), width=float(rng.uniform(40, 160)),
+                  height=float(rng.uniform(20, 300)))
+            for _ in range(int(rng.integers(2, 5)))
+        ]
+        start = float(rng.choice([-1, 1]) * rng.uniform(20, 80))
+        slack = int(rng.integers(0, 12))
+        best, value = _best_average(curves)
+        plain, _optics = _walked(curves, start=start, slack=slack, turn_back=0.3)
+        quick, optics = _walked(
+            curves, start=start, slack=slack, turn_back=0.3, hurry=True
+        )
+        shares = [curve(optics) / max(curve(p) for p in np.arange(-300.0, 300.0))
+                  for curve in curves]
+        given_up.append(value - float(np.mean(shares)))
+        saved.append(plain.probes - quick.probes)
+    assert float(np.mean(given_up)) < 0.02, f"gave away {np.mean(given_up):.3f}"
+    assert max(given_up) < 0.1, f"worst gave away {max(given_up):.3f}"
+    assert float(np.mean(saved)) > 0, f"saved {np.mean(saved):.1f} probes on average"
+
+
+def test_a_walk_climbing_from_soft_focus_strides_even_though_every_step_is_its_best():
+    """The stretch the relative test cannot see. A fine tune that left the lens
+    where every region reads badly has the walk climbing ground it has never
+    seen, reading its own best at every step -- so nothing is ever four fifths
+    of the best, and it is the absolute half that strides there."""
+    curves = [_hill(-40), _hill(40)]
+    moves = []
+    # Started far outside both hills, so the walk out climbs all the way in.
+    _run, _optics = _walked(curves, start=-200.0, hurry=True, moves=moves)
+    climbing = [
+        abs(steps) // STEP
+        for stage, steps, score, best in moves
+        if stage == "out" and score is not None and score >= best and score < HURRY_BELOW
+    ]
+    # All of them strides but the first, which is the probe the two-readings
+    # rule costs at the top of every soft stretch.
+    assert climbing and set(climbing) <= {1, HURRY_STRIDE}, climbing
+    assert climbing.count(HURRY_STRIDE) >= len(climbing) - 1, climbing
+
+
+def test_a_hurrying_search_says_what_pace_it_is_walking_at():
+    """Someone watching a search that has slowed down wants to know whether it
+    is on to something or merely hurrying, so the line says which."""
+    said = []
+    _run, _optics = _walked(
+        [_hill(-40), _hill(40)],
+        start=40.0,
+        hurry=True,
+        watch=lambda run: said.append(run.progress()),
+    )
+    assert any(f"strides of {HURRY_STRIDE * STEP}" in line for line in said), said
+    assert any(f"steps of {STEP}," in line for line in said), said
+
+
+def _travel(moves) -> "dict[str, int]":
+    """How far each leg of a walk went, in drive steps."""
+    per: "dict[str, int]" = {}
+    for stage, steps, _score, _best in moves:
+        per[stage] = per.get(stage, 0) + abs(steps)
+    return per
+
+
+def _dead(at: float = -250.0, height: float = 0.2):
+    """A region whose fine tune found a little and which reads nothing after.
+
+    Region 2 of the calibration that found the bug below: a peak of 0.2 where
+    the others read 2.4 to 4.6, and nothing above its own grain anywhere the
+    compromise walked -- so its share was zero at every probe.
+    """
+    return lambda p: height if abs(p - at) < 3 else 0.0
+
+
+def _five_with_a_dead_one():
+    return [
+        _hill(-30, width=45, height=4.6),
+        _dead(),
+        _hill(0, width=45, height=3.5),
+        _hill(20, width=50, height=3.2),
+        _hill(-10, width=45, height=2.4),
+    ]
+
+
+def test_hurrying_covers_the_same_ground_and_not_four_times_as_much():
+    """What a real run found, and why every limit here is a distance.
+
+    Five regions with one that reads nothing where the walks go, and depths
+    asked for: "fallen a quarter below its best" can never be true of a region
+    reading nothing, so both walks run to the end of their patience every
+    time. With that patience counted by the probe, a stride of four made it
+    four times as long -- the rig walked 672 steps out where it had walked 156
+    and 1230 across where it had walked 228, out into focus where nothing
+    reads at all, and then crawled the whole of it back an increment at a
+    time, 206 probes against 86. Hurrying may cross the same ground in fewer
+    probes. It may not cross more ground.
+    """
+    curves = _five_with_a_dead_one()
+    walked, hurried = [], []
+    plain, plain_optics = _walked(
+        curves, start=-30.0, slack=8, depths=True, moves=walked
+    )
+    quick, quick_optics = _walked(
+        curves, start=-30.0, slack=8, depths=True, hurry=True, moves=hurried
+    )
+    there, and_back = _travel(walked), _travel(hurried)
+    for leg in ("out", "across"):
+        # A stride at either end of a leg, since the turn-back line is only
+        # looked at where a reading is taken -- and nothing like four times.
+        assert and_back[leg] <= there[leg] + 2 * HURRY_STRIDE * STEP, (
+            f"hurrying went {and_back[leg]} steps {leg} where walking went {there[leg]}"
+        )
+    assert quick.probes < plain.probes, (quick.probes, plain.probes)
+    assert abs(quick_optics - plain_optics) <= STEP
+
+
+def test_a_walk_stops_waiting_for_a_picture_with_nothing_in_it():
+    """The other half of that run: what the walks were waiting for.
+
+    A region that reads nothing can never be seen to climb and has no peak to
+    place, so both of the things a walk goes on past the turn-back line for
+    are waits for something that cannot happen -- and it walked on to where
+    the number it was climbing was at a fiftieth of its best, a pan to every
+    region and a wait for a picture at each step. Now a collapsed reading ends
+    the wait wherever it happens, hurried or not.
+    """
+    curves = _five_with_a_dead_one()
+    for hurry in (False, True):
+        moves = []
+        run, _optics = _walked(
+            curves, start=-30.0, slack=8, depths=True, hurry=hurry, moves=moves
+        )
+        spent = [
+            score
+            for _stage, _steps, score, best in moves
+            if score is not None and best > 0.0 and score < 0.1 * best
+        ]
+        assert len(spent) <= 10, f"{len(spent)} probes on nothing (hurry={hurry})"
+        assert run.report().outcome == "found"
+
+
+def test_the_leg_across_still_crosses_the_soft_ground_it_sets_off_from():
+    """What the give-up line must not do. The leg across starts at the far end
+    of the leg out, which is the softest reading there is -- and if a collapsed
+    reading were judged against the best of the whole search rather than of the
+    leg it is on, the walk would turn round on the spot and never cross back
+    over the regions at all."""
+    curves = _five_with_a_dead_one()
+    moves = []
+    run, optics = _walked(
+        curves, start=-30.0, slack=8, depths=True, hurry=True, moves=moves
+    )
+    across = [steps for stage, steps, _s, _b in moves if stage == "across"]
+    assert len(across) >= 8, f"the leg across gave up after {len(across)} probes"
+    best, _value = _best_average(curves)
+    assert abs(optics - best) <= 2 * STEP, f"ended at {optics}, best is {best}"
+
+
 def test_without_depths_asked_for_the_report_has_none_and_says_how_to_get_them(window):
     from PySide6.QtWidgets import QLabel
 
@@ -1565,6 +1900,53 @@ def test_measuring_depths_is_asked_for_before_calibrating_and_remembered(window)
     window._on_calibration_changed(True)
     assert not window.regions_depths.isEnabled()
     window._on_calibration_changed(False)
+
+
+def test_how_long_a_stride_is_set_before_calibrating_and_remembered(window):
+    asked = []
+    window.requestCalibration.connect(
+        lambda step, aim, turn, depths, hurry: asked.append(hurry)
+    )
+    window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
+    window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
+    assert window.regions_hurry.value() == 1, "off, out of the box"
+    assert window.regions_hurry.specialValueText() == "off", "and it says so"
+    window.calibrate_button.click()
+    window.regions_hurry.setValue(3)
+    window.calibrate_button.click()
+    assert asked == [1, 3]
+    assert int(QSettings().value("regions/hurry")) == 3
+    # Settled before it starts, like everything else the search is shaped by.
+    window._on_calibration_changed(True)
+    assert not window.regions_hurry.isEnabled()
+    window._on_calibration_changed(False)
+    assert window.regions_hurry.isEnabled()
+
+
+def test_the_tick_hurrying_used_to_be_becomes_the_stride_it_stood_for(app):
+    from scanny.ui.regions import HURRY_STRIDE as stride
+
+    settings = QSettings()
+    settings.setValue("regions/hurry", True)
+    assert mw.MainWindow._stored_hurry() == stride
+    settings.setValue("regions/hurry", False)
+    assert mw.MainWindow._stored_hurry() == 1
+    settings.setValue("regions/hurry", 4)
+    assert mw.MainWindow._stored_hurry() == 4
+    settings.remove("regions/hurry")
+    assert mw.MainWindow._stored_hurry() == 1
+
+
+def test_hurrying_reaches_the_search_and_is_said_while_it_runs(worker):
+    rig = _Rig(PLACES)
+    worker._camera = rig
+    for _ in range(4):
+        worker._grab()
+    worker.set_focus_regions(_regions_round(PLACES))
+    worker.start_calibration(STEP, "average", 80, False, 3)
+    assert worker._calibration.hurries
+    assert worker._calibration.hurry == 3
+    worker.cancel_calibration()
 
 
 def test_the_rig_s_calibration_is_timed_and_counted(worker):
@@ -1949,6 +2331,132 @@ def test_the_film_is_vivid_from_above_and_dull_from_underneath(app):
     assert from_above > 10 * from_below, "the far side of the film is not its face"
 
 
+def test_the_film_page_keeps_its_notes_under_the_drawing(window):
+    """Beside it they took a third of the page's width off the drawing, which
+    is the thing on the page meant to be looked at. Under it they are as tall
+    as they need and no taller, and the drawing has the whole width."""
+    from scanny.ui.report import CalibrationReportDialog, _NOTES_TALL
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)]
+    report = _levelled_report(lambda x, y: 30 * x + 10 * y, corners)
+    dialog = CalibrationReportDialog(report, Orientation(), window._save_directory(), window)
+    dialog.show()
+    # A page that is not the one on show is not laid out, and has nothing to
+    # say about where anything on it sits.
+    dialog._tabs.setCurrentWidget(dialog._film_page)
+    QApplication.processEvents()
+    view, notes = dialog._film_view, dialog._film_notes
+    assert notes.height() <= _NOTES_TALL
+    assert notes.y() >= view.y() + view.height(), "under the drawing, not beside it"
+    assert view.width() >= notes.width(), "and the drawing has the width of the page"
+    dialog.close()
+
+
+def test_the_drawing_fills_a_page_wider_than_it_is_tall(app):
+    """The two sheets seen from the side are far wider than they are tall.
+    Fitted by their width against the shorter side of the widget, they came out
+    small in the middle of a wide page with the room going to waste."""
+    from scanny.ui.film import FilmView, Mark
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)]
+    report = _levelled_report(lambda x, y: 30 * x + 10 * y, corners)
+    view = FilmView()
+    view.set_scene(
+        report.surface(),
+        [Mark(one.number, one.region.rect, one.depth) for one in report.placed],
+    )
+    view.show()
+
+    def drawn_across() -> int:
+        """How much of the width the drawing covers, in pixels."""
+        QApplication.processEvents()
+        shown = view.grab().toImage()
+        ground = shown.pixelColor(0, 0)
+        columns = [
+            x
+            for x in range(shown.width())
+            for y in range(0, shown.height(), 4)
+            if shown.pixelColor(x, y) != ground
+        ]
+        return max(columns) - min(columns)
+
+    view.resize(400, 400)
+    square = drawn_across()
+    view.resize(900, 400)
+    assert drawn_across() > 1.8 * square, "a wider page draws a wider picture"
+
+
+def test_the_focus_plane_is_drawn_among_the_depths_it_was_chosen_for(app):
+    """One focus position for all of the regions is one plane, level with the
+    sensor, and the whole of the compromise is what the film does either side
+    of it. Drawn see-through, so that the film shows through it where it is
+    behind it and over it where it is in front."""
+    from scanny.ui.film import FilmView, Mark
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
+    report = _levelled_report(lambda x, y: 40 * x + (25 if x == 0.5 else 0), corners)
+    view = FilmView()
+    view.resize(500, 380)
+    marks = [Mark(one.number, one.region.rect, one.depth) for one in report.placed]
+
+    def drawn():
+        view.update()
+        QApplication.processEvents()
+        return view.grab().toImage()
+
+    view.set_scene(report.surface(), marks)
+    view.show()
+    without = drawn()
+    deepest = max(one.depth for one in report.placed)
+    view.set_scene(report.surface(), marks, focus=deepest / 2)
+    assert drawn() != without, "the plane is drawn"
+
+    # Put it above everything and the drawing has to make room for it: the
+    # heights are stretched to take it in, as they are for any depth.
+    view.set_scene(report.surface(), marks, focus=deepest * 3)
+    assert view._heights()[1] == pytest.approx(deepest * 3)
+
+
+def test_the_sensor_says_which_of_its_sides_is_being_looked_at(app):
+    """It lies flat, so there is no shading on it to tell its face from its
+    back, and two sides alike make turning right under the rig look like
+    turning back over it. Its back is drawn as the back of a plate instead:
+    darker, and without the grid its face is ruled into."""
+    from scanny.ui.film import _SENSOR, _SENSOR_BACK, FilmView, Mark
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)]
+    report = _levelled_report(lambda x, y: 30 * x + 10 * y, corners)
+    view = FilmView()
+    view.resize(500, 380)
+    view.set_scene(
+        report.surface(),
+        [Mark(one.number, one.region.rect, one.depth) for one in report.placed],
+    )
+    view.show()
+
+    def sides() -> "tuple[int, int]":
+        """How much of the drawing is the sensor's face and how much its back."""
+        view.update()
+        QApplication.processEvents()
+        shown = view.grab().toImage()
+        looked = [
+            shown.pixelColor(x, y)
+            for x in range(0, shown.width(), 3)
+            for y in range(0, shown.height(), 3)
+        ]
+        return (
+            sum(one == _SENSOR for one in looked),
+            sum(one == _SENSOR_BACK for one in looked),
+        )
+
+    view._tilt = 30.0
+    face, back = sides()
+    assert face > 0 and back == 0, "from over the rig, the sensor's face"
+    view._tilt = -30.0
+    face, back = sides()
+    assert back > 0 and face == 0, "from under it, the back of the same plate"
+
+
 def test_the_report_has_the_film_and_the_search_on_pages_of_their_own(window):
     from scanny.ui.report import CalibrationReportDialog
 
@@ -2059,6 +2567,7 @@ def _documented_report() -> CalibrationReport:
         history=(("out", (0.9, 0.8, 0.7), 0.7), ("across", (0.95, 0.85, 0.75), 0.75)),
         history_regions=(1, 2, 3),
         depths_measured=True,
+        focus_depth=17.5,
         began=1_789_000_000.0,
         log=("14:03:01  Calibration started", "14:03:02  !! the camera refused: busy"),
         readings=(
@@ -2283,7 +2792,7 @@ def test_every_setting_is_logged_when_a_calibration_starts(worker, monkeypatch):
     reports = []
     worker.calibrationReady.connect(reports.append)
     panel = [("Focus", "coarse increment", "500 steps"), ("View", "shown", "Rotated")]
-    worker.start_calibration(STEP, "worst", 65, True, panel)
+    worker.start_calibration(STEP, "worst", 65, True, 1, panel)
     worker.cancel_calibration()
     said = [line.split("  ", 1)[1].strip() for line in reports[-1].log]
     settings = [line for line in said if line.startswith("Setting  ")]
@@ -2293,6 +2802,7 @@ def test_every_setting_is_logged_when_a_calibration_starts(worker, monkeypatch):
         "Setting  Calibration > turn back below: 65% of the best",
         f"Setting  Calibration > walk in steps of: {STEP}",
         "Setting  Calibration > measure depths for levelling: yes",
+        "Setting  Calibration > hurry through soft focus: off",
         "Setting  Camera > model: Nikon D750",
         "Setting  Exposure > Shutter speed: 1/60",
         "Setting  Exposure > Exposure mode: Manual (set on the body)",
@@ -2314,7 +2824,7 @@ def test_every_setting_is_logged_when_a_calibration_starts(worker, monkeypatch):
 
 def test_the_panel_sends_every_focus_increment_and_the_view_with_a_calibration(window):
     asked = []
-    window.requestCalibration.connect(lambda *args: asked.append(args[4]))
+    window.requestCalibration.connect(lambda *args: asked.append(args[5]))
     window._on_region_drawn(0.1, 0.1, 0.1, 0.1)
     window._on_region_drawn(0.6, 0.6, 0.1, 0.1)
     window._turn_view(1)

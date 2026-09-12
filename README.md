@@ -1192,7 +1192,17 @@ So the search is three legs, and none of them counts a step across a reversal:
   best it reached on this walk, and it turns at the first reading under that
   line. The one thing it waits for is a region *visibly climbing* towards its
   own best, and then only ten increments: that is how a hill just beyond a
-  valley is still found. It used to walk on while anything ahead could in
+  valley is still found. **Both of the waits end at once where the reading
+  has collapsed** -- under a tenth of what the leg has read. A region that
+  reads nothing above its own grain can never be seen to climb and has no
+  peak to place, so a walk waiting for either of those is waiting for
+  something that cannot happen: one real calibration, with a region that read
+  nothing where the walks went, spent twenty probes at a fiftieth of its best
+  for it, each of them a pan to every region and a wait for a picture with
+  nothing in it. Measured against the best of *that leg*, which is what makes
+  it safe on the leg across -- that leg sets off from the softest reading
+  there is, so nothing is under a tenth of it and it crosses the regions as
+  it must. It used to walk on while anything ahead could in
   principle beat the best so far, and then until every region had fallen well
   below its own best for the sake of the depths -- which is how a walk told
   to turn back at 80% was seen going on to where the sharpest region was at
@@ -1229,6 +1239,451 @@ regions' curves cross: an increment off it, which the play can make
 unavoidable, costs more there, and it ends on average 0.9% short. It takes
 about sixty probes, each a pan and a stack per region -- a few minutes for
 three regions magnified.
+
+### Hurrying through focus no compromise can be in
+
+Every probe of the compromise costs a pan to each region and a wait for the
+picture to settle, and a good many of them are spent on ground where every
+region is soft -- the walk across has the whole of the stretch the walk out
+covered to recross before it reaches the first region's hill. **Hurry through
+soft focus**, off out of the box, is one rule:
+
+> While the average sharpness is **under four fifths**, a step is **as many
+> increments as Hurry in strides of says**. At or above four fifths, a step is
+> **one increment**.
+
+The stride is a multiple of the increment the walk is made in -- the lens's
+minimum, your setting -- so it scales with the lens: two increments is twelve
+drive steps on the six-step minimum a D750 kit lens has. **Off** out of the
+box, and **2** is the number to start from; more saves more and tells on the
+answer sooner, and the paragraph after next says how much. Going back to one
+increment takes a single reading at or above the line; striding takes two
+readings under it in a row, because slowing down where it might matter is
+cheap and hurrying where it might matter is not.
+
+**The line is fixed, and it is an absolute share of what each region can do --
+the number the panel shows while the search runs.** It was a share of the best
+read so far to begin with, and that is what made the pace flap: the best read
+anywhere goes up while the walk is walking, so the line moved under it, and on
+a real rig one leg strode into a peak from one side and away from it on the
+other. A fixed line does not move. Where the regions are further apart in
+focus than each is deep the average never clears it at all -- eighty steps
+apart it tops out at two thirds -- and then the walks stride the whole way,
+which is affordable at two increments and lands on the answer anyway, because
+nothing that lands on the answer is hurried.
+
+**Four was too much, which is why the stride is yours to set.** It strode
+into the peak from one side and away from it on the other, leaving one leg
+sampled at one increment around its top and four everywhere else -- and the
+arithmetic that picks the top of a leg weighted every reading equally, so
+three closely spaced readings outvoted one stride-spaced reading standing for
+the same ground, and the top came out pulled towards whichever side had been
+walked finely. Both halves of that are fixed: two increments, and
+`middle_of_top` now weights each reading by how much travel it stands for,
+which changes nothing at all where a stretch was walked evenly.
+
+**It never carries a walk further than it would have gone.** Every limit that
+stops a walk -- the turn-back line's two patiences, and the longest a leg may
+be -- is a distance in increments, not a number of probes. That is not a
+detail: while every step was one increment the two were the same number, and
+counting probes is how the first version of this went wrong. Told to hurry, a
+rig that had walked 156 steps out and 228 across walked 672 and 1230 -- four
+times as far, out into focus where nothing reads at all -- and then crawled
+the whole of it back an increment at a time. It took 206 probes where the same
+rig had taken 86.
+
+**The way home hurries too, and on distance rather than on what it reads.** It
+has to: the two walks are two thirds of the probes, and on one rig the strides
+cut them from 66 probes to 24 while the way home went from 20 to 70 by
+retracing at single increments what the strides had crossed. What the
+beginning of the way home is, on a lens with play in it, is *dead travel*:
+until the play is taken up the optics have not moved, every reading says what
+the far end of the stretch said, and there is nothing in any of them to be had
+by taking them an increment apart. So it strides while the play worked out so
+far says there is a long way still to go, and walks the last two increments
+and the arrival exactly as it always did. The fine tune that takes over when
+the way home is lost is never hurried at all, and neither is any of phase one.
+
+What it is worth, across 120 made-up scenes of two to five regions with up to
+twenty steps of play and 2% grain on the readings: **26% fewer probes** as the
+search comes set up, **35% fewer** with depths asked for, **38% fewer** with a
+lens carrying 40 to 60 steps of play -- the more dead travel there is, the more
+there is to save. It ended within a step of where the unhurried search ended on
+every one of the 120, and gave away the same 0.1% of the best average. On
+readings made ten and thirty times grainier than that it still gave away no
+more on average than walking did (2.2% against 2.2% at the worst grain), though
+its unluckiest scene was worse -- which is what two increments bought over
+four, where the same test gave away nearly twice what walking did. On one real
+five-region frame, hurried in strides of two: **61 probes against 86 walked,
+and 91% of every region's own best either way** -- the same compromise, in
+five and a half minutes rather than seven.
+
+And what each stride is worth, over the same scenes with depths asked for --
+probes, and what the answer gave away against the best average any focus
+position gives:
+
+| Hurry in strides of | probes | given away | at the 99th percentile |
+|---|---|---|---|
+| off | 70 | 0.09% | 0.8% |
+| 2 increments | 45 | 0.11% | 0.8% |
+| 3 increments | 36 | 0.11% | 0.9% |
+| 4 increments | 33 | 0.12% | 1.2% |
+| 6 increments | 27 | 0.39% | 3.7% |
+| 8 increments | 24 | 1.11% | 7.6% |
+
+Two to four are near enough free; six upwards starts costing real sharpness,
+and its unluckiest scene in a hundred costs several per cent. That is why the
+number is a setting rather than a decision made here: how long a stride can be
+before it tells on the answer depends on the lens and on how deep the subject
+is, and 2 was settled on one rig with one kind of film in it.
+
+What it costs even at two is the risk it is off by default for: a top no wider
+than a stride can be stepped over without the search seeing it, and a depth
+read off a coarsely sampled curve is placed less finely, which the doubt
+printed beside it says. So it is for calibrating frames on a slow rig, and a
+levelling run is better off without it.
+
+### What stops it
+
+Taking the focus by hand, magnifying, moving the measured area, changing the
+integration, changing any camera setting, or stopping live view. All of them
+mean the next reading would be of a different picture from the last one, and
+comparing across that is exactly the mistake the whole thing is made of. The
+button says **Stop** while it is running.
+
+## One focus for several places: focus regions
+
+Fine tuning answers where one rectangle is sharpest. A frame of film is not one
+rectangle: it curls, it sags in the carrier, and the lens has a curved field,
+so the corners and the middle come into focus at slightly different places --
+and there is only one focus position to give them. What is wanted is not how
+far apart they are but **the position that does best by all of them together**,
+and an honest account of what each of them gave up for it. `ui/regions.py` is
+that, `ui/report.py` shows it.
+
+Ctrl-drag the picture to draw a region round something that has to be sharp,
+up to five; ctrl-click inside one to take it away. They are remembered between
+runs, since a copy stand is set up once and scanned from for hours.
+**Calibrate** does two things, and the second only means anything because of
+the first:
+
+1. **Each region's best, by fine tuning on it alone.** What the Fine tune
+   button does -- magnified onto the region, the camera's autofocus aimed at
+   it, then walked in minimum steps until the reading has fallen away on both
+   sides of its best -- once per region. The best reading the walk saw is that
+   region's *peak*: the reading, and the picture of the region at that
+   moment. Along with where the camera was pointed when it read it, because a
+   reading is only comparable with another taken through the same crop at the
+   same magnification. It does *not* walk back to stand on the peak, as the
+   button does: the lens is walked somewhere else next anyway, and whatever
+   the walk back lands on becomes the yardstick every share of that region is
+   measured against. On a real calibration that was 7% short of the top, and
+   the compromise then read three regions of four at up to 113% of "their
+   best".
+2. **Then one position for all of them.** At every probe the camera is panned
+   to each region's view in turn -- panning moves the focus point and nothing
+   else, so every region is read at the one focus position -- and each is
+   read against its own peak. Those shares are combined into the one number
+   the search climbs, in the way **Aim for** says, chosen before it starts:
+   *the best average* of them, or *the best worst region* -- the softest one
+   made as sharp as it can be, whatever that costs the sharpest.
+
+When it finishes, focus is left on the compromise, the view is put back where
+it was, the regions are coloured by how near their best they ended up (green
+within 5%, amber within 15%, red further), and the **report** opens: every
+region at its own best and at the compromise, side by side at the same size
+with the numbers, so a person can look at what was possible and what was
+chosen rather than take a percentage's word for it. The pictures are shown
+the way the view is set -- turned, mirrored and inverted as the View panel has
+it now -- and enlarged pixel for pixel, never smoothed. The system bell
+sounds as it ends, unless it was stopped from the panel: it takes minutes, and
+whoever started it has usually gone to do something else.
+
+**Save report...** keeps the whole report as one `.focusreport` file, to be
+opened again with **File > Open focus report** (Ctrl+O) -- each in a window of
+its own, so an old one can be set beside the one just made. It is a zip
+archive: `report.json` holds every number the report has, `pictures/` every
+region at its best and at the compromise as it was cut out of the live view,
+`activity.log` everything said while the calibration ran, and `readings.csv`
+**every reading of every region it took**, one to a row -- which region, which
+part of the calibration (`tune`, or the search's `out`, `across`, `home`,
+`climb`), the step count, the reading, the seconds since the calibration began,
+the seconds since the lens last moved, and the grain taken off it with the mean
+level it was read at, which together give back the picture's gradient energy
+(`value * level² / 1000 + 4 * grain`) and so what the reading would have been
+with any other grain taken off -- for a spreadsheet, when a number in the
+report wants explaining. That is how the grain being shared between regions was
+found. Opened again, it is the same report, pages and
+3D film included, shown the way the view is set now. **Save page as
+picture...** keeps the page on show as a PNG.
+
+While it runs, the panel keeps a clock of how long it has been going and says
+what it is doing, and once the compromise is being sought it charts **every
+region's sharpness, one line each**, as a share of its own best, with the
+combined number dashed over them and what the search was doing shaded
+behind -- so region 1 coming to its best and going over it while region 2 is
+still climbing can be watched, not guessed from the one number. The report
+says what it all took: the time, each region's fine-tune probes, the
+compromise's, and how many focus moves and drive steps that came to.
+
+The report has four pages. **Regions** is the pictures. **Film shape** is what
+levelling the film needs: **how far apart in focus the regions are**, in drive
+steps, nearest first with the doubt on each -- `1 nearest,  3 +42 ±2,  2 +95
+±3` -- and the film itself, drawn in three dimensions over the sensor: each
+region's rectangle on the sensor, a line up from it to where that region is
+on the film, and the film bent through those points. Drag it round, scroll to
+come closer; the height is exaggerated, since the depths are drive steps and
+have no length in common with the frame. **The search** is the chart of every
+region, full size. **Activity log** is everything said while it ran.
+
+### The film is foil, held at its edges
+
+A frame of film in a holder is not a plane. The holder grips it along its four
+sides, which lie more or less on a plane -- one that may lean against the
+sensor, which is what levelling corrects -- and inside them the film is free
+to bow towards the lens or away from it. So that is the shape fitted to the
+depths: **a plane for the edges, and a bulge that is nothing at the edges**,
+made of the shapes a sheet clamped along its sides takes, and the gentlest of
+those that passes through every measured depth -- each weighted by how much
+bending it costs, so nothing is invented between the regions that they do not
+ask for. Three regions are always a plane, so it takes a fourth -- one in the
+middle says most -- to see the bow at all.
+
+That separation is the point of it. A plane pulled through all the regions,
+the obvious fit, leans the wrong amount as soon as one of them is on a bow:
+the holder tips the edges, not the middle. So what the report gives as the
+lean to correct is the **edges'** -- how much further the right edge focuses
+than the left and the bottom than the top, in the picture's directions as it
+is shown, with the doubt on each carried through from the depths -- and,
+separately, how far the film bows between them, which no levelling removes.
+The edges are taken to be the picture's: true when the film frame fills the
+camera's frame, as a copy stand is set up to.
+
+### Depth, when it is asked for, and why it can be trusted
+
+Depths cost walking the compromise does not need, so they are asked for:
+**Measure depths for levelling**, off out of the box. Levelling is done once,
+when the stand is set up, and frames are calibrated many times after. With it
+on, the walks go on past the turn-back line until every region has fallen a
+quarter below its best on both sides of its peak -- far enough to place the
+peak to a step or two, where a sixth left the worst five steps out -- and no
+further than twenty-five increments for that. With it off, the report's Film
+shape page says how to get them rather than showing a few that happened to
+be measured.
+
+The search's walk across (below) crosses every region's peak in one
+direction. Within one direction the steps are honest -- the play in the
+gearing was taken up at the start of the walk and stayed taken up -- so where
+on it each region peaked is its depth against the others. The play moves every
+position on that walk by the same amount, which is why only the differences
+are reported: they are the answer, and the positions themselves mean nothing.
+This is the same reasoning the old point scan was built on, without its
+parking or its bracket, because the walk across was happening anyway.
+
+Two things were needed to make the number worth levelling by. The walk has to
+take in the **top** of each region's curve with some of both its sides, not
+just its peak: the depth is the middle of that top, drawn at the same height
+on both sides so that it stays symmetrical, and a curve cut off on one side
+has a middle pulled towards the cut. That is what the quarter's fall on each
+side is for, whether or not the compromise needs that region -- a region a
+little outside the others is still one the film is levelled by. And each
+depth carries its doubt, worked out from the grain on the readings
+themselves, and the lean carries that doubt through the fit, so a lean
+smaller than it can tell is called level. Against made-up scenes of regions
+on one frame, with up to sixty steps of play and 2% grain on every reading,
+depths came back within two steps of the truth, most within a fraction of
+one, for about a dozen more probes than the compromise alone.
+
+**Which way is further is the drive's word, not a measurement.** The focus
+drive's two directions are named nearer and further after Nikon's usual
+convention, and `camera/nikon.py` could not confirm from live view which way
+a lens actually turns. Before levelling by the report, drive focus a few
+steps further with `>` and check that the edge it says is further is the one
+that sharpens. The steps are the lens's, too: how much film height one of
+them is depends on the lens and the magnification, and a shim of known
+thickness under one edge, calibrated again, is the way to find out.
+
+### Shares of each region's own best, not the readings
+
+A reading has no units: its size is set by how much detail is in the box and
+how bright it is. Averaging raw readings would hand the compromise to
+whichever region has the most texture in it, and a faint region would count
+for nothing. As shares of their own peaks, every region has the same say.
+
+The two ways of combining them part company when regions are further apart
+in focus than each is deep. The best average can then be one region's own
+peak, with the others well short of theirs; the best worst region never
+sacrifices one, and pays for that in the average. Both only ever go up when a
+single share does, so the search is the same for either.
+
+**A region's peak can go up while the search runs.** Its peak is the best it
+has read *anywhere* -- its fine tune, or any probe of the search -- and the walk
+across crosses every region's peak, read the same way every later reading
+is. A region the search reads higher than its fine tune did has that for its
+peak from then on, picture and all, and the log says so. It matters beyond
+the report showing more than 100%: a peak read low makes that region's share
+too big, so the average leans towards it and the worst region protected may
+not be the one that needs it. Everything the search judges by is worked out
+again from the readings with the new peak; only the way home keeps the peaks
+it set out with, since it matches readings against a profile and a profile has
+to hold still. The report measures everything against the peaks as they
+finally stood, and where one was raised it says by how much, next to what the
+fine tune alone found.
+
+With each region's readings taken with its own grain off, raising a peak
+should now be a matter of the grain on a reading -- a per cent or so. A region
+the search reads several per cent above its fine tune is saying that something
+about the two measurements still differs, and `readings.csv` is where to look:
+the grain and the level are on every row, so the readings can be worked out
+again with the same grain taken off both.
+
+### Why the compromise is not a fine tune on the average
+
+That was the first version, and two things about the average that are not
+true of one region's reading each cost it something real.
+
+**It can have more than one hill.** A region's reading against focus has one
+peak. The average of several has one per region wherever the regions are
+further apart than each is deep, and a climb finds the hill it starts on --
+which, started as it has to be on the last region's own peak, is that
+region's, when the hill in the middle serves all of them better. Against a
+simulated rig with three regions sixty steps apart, the climb stood on 40%
+where 44% was there to be had.
+
+**Its top is flat.** Several peaks side by side add up to a broad top whose
+readings are within a per cent of each other over many steps. A fine tune
+walks home until the reading is within a per cent of the best it saw, which
+on one region's steep peak is the top -- and on the average's flat top is its
+edge. Two regions eighty steps apart came back as 85% and 42% where the
+middle had both at 64%.
+
+So the search is three legs, and none of them counts a step across a reversal:
+
+- **Out**, one way until it is plainly the wrong way: the number being
+  climbed has fallen below **Turn back below** -- 80% out of the box -- of the
+  best it reached on this walk, and it turns at the first reading under that
+  line. The one thing it waits for is a region *visibly climbing* towards its
+  own best, and then only ten increments: that is how a hill just beyond a
+  valley is still found. **Both of the waits end at once where the reading
+  has collapsed** -- under a tenth of what the leg has read. A region that
+  reads nothing above its own grain can never be seen to climb and has no
+  peak to place, so a walk waiting for either of those is waiting for
+  something that cannot happen: one real calibration, with a region that read
+  nothing where the walks went, spent twenty probes at a fiftieth of its best
+  for it, each of them a pan to every region and a wait for a picture with
+  nothing in it. Measured against the best of *that leg*, which is what makes
+  it safe on the leg across -- that leg sets off from the softest reading
+  there is, so nothing is under a tenth of it and it crosses the regions as
+  it must. It used to walk on while anything ahead could in
+  principle beat the best so far, and then until every region had fallen well
+  below its own best for the sake of the depths -- which is how a walk told
+  to turn back at 80% was seen going on to where the sharpest region was at
+  38% of its best, waiting for three broad ones around it to fall. On one
+  frame of film turning back at 80% loses nothing and saves about a third of
+  the probes; set it lower only when regions are so far apart in focus that
+  the best compromise lies beyond a valley where they are all soft. Regions
+  so far apart that each reads nothing where another is sharp are beyond any
+  walk: nothing on the way says there is anything further on.
+- **Across**, back the other way until the same holds. That one leg crosses
+  every region's peak in a single direction, so its steps are honest -- the
+  play was taken up at its start -- and it is a true profile of the average
+  against focus. Its best is the best of all of it, found as the middle of
+  its top by a weighted middle of the readings on it -- with the top drawn
+  near the top: a line half way down took in enough of a lopsided top to pull
+  its middle several steps off the best.
+- **Home**, back again. The way home retraces the profile, but how much play
+  was taken up first is not known, and it is the one number the walk needs.
+  So it is measured: every reading on the way home is matched against the
+  profile, and the play is whatever lines them up -- the arithmetic the fine
+  tune now goes home by as well (`ui/homing.py`). The walk goes on an
+  increment at a time, matching again with every reading, until the best is
+  less than half an increment away. If the reading there does not agree --
+  the top was one increment wide, or the walk passed the best before it could
+  tell -- the walk home is itself an honest profile, and it goes home again
+  from that; only after that does a fine tune take over and climb the hill it
+  is next to.
+
+Against made-up scenes of two to five regions at random depths, with up to
+sixty steps of play and 2% grain on every reading, it ends on average 0.2%
+short of the best average any focus position gives, 1.3% at the 99th
+percentile. The worst region is harder, because its top is a point where two
+regions' curves cross: an increment off it, which the play can make
+unavoidable, costs more there, and it ends on average 0.9% short. It takes
+about sixty probes, each a pan and a stack per region -- a few minutes for
+three regions magnified.
+
+### Hurrying through focus no compromise can be in
+
+Every probe of the compromise costs a pan to each region and a wait for the
+picture to settle, and a good many of them are spent on ground where every
+region is soft -- the walk across has the whole of the stretch the walk out
+covered to recross before it reaches the first region's hill. **Hurry through
+soft focus**, off out of the box, has the two walks take four increments at a
+step through that ground and single increments as they come up to the best,
+where the answer is actually decided. Soft means either of two things: the
+number being climbed has fallen below four fifths of the best read anywhere,
+or it is under half whatever has been read -- the second because a walk
+climbing ground it has never seen reads its own best at every step, so nothing
+is ever four fifths of it, and that is the very stretch a fine tune that left
+the lens somewhere bad has to get out of.
+
+**It never carries a walk further than it would have gone.** Every limit that
+stops a walk -- the turn-back line's two patiences, and the longest a leg may
+be -- is a distance in increments, not a number of probes. That is not a
+detail: while every step was one increment the two were the same number, and
+counting probes is how the first version of this went wrong. Told to hurry, a
+rig that had walked 156 steps out and 228 across walked 672 and 1230 -- four
+times as far, out into focus where nothing reads at all, since each probe of
+its patience was now worth four increments -- and then crawled the whole of it
+back an increment at a time, because the way home does not hurry. It took 206
+probes where the same rig had taken 86, and most of them read nothing. The
+strides are there to cross the same ground in fewer probes.
+
+The stride is four times the increment the walk is made in, which is the
+lens's minimum, so it scales with the lens. It goes no higher because a
+stride is the one thing that can step clean over a hill: the average of
+several regions is broader than any one of them, but a magnified region's top
+can be a single increment wide and two regions nearly on top of each other
+add up to little more. And **two readings in a row have to agree that the
+ground is soft** before the pace changes: where a region's reading swings by
+half between one probe and the next, one reading puts the pace anywhere, and
+the walk strides over good ground and creeps across dead ground in the same
+leg.
+
+**The way home hurries too, and on distance rather than on what it reads.**
+It has to, and this is the part the first attempt got wrong: the two walks are
+two thirds of the probes and the strides cut them to a quarter, and the way
+home gave every bit of it back by retracing at single increments what the
+strides had crossed four at a time. On one rig the two walks took 24 probes
+where they had taken 66 -- and the way home took 70 where it had taken 20.
+What the beginning of the way home is, on a lens with play in it, is *dead
+travel*: until the play is taken up the optics have not moved, every reading
+says what the far end of the stretch said, and there is nothing in any of
+them to be had by taking them an increment apart. So it strides while the
+play worked out so far says there is a long way still to go, and walks the
+last two increments and the arrival exactly as it always did. The fine tune
+that takes over when the way home is lost is never hurried at all.
+
+What it is worth, across 120 made-up scenes of two to five regions with up to
+twenty steps of play and 2% grain on the readings: **24% fewer probes** as the
+search comes set up, **40% fewer** with depths asked for, and **47% fewer**
+with a lens carrying 40 to 60 steps of play -- the more dead travel there is,
+the more there is to save. It gave away 0.1% of the best average on average
+and 2.0% at the worst, against 0.1% and 1.5% unhurried, and ended within a
+step of where the unhurried search ended on every scene. On the model of a
+five-region rig with one region that reads nothing, it took 35 probes against
+67.
+
+What it costs is the risk it is off by default for. A top no wider than a
+stride can be stepped over without the search seeing it; a depth read off a
+coarsely sampled curve is placed less finely, which the doubt printed beside
+it says; and it wants readings that hold still. That last is measurable: at
+2% and 10% grain hurried and unhurried give away the same, but where the
+readings swing by a third hurrying gives away about twice what walking does
+(7% of the best average against 4%). A rig whose readings are that unsteady
+has a worse problem than the time the search takes -- see **View > Activity
+log** and the `readings.csv` in a saved report, where the grain taken off
+every reading is written down.
 
 ### What stops it
 
@@ -1666,8 +2121,10 @@ Switched off, the camera's own names are kept, and a collision is decorated
   compromise cost them, and the **Report** shows each region at its best and
   at the compromise side by side, with how far apart in focus they are and
   how the frame leans. **Aim for** chooses, before it starts, between the
-  best average and the best worst region, and **Turn back below** how far a
-  walk goes the wrong way before it turns round. It takes a few minutes;
+  best average and the best worst region, **Turn back below** how far a
+  walk goes the wrong way before it turns round, and **Hurry in strides of**
+  how many increments a step is worth while every region is soft -- off, or
+  two to start from. It takes a few minutes;
   anything you do to the focus or the view stops it, live view going off does
   not, and **View > Activity log** says what it did. The system bell sounds
   when it ends by itself, finished or stopped by trouble, but not when you
@@ -1729,5 +2186,3 @@ They need no camera attached.
 
 
 ## TODO
-- 3d looks buggy
-- sometimes calibrated compromise shows actually better sharpness than initially found "best" fine tuned.

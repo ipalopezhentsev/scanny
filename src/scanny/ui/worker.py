@@ -27,7 +27,15 @@ from .hunt import FineTune
 from .integration import FrameIntegrator
 from .naming import NameSequence, unique
 from .pixels import green
-from .regions import OBJECTIVES, Calibration, Look, Region, View, cut_out
+from .regions import (
+    HURRY_BELOW,
+    OBJECTIVES,
+    Calibration,
+    Look,
+    Region,
+    View,
+    cut_out,
+)
 from .sharpness import (
     QUANTISATION,
     GrainMemory,
@@ -1808,13 +1816,14 @@ class CameraWorker(QObject):
         )
         self.calibrationReady.emit(None)
 
-    @Slot(int, str, int, bool, object)
+    @Slot(int, str, int, bool, int, object)
     def start_calibration(
         self,
         step: int,
         objective: str = "average",
         turn_back: int = 80,
         depths: bool = False,
+        hurry: int = 1,
         panel: object = None,
     ) -> None:
         """Find each region's best, then the one focus that does best by all.
@@ -1826,7 +1835,11 @@ class CameraWorker(QObject):
         search turns round; see :data:`scanny.ui.regions.TURN_BACK`. With
         *depths*, the walks also go far enough to place every region's peak,
         for the depths and the film's shape -- which costs walking the
-        compromise itself does not need. See
+        compromise itself does not need. *hurry* is how many increments a
+        step is worth while the average sharpness is under
+        :data:`scanny.ui.regions.HURRY_BELOW` -- one for no hurrying at all,
+        which is what it does unless asked; see
+        :meth:`scanny.ui.regions._Search._hurrying`. See
         :mod:`scanny.ui.regions` for the two phases, and why the second one
         walks rather than drives.
 
@@ -1859,6 +1872,7 @@ class CameraWorker(QObject):
             objective=objective,
             turn_back=turn_back / 100.0,
             depths=depths,
+            hurry=hurry,
         )
         self._view_restore = (self._zoom_level, frame.af_x, frame.af_y)
         # Regions are kept by number, and these are not the last calibration's.
@@ -1877,6 +1891,11 @@ class CameraWorker(QObject):
             f"{OBJECTIVES[objective].lower()}, turning back below "
             f"{self._calibration.turn_back:.0%}, in steps of {step}"
             + (", measuring depths" if depths else "")
+            + (
+                f", hurrying in strides of {self._calibration.hurry} increments"
+                if self._calibration.hurries
+                else ""
+            )
         )
         self._log_settings(camera, frame, panel)
         self._tune_region()
@@ -1918,6 +1937,13 @@ class CameraWorker(QObject):
             put("Calibration", "turn back below", f"{run.turn_back:.0%} of the best")
             put("Calibration", "walk in steps of", run.step)
             put("Calibration", "measure depths for levelling", _yes(run.measures_depths))
+            put(
+                "Calibration",
+                "hurry through soft focus",
+                f"strides of {run.hurry} increments below {HURRY_BELOW:.0%}"
+                if run.hurries
+                else "off",
+            )
 
         put("Camera", "model", _ask(lambda: camera.model))
         put("Camera", "firmware", _ask(lambda: camera.firmware))

@@ -53,6 +53,9 @@ from .navigator import NavigatorWidget
 from .orientation import Orientation
 from .regionchart import RegionChart
 from .regions import (
+    HURRY_BELOW,
+    HURRY_RANGE,
+    HURRY_STRIDE,
     MAX_REGIONS,
     OBJECTIVES,
     TURN_BACK,
@@ -262,8 +265,9 @@ class MainWindow(QMainWindow):
     #: Calibrate them, walking in this many drive steps -- the lens minimum --
     #: aiming for one of scanny.ui.regions.OBJECTIVES, turning a walk back
     #: once it has fallen below this percentage of its best, measuring depths
-    #: or not -- and the settings only the panel knows, for the log.
-    requestCalibration = Signal(int, str, int, bool, object)
+    #: or not, striding through soft focus in this many increments (one for
+    #: not hurrying) -- and the settings only the panel knows, for the log.
+    requestCalibration = Signal(int, str, int, bool, int, object)
     requestCalibrationCancel = Signal()
     #: Naming for downloaded pictures: on, the prefix, and the next number.
     #: Sent whole on every change, since an override may touch any of them.
@@ -1235,6 +1239,63 @@ class MainWindow(QMainWindow):
         )
         column.addWidget(self.regions_depths)
 
+        # Off out of the box: a stride is the one thing that can step clean
+        # over a hill, so it is offered rather than done. A number rather than
+        # a tick, because how long a stride can be before it tells on the
+        # answer depends on the lens and the subject, and two was settled on
+        # one rig with one kind of film in it.
+        hurry = QHBoxLayout()
+        hurry.setContentsMargins(0, 0, 0, 0)
+        hurry.addWidget(QLabel("Hurry in strides of"))
+        self.regions_hurry = QSpinBox()
+        self.regions_hurry.setRange(*HURRY_RANGE)
+        self.regions_hurry.setSuffix(" increments")
+        self.regions_hurry.setSpecialValueText("off")
+        self.regions_hurry.setValue(self._stored_hurry())
+        self.regions_hurry.setToolTip(
+            "One rule, while it looks for the compromise: below "
+            f"{HURRY_BELOW:.0%} average sharpness a step is this many "
+            "increments, at or above it a step is one. An increment is the "
+            "minimum increment above, so the stride scales with whatever you "
+            "have that set to -- and the line is a fixed share of what each "
+            "region managed on its own, the same number shown while the "
+            "search runs. It takes two readings under the line to start "
+            "striding and one at or above it to stop.\n\n"
+            f"{HURRY_STRIDE} is the number to start from. What each one costs, "
+            "over made-up scenes of two to five regions with depths asked "
+            "for, measured against the best average any focus position "
+            "gives:\n"
+            "    off            70 probes,  0.09% given away\n"
+            "    2 increments    45 probes,  0.11%\n"
+            "    3 increments    36 probes,  0.11%\n"
+            "    4 increments    33 probes,  0.12%\n"
+            "    6 increments    27 probes,  0.39%\n"
+            "    8 increments    24 probes,  1.11%\n"
+            "So 2 to 4 are near enough free and 6 upwards starts costing "
+            "real sharpness -- and one scene in a hundred costs several per "
+            "cent at 6, which is why the number is yours rather than "
+            "mine.\n\n"
+            "The way home strides as well, but by distance: until the play "
+            "in the lens is taken up the optics have not moved and every "
+            "reading says the same thing, so that part is crossed in "
+            "strides, and the last two increments and the arrival are walked "
+            "exactly as they always were. The fine tunes on each region, and "
+            "climbing when the way home is lost, are never hurried.\n\n"
+            "On a real five-region frame of film, strides of two read the "
+            "same compromise as walking did -- 91% of every region's own "
+            "best either way -- in 61 probes against 86.\n\n"
+            "What it risks is a narrow hill: a top no wider than a stride "
+            "can be stepped over without the search seeing it, and a depth "
+            "read off a coarsely sampled curve is placed less finely, which "
+            "the doubt on it says. Leave it off for a levelling run."
+        )
+        self.regions_hurry.valueChanged.connect(
+            lambda value: QSettings().setValue("regions/hurry", value)
+        )
+        self.regions_hurry.editingFinished.connect(self.view.setFocus)
+        hurry.addWidget(self.regions_hurry, 1)
+        column.addLayout(hurry)
+
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
         self.calibrate_button = QPushButton("Calibrate")
@@ -1272,6 +1333,23 @@ class MainWindow(QMainWindow):
         return box
 
     # -- drawing and showing them ------------------------------------------
+
+    @staticmethod
+    def _stored_hurry() -> int:
+        """How long a stride was left set to, in increments; 1 for off.
+
+        It was a tick before it was a number, so a remembered ``true`` means
+        somebody had hurrying on and wants it on: that is the stride the tick
+        stood for. Anything unreadable is off.
+        """
+        stored = QSettings().value("regions/hurry", HURRY_RANGE[0])
+        if isinstance(stored, str) and stored.lower() in ("true", "false"):
+            return HURRY_STRIDE if stored.lower() == "true" else HURRY_RANGE[0]
+        if isinstance(stored, bool):
+            return HURRY_STRIDE if stored else HURRY_RANGE[0]
+        return _stored_int(
+            QSettings(), "regions/hurry", HURRY_RANGE[0], *HURRY_RANGE
+        )
 
     @staticmethod
     def _stored_regions() -> "list[tuple[float, float, float, float]]":
@@ -1384,6 +1462,7 @@ class MainWindow(QMainWindow):
         self.regions_objective.setEnabled(not self._calibrating)
         self.regions_turn_back.setEnabled(not self._calibrating)
         self.regions_depths.setEnabled(not self._calibrating)
+        self.regions_hurry.setEnabled(not self._calibrating)
         self.report_button.setEnabled(report is not None)
 
     def _draw_regions(self) -> int:
@@ -1430,6 +1509,7 @@ class MainWindow(QMainWindow):
             str(self.regions_objective.currentData()),
             self.regions_turn_back.value(),
             self.regions_depths.isChecked(),
+            self.regions_hurry.value(),
             self._panel_settings(),
         )
 

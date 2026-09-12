@@ -78,6 +78,12 @@ _ENOUGH_ON_THE_WAY = 1
 #: increment, so that rounding it is not where the error comes from.
 _PLAY_RESOLUTION = 0.5
 
+#: How many increments of the way home are always walked one at a time,
+#: however far there is to go: see :meth:`WayHome.stride`. Two, because the
+#: arrival is judged by the reading against the profile, and one increment of
+#: warning is one reading of warning.
+_CLOSE_IN = 2
+
 #: How far below the top the stretch saw the reading may be where the way
 #: home ends, before it is not believed to be there. Well outside the grain;
 #: well inside what one increment off the top of a steep hill costs.
@@ -115,6 +121,25 @@ def run_around_top(read: "list[float]", level: float) -> "tuple[int, int]":
     return first, last
 
 
+def _spacing(where: np.ndarray) -> np.ndarray:
+    """How much travel each reading stands for: half way to either neighbour.
+
+    One when there is nothing to compare with, so a single reading or an
+    evenly walked stretch is weighted exactly as it was before this existed.
+    """
+    if len(where) < 2:
+        return np.ones(len(where))
+    span = np.empty(len(where))
+    span[0] = abs(where[1] - where[0])
+    span[-1] = abs(where[-1] - where[-2])
+    if len(where) > 2:
+        span[1:-1] = np.abs(where[2:] - where[:-2]) / 2.0
+    average = float(np.mean(span)) or 1.0
+    # Relative to the average, so that the weights stay of the same size as
+    # the readings' own and the arithmetic below is unchanged by the units.
+    return np.maximum(span / average, 1e-9)
+
+
 def middle_of_top(
     where: "list[int]", read: "list[float]", level: float
 ) -> "float | None":
@@ -131,13 +156,22 @@ def middle_of_top(
     within the grain of the others, and which is highest is the grain's
     choice. A top of three is found as the parabola through them, which is
     the better estimator when the hill is narrow against the step.
+
+    **And weighted by how much travel each reading stands for**, which is one
+    where the stretch was walked evenly and is not where it was not. A walk
+    told to hurry takes strides through soft focus and single increments near
+    the best, so a leg can arrive here with one spacing on one side of its top
+    and another on the other -- and a plain middle of such a run is pulled
+    towards whichever side was walked finely, because three closely spaced
+    readings outvote one stride-spaced reading that stands for the same
+    ground. Where the spacing is even this changes nothing at all.
     """
     if not read:
         return None
     first, last = run_around_top(read, level)
     xs = np.array(where[first : last + 1], dtype=float)
     ys = np.array(read[first : last + 1], dtype=float)
-    weights = ys - level
+    weights = (ys - level) * _spacing(xs)
     total = float(weights.sum())
     centre = float((xs * weights).sum() / total) if total > 0.0 else float(xs.mean())
     if len(xs) != 3 or np.ptp(xs) <= 0.0:
@@ -201,9 +235,35 @@ class WayHome:
         back = np.abs(where - end)[::-1]
         return cls(back, read[::-1], abs(best - end), unit)
 
-    def drive(self) -> None:
-        """One increment further home is being driven."""
-        self.travel += self._unit
+    def drive(self, stride: int = 1) -> None:
+        """*stride* increments further home are being driven."""
+        self.travel += self._unit * max(1, int(stride))
+
+    def stride(self, most: int = 1) -> int:
+        """How many increments to drive next, taking at most *most*.
+
+        One, always, unless there is plainly a long way still to go. The way
+        home is what lands on the answer, so the end of it is walked an
+        increment at a time whatever the caller would like -- but the
+        beginning of it need not be. What the beginning is, on a lens with
+        play in it, is dead travel: until the play is taken up the optics have
+        not moved, every reading says what the far end of the stretch said,
+        and there is nothing in any of them to be had by taking them one
+        increment apart.
+
+        *left* is what the play worked out so far says there is still to go,
+        and it is honest in both halves of the journey: while the optics have
+        not moved the fit puts the play at everything driven so far, so left
+        stays at the whole distance home; once they are moving it is pinned,
+        and left counts down. Two increments are kept in hand so that the
+        last of the way, where the reading is matched against the profile
+        step by step, is walked the way it always was.
+        """
+        if most <= 1:
+            return 1
+        left = self.play() + self.best_at - self.travel
+        room = int(left // self._unit) - _CLOSE_IN
+        return max(1, min(int(most), room))
 
     def heard(self, reading: float) -> str:
         """What it read after the last increment: ``on``, ``home`` or ``lost``.

@@ -60,8 +60,12 @@ _NAMES = 170
 _SPACING = 12
 _WHOLE = _NAMES + 2 * _SHOWN + 2 * _SPACING
 
-#: How wide the notes beside the film's shape are.
-_NOTES = 300
+#: How tall the notes under the film's shape are let grow before they scroll,
+#: and the room left around them. Under it and not beside it: beside it they
+#: took a third of the width off the drawing, and the drawing is the thing on
+#: the page that is meant to be looked at.
+_NOTES_TALL = 210
+_NOTES_ROOM = 12
 
 #: Said under the depths every time, because it is the one thing about them
 #: that nothing here can find out, and levelling the wrong way doubles a tilt.
@@ -187,12 +191,12 @@ class CalibrationReportDialog(QDialog):
         self._tabs.addTab(self._scroller, "Regions")
 
         self._film_page = QWidget()
-        film = QHBoxLayout(self._film_page)
+        film = QVBoxLayout(self._film_page)
         self._film_view = FilmView()
         film.addWidget(self._film_view, 1)
         self._film_notes = QScrollArea()
         self._film_notes.setWidgetResizable(True)
-        self._film_notes.setFixedWidth(_NOTES + 24)
+        self._film_notes.setFrameShape(QScrollArea.Shape.NoFrame)
         film.addWidget(self._film_notes)
         self._tabs.addTab(self._film_page, "Film shape")
 
@@ -266,7 +270,7 @@ class CalibrationReportDialog(QDialog):
         wanted = self._content.sizeHint()
         bar = self._scroller.verticalScrollBar().sizeHint().width()
         margins = self.layout().contentsMargins()
-        width = max(wanted.width() + bar, 480 + _NOTES) + margins.left() + margins.right() + 16
+        width = max(wanted.width() + bar, _WHOLE) + margins.left() + margins.right() + 16
         height = (
             max(wanted.height(), 460)
             + self._summary.sizeHint().height()
@@ -338,6 +342,17 @@ class CalibrationReportDialog(QDialog):
         self._content = content
         self._scroller.setWidget(content)
 
+    def _show_film_notes(self, notes: QWidget) -> None:
+        """Put *notes* under the drawing, as tall as they are and no taller.
+
+        Short notes take only the room they need, long ones stop at
+        :data:`_NOTES_TALL` and scroll, and either way what is left of the
+        page goes to the drawing.
+        """
+        self._film_notes.setWidget(notes)
+        wanted = notes.sizeHint().height() + _NOTES_ROOM
+        self._film_notes.setFixedHeight(min(wanted, _NOTES_TALL))
+
     def _fill_film(self) -> None:
         """The film's shape, and what levelling needs to know about it.
 
@@ -356,6 +371,7 @@ class CalibrationReportDialog(QDialog):
             ],
             self._orientation,
             self._aspect,
+            report.focus_depth,
         )
         notes = QWidget()
         column = QVBoxLayout(notes)
@@ -371,9 +387,9 @@ class CalibrationReportDialog(QDialog):
                 "how far apart in focus the regions are, how the film's edges "
                 "lean and how far it bows -- it walks further to find out."
             )
-            column.addWidget(_wrapped(said, _NOTES, align=Qt.AlignmentFlag.AlignLeft))
+            column.addWidget(_wrapped(said, _WHOLE, align=Qt.AlignmentFlag.AlignLeft))
             column.addStretch(1)
-            self._film_notes.setWidget(notes)
+            self._show_film_notes(notes)
             return
         lines = ["<b>Depth</b>, in drive steps, on one walk across all of them:"]
         for one in placed:
@@ -390,8 +406,16 @@ class CalibrationReportDialog(QDialog):
                 lines.append(
                     f"Region {one.number}: its peak was not on the walk, so not measured"
                 )
+        if report.focus_depth is not None:
+            lines.append(
+                f"<br><b>Focus</b> was left {report.focus_depth:.0f} steps further "
+                "than the nearest of them -- the clear sheet in the drawing, "
+                "which is the plane the compromise brings into focus. What the "
+                "film does either side of that sheet is what the percentages "
+                "on the first page cost."
+            )
         column.addWidget(
-            _wrapped("<br>".join(lines), _NOTES, align=Qt.AlignmentFlag.AlignLeft)
+            _wrapped("<br>".join(lines), _WHOLE, align=Qt.AlignmentFlag.AlignLeft)
         )
         tilt = report.tilt(self._orientation)
         if tilt is not None:
@@ -404,17 +428,17 @@ class CalibrationReportDialog(QDialog):
                 "A lean needs three regions, not in a line, with their depths "
                 "measured; with fewer, only the differences above can be said."
             )
-        column.addWidget(_wrapped(said, _NOTES, align=Qt.AlignmentFlag.AlignLeft))
+        column.addWidget(_wrapped(said, _WHOLE, align=Qt.AlignmentFlag.AlignLeft))
         column.addWidget(_wrapped(
             "The shape is a plane for the edges and the gentlest bulge between "
             "them that passes through every region, the edges being taken as "
             "the edges of the picture. " + _WHICH_WAY,
-            _NOTES,
+            _WHOLE,
             "color: #888; font-size: 11px;",
             align=Qt.AlignmentFlag.AlignLeft,
         ))
         column.addStretch(1)
-        self._film_notes.setWidget(notes)
+        self._show_film_notes(notes)
 
     def _describe(self, result: RegionResult) -> QLabel:
         lines = [f"<b>Region {result.number}</b>"]

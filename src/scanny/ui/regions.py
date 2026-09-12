@@ -78,6 +78,9 @@ from .orientation import Orientation
 from .sharpness import format_reading
 
 __all__ = [
+    "HURRY_BELOW",
+    "HURRY_RANGE",
+    "HURRY_STRIDE",
     "MAX_REGIONS",
     "OBJECTIVES",
     "TURN_BACK",
@@ -493,6 +496,11 @@ class CalibrationReport:
     #: Whether the calibration was asked to walk far enough to place every
     #: region's peak. Without it there are no depths, rather than some.
     depths_measured: bool = False
+    #: Where the compromise was placed, in the depths' own steps -- so many
+    #: further than the nearest region -- or None when there is no walk across
+    #: to read it off, or the compromise settled at an end of it. The plane it
+    #: brings into focus, which the film's shape is to be judged against.
+    focus_depth: "float | None" = None
     #: When it began, in seconds since the epoch, or 0 if not known.
     began: float = 0.0
     #: Everything that was said while it ran, as the activity log has it.
@@ -754,6 +762,68 @@ TURN_BACK = 0.8
 #: The least and most the turn-back share may be set to.
 TURN_BACK_RANGE = (0.3, 0.95)
 
+#: How long a stride to start from, in increments: what the panel recommends
+#: under **Hurry in strides of**, and what the tick this setting used to be
+#: turns into. How long a stride actually is, is the user's -- see
+#: :data:`HURRY_RANGE`.
+#:
+#: A stride is a multiple of whatever increment the walk is made in -- the
+#: lens's minimum, the user's setting -- so it scales with the lens rather
+#: than with a number chosen here. Two of them is twelve drive steps on the
+#: six-step increment a D750 kit lens has.
+#:
+#: **Two, and it was four.** What a stride can do that an increment cannot is
+#: step clean over a hill: the average of several regions is broader than any
+#: one of them, but a magnified region's top can be a single increment wide
+#: and two regions nearly on top of each other add up to little more. On a
+#: real five-region calibration four was plainly too much -- it strode into
+#: the peak from one side and away from it on the other, leaving the leg
+#: sampled at one increment around the top and four everywhere else. Two
+#: halved the walking, read the same compromise as walking it did (91% both
+#: ways, 61 probes against 86), and is near enough to an increment that the
+#: profile a leg leaves behind is still an honest one.
+HURRY_STRIDE = 2
+
+#: The least and most a stride may be set to, as **Hurry in strides of**.
+#:
+#: One is no hurrying at all, which is what the search does unless asked. The
+#: top is loose rather than a judgement: past two the strides start to tell on
+#: the answer -- at four, readings a third grainy cost twice what walking them
+#: cost -- and somebody with a lens whose minimum increment is finer than a
+#: D750's, or a subject far deeper than a frame of film, has every right to a
+#: longer one. What it costs is written down beside it.
+HURRY_RANGE = (1, 8)
+
+#: The average sharpness below which a hurrying walk strides, and at or above
+#: which it walks single increments again.
+#:
+#: An **absolute** share of what the regions can each do -- the number the
+#: panel shows as a percentage while the search runs -- and not a share of the
+#: best the search has read so far. Both were tried against a real rig, and
+#: the moving reference is what made the pace flap: the best read anywhere
+#: goes up while the walk is walking, so the line it is judged against moves
+#: under it, and a walk strode into a peak from one side and away from it on
+#: the other in the same leg. A fixed line does not move, which is the whole
+#: point: below it the walk is in a valley and hurries out, at or above it the
+#: walk is where the answer is decided and steps as it always did.
+#:
+#: Four fifths is where a person watching the trend line puts it, and it is
+#: what was asked for. Where a scene tops out under it the walks stride
+#: throughout -- at two increments, and with the way home and the climb still
+#: walking the answer an increment at a time.
+HURRY_BELOW = 0.8
+
+#: How many readings in a row have to call the ground soft before a walk
+#: strides across it.
+#:
+#: One reading is not enough, and this is what a real calibration on unsteady
+#: readings showed: where a region's reading swings by half between one probe
+#: and the next, a single reading puts the pace anywhere, and the walk strides
+#: over good ground and creeps across dead ground in the same leg. Two in a
+#: row costs one probe at the top of every soft stretch and makes the pace
+#: mean something.
+_SOFT_ENOUGH = 2
+
 #: The most increments one leg may take, whatever the regions are doing.
 _LONGEST_LEG = 150
 
@@ -769,6 +839,24 @@ _NEAR_ITS_BEST = 0.7
 #: may serve every region better than the one behind. A handful, and no
 #: more.
 _CLIMB_PATIENCE = 10
+
+#: How far below the best of its own leg the number being climbed has to
+#: collapse for a walk to turn back at once, whatever it was waiting for.
+#:
+#: The two waits in :meth:`_Search._past` -- a region visibly climbing, and
+#: the depths -- are both waits for something to be *read*, and neither can be
+#: read in a picture with nothing above its own grain in it. A tenth of what
+#: the leg has seen is that: a region at a tenth of its best is not climbing
+#: towards anything and has no peak to place, so walking further into it buys
+#: nothing and costs a pan to every region and a wait for the picture at each
+#: step. A real calibration spent twenty probes at a fiftieth of its best
+#: because a region that read nothing at all could never satisfy the depths.
+#:
+#: Against the best of *this leg*, which is what makes it safe on the leg
+#: across: that leg sets off from the collapsed far end of the leg out, where
+#: the best it has read is the reading it is standing on, so nothing is under
+#: a tenth of it and the walk crosses the peaks as it must.
+_GIVE_UP = 0.1
 
 #: What *visibly climbing* is: a region at the best it has read on this walk
 #: that has risen by this share of its own best over the last few readings.
@@ -848,6 +936,14 @@ class _Search:
     everything the walk judges by is worked out again from the readings.
     Only the way home is judged by the bests as they stood when it set out:
     it matches readings against a profile, and a profile has to hold still.
+
+    **It may be told to hurry through focus no compromise can be in.** Asked
+    to, the two walks take a stride of several increments (*hurry*) while the
+    number they are climbing is well below the best read anywhere, and go back
+    to single increments as they come up to it -- so the ground where the
+    answer is decided is walked exactly as it always was, and the soft ground
+    either side of it is crossed in a quarter of the probes. The way home and
+    the climb never hurry; see :meth:`_hurrying`.
     """
 
     def __init__(
@@ -859,6 +955,7 @@ class _Search:
         longest: int = _LONGEST_LEG,
         turn_back: float = TURN_BACK,
         depths: bool = False,
+        hurry: int = 1,
     ) -> None:
         self._unit = abs(int(unit)) or 1
         self._objective = objective
@@ -872,6 +969,14 @@ class _Search:
         self._depths = bool(depths)
         self._longest = max(4, int(longest))
         self._turn_back = min(max(float(turn_back), TURN_BACK_RANGE[0]), TURN_BACK_RANGE[1])
+        #: How many increments a step of the walks is worth while what they
+        #: are climbing is plainly soft; one for no hurrying at all.
+        self._hurry = max(1, int(hurry))
+        #: How many increments the last step was worth, for saying so while
+        #: it runs.
+        self._stride = 1
+        #: How many readings in a row have said the ground here is soft.
+        self._soft = 0
         self._direction = 1
         self._state = "out"
         # Increments walked since the leg's number fell below the turn-back
@@ -903,6 +1008,11 @@ class _Search:
     @property
     def step_size(self) -> int:
         return self._unit
+
+    @property
+    def stride(self) -> int:
+        """How many increments the last step was worth: above one is hurrying."""
+        return self._stride
 
     @property
     def position(self) -> int:
@@ -948,20 +1058,38 @@ class _Search:
 
     def _walk(self, readings: "tuple[float, ...]") -> "Move | None":
         self._leg.append((self._position, readings))
-        if not (self._past(readings) or len(self._leg) > self._longest):
-            return self._drive()
+        if not (self._past(readings) or self._walked() > self._longest):
+            return self._drive(self._hurrying(readings))
         if self._state == "out":
             # The leg across begins where this one ended, with this reading.
             self._state = "across"
             self._direction = -self._direction
             self._leg = [self._leg[-1]]
             self._waited = 0
-            return self._drive()
+            return self._drive(self._hurrying(readings))
         self.survey = (
             np.array([position for position, _r in self._leg], dtype=float),
             np.array([self.shares(seen) for _p, seen in self._leg], dtype=float),
         )
         return self._turn_for_home(readings)
+
+    def _walked(self) -> int:
+        """How far this leg has come, in increments.
+
+        In increments and not in probes, which is the whole difference between
+        a walk that hurries and one that simply goes four times as far. Every
+        limit that stops a walk -- this one, and the two patiences in
+        :meth:`_past` -- is a distance, and each of them was being counted by
+        the probe because until there were strides the two were the same
+        number. They are not: told to hurry, a real calibration walked 672
+        steps out where it had walked 156, and 1230 across where it had walked
+        228, straight out into focus where nothing reads at all -- and then
+        crawled the whole of it back an increment at a time, because the way
+        home never hurries. It took 206 probes where the same rig had taken
+        86. The strides are meant to cross the same ground in fewer probes,
+        never to cross more of it.
+        """
+        return abs(self._position - self._leg[0][0]) // self._unit
 
     def _leg_top(self) -> float:
         """The best number this leg has read, by every region's best as it is now."""
@@ -994,11 +1122,33 @@ class _Search:
         for or not, and it is why a walk told to turn back at four fifths went
         on to where a sharp region was at a third of its best: the broad ones
         around it had barely begun to fall.
+
+        **Both of those waits end at once where the reading has collapsed.**
+        Under :data:`_GIVE_UP` of what this leg has read there is nothing
+        there to wait for: a region cannot be seen to climb in a picture with
+        nothing above its own grain in it, and a peak cannot be placed from
+        readings of nothing either, so the walk turns instead of walking on
+        into it. Measured against the best of *this leg*, which is what makes
+        it safe to apply to the leg across as well: that leg sets off from the
+        soft far end of the leg out, where the best it has read is the
+        collapsed reading it is standing on -- so nothing is under a tenth of
+        it, and the walk goes on and crosses the peaks as it must. Only once
+        the leg has seen something does falling to a tenth of it mean
+        anything.
+
+        A calibration whose walks had been carried a long way out reported
+        this as the real complaint: the number had been at a fiftieth of its
+        best for twenty probes, and every one of them was a pan to each region
+        and a wait for a picture with nothing in it.
         """
-        if len(self._leg) < 2 or self.score(readings) >= self._turn_back * self._leg_top():
+        top = self._leg_top()
+        if len(self._leg) < 2 or self.score(readings) >= self._turn_back * top:
             self._waited = 0
             return False
-        self._waited += 1
+        if self.score(readings) < _GIVE_UP * top:
+            return True
+        # In increments of travel, not in probes: see _walked.
+        self._waited += self._stride
         shares, best = self.shares(readings), self._leg_best()
         if self._depths:
             if all(self._seen(share, most) for share, most in zip(shares, best)):
@@ -1007,6 +1157,36 @@ class _Search:
         if self._rising(shares, best):
             return self._waited > _CLIMB_PATIENCE
         return True
+
+    def _hurrying(self, readings: "tuple[float, ...]") -> int:
+        """How many increments the next step of a walk is worth.
+
+        Two things decide it and nothing else: whether hurrying was asked for,
+        and whether the average sharpness here is under :data:`HURRY_BELOW`.
+        Under it the walk is in a valley, where no compromise is going to be
+        found and the only thing to be had is travel, so it strides; at or
+        above it the walk is where the answer is decided, and it steps exactly
+        as it would have without hurrying.
+
+        **One line, fixed, and not a share of the best read so far.** The
+        moving reference is what made the pace flap on a real rig: the best
+        read anywhere goes up while the walk walks, so the line moved under
+        it, and one leg strode into a peak from one side and away from it on
+        the other. Going back to single increments takes one reading at or
+        above the line; striding takes :data:`_SOFT_ENOUGH` under it, since
+        slowing down where it might matter is cheap and hurrying where it
+        might matter is not.
+
+        Only the walks out and across. The way home is paced by how far it
+        has left to go rather than by what it reads
+        (:meth:`~scanny.ui.homing.WayHome.stride`), and the climb that takes
+        over when the way home is lost is a fine tune, which takes the one
+        increment it was given on purpose -- see :mod:`scanny.ui.hunt`.
+        """
+        if self._hurry <= 1:
+            return 1
+        self._soft = self._soft + 1 if self.score(readings) < HURRY_BELOW else 0
+        return self._hurry if self._soft >= _SOFT_ENOUGH else 1
 
     def _seen(self, share: float, best: float) -> bool:
         """Whether this walk has gone far enough past a region to place its peak.
@@ -1081,15 +1261,34 @@ class _Search:
         return self._start_climb(readings)
 
     def _drive_home(self) -> Move:
+        """One step of the way home, which is where the strides are worth most.
+
+        The walks out and across are two thirds of the probes and the strides
+        cut them to a quarter -- and it was all given back here: a real
+        calibration's way home took seventy probes against the twenty-four the
+        two walks had taken, because it retraced at single increments a
+        stretch the strides had crossed four at a time, and then, on readings
+        that would not hold still, went home again twice more.
+
+        So the way home strides too, but on distance rather than on what it
+        reads: :meth:`~scanny.ui.homing.WayHome.stride` gives back what the
+        play worked out so far says there is still to go, less a couple of
+        increments kept in hand, and the last of the way -- where the reading
+        is matched against the profile and the answer is landed on -- is
+        walked exactly as it always was.
+        """
         assert self._way is not None
-        self._way.drive()
-        return self._drive()
+        stride = self._way.stride(self._hurry)
+        self._way.drive(stride)
+        return self._drive(stride)
 
     # -- when the way home is lost -----------------------------------------
 
     def _start_climb(self, readings: "tuple[float, ...]") -> "Move | None":
         self._state = "climb"
         self._held = list(self.peaks)
+        # A fine tune drives itself, in the one increment it was given.
+        self._stride = 1
         self._climb = FineTune(self._unit, autofocus=False)
         return self._climbing(readings)
 
@@ -1103,8 +1302,9 @@ class _Search:
 
     # -- driving -----------------------------------------------------------
 
-    def _drive(self) -> Move:
-        steps = self._direction * self._unit
+    def _drive(self, stride: int = 1) -> Move:
+        self._stride = max(1, int(stride))
+        steps = self._direction * self._unit * self._stride
         self._position += steps
         return Move(steps=steps)
 
@@ -1136,6 +1336,7 @@ class Calibration:
         clock: "Callable[[], float]" = time.monotonic,
         turn_back: float = TURN_BACK,
         depths: bool = False,
+        hurry: int = 1,
     ) -> None:
         if not regions:
             raise ValueError("nothing to calibrate")
@@ -1147,6 +1348,10 @@ class Calibration:
         self._longest = longest
         self._turn_back = min(max(float(turn_back), TURN_BACK_RANGE[0]), TURN_BACK_RANGE[1])
         self._measure_depths = bool(depths)
+        #: How many increments a stride is worth where the compromise's walks
+        #: are in soft focus; one for no hurrying at all. See
+        #: :meth:`_Search._hurrying`.
+        self._hurry = min(max(int(hurry), HURRY_RANGE[0]), HURRY_RANGE[1])
         count = len(self._regions)
         #: Each region's best reading and the picture of it: its fine tune's
         #: to begin with, then any the compromise reads higher.
@@ -1255,9 +1460,17 @@ class Calibration:
         }.get(search.state, "done")
         here = f", {self._score:.0%} here" if self._score is not None else ""
         probes = search.probes
+        # Said as it is being walked, since that is the question someone
+        # watching a hurried search has: is it striding, or has it slowed
+        # down because it is on to something?
+        pace = (
+            f"strides of {search.stride * search.step_size}"
+            if search.stride > 1
+            else f"steps of {search.step_size}"
+        )
         return (
-            f"Compromise: {probes} probe{'' if probes == 1 else 's'} in steps "
-            f"of {search.step_size}, {doing} -- best average so far "
+            f"Compromise: {probes} probe{'' if probes == 1 else 's'} in {pace}"
+            f", {doing} -- best average so far "
             f"{search.best:.0%}{here}"
         )
 
@@ -1272,6 +1485,16 @@ class Calibration:
     def turn_back(self) -> float:
         """The share of a walk's best below which the walk turns back."""
         return self._turn_back
+
+    @property
+    def hurry(self) -> int:
+        """How many increments a stride is, in soft focus; one for not hurrying."""
+        return self._hurry
+
+    @property
+    def hurries(self) -> bool:
+        """Whether the walks stride through focus no compromise can be in."""
+        return self._hurry > 1
 
     @property
     def objective(self) -> str:
@@ -1380,6 +1603,7 @@ class Calibration:
             longest=self._longest,
             turn_back=self._turn_back,
             depths=self._measure_depths,
+            hurry=self._hurry,
         )
         return True
 
@@ -1456,21 +1680,61 @@ class Calibration:
         so the differences between them are honest and the positions
         themselves mean nothing.
         """
-        search = self._search
-        if not self._measure_depths or search is None or search.survey is None:
+        walked = self._walk_across()
+        if walked is None:
             return {}
-        where, shares = search.survey
-        found = _depths(where, shares)
+        _where, _shares, found, nearest = walked
         usable = self.usable
-        known = [position for position, _doubt, _edge in found if position is not None]
-        if not known:
-            return {}
-        nearest = min(known)
         return {
             usable[column]: (position - nearest, doubt, edge)
             for column, (position, doubt, edge) in enumerate(found)
             if position is not None
         }
+
+    def _walk_across(self):
+        """The walk across and what its peaks came to, or None without it.
+
+        Its positions in order, every region's share at each of them, where
+        each region peaked, and the nearest of those peaks -- which is what
+        everything read off the walk is counted from.
+        """
+        search = self._search
+        if not self._measure_depths or search is None or search.survey is None:
+            return None
+        where, shares = search.survey
+        found = _depths(where, shares)
+        known = [position for position, _doubt, _edge in found if position is not None]
+        if not known:
+            return None
+        return (*_in_order(where, shares), found, min(known))
+
+    def focus_depth(self) -> "float | None":
+        """How deep the compromise was placed, in the depths' own steps.
+
+        The one focus position all the regions were left at, said the way
+        their depths are: so many steps further than the nearest of them. It
+        is read off the same walk across, as the top of the very number the
+        search climbs -- every region's share of its best, combined the way
+        the objective says -- so it is on the depths' own axis and can be
+        drawn among them.
+
+        Not the drive position the lens finally stands at, which is on the
+        far side of a reversal and comparable with nothing here. The search
+        goes home to the top of this walk and climbs from there, so this is
+        where it placed the focus, give or take the increment or two the
+        climb moved it by.
+        """
+        walked = self._walk_across()
+        if walked is None:
+            return None
+        where, shares, _found, nearest = walked
+        climbed = np.array(
+            [combine(tuple(row), self._objective) for row in shares], dtype=float
+        )
+        position, _doubt, edge = _peak_of(where, climbed)
+        if position is None or edge:
+            return None
+        return position - nearest
 
     def report(self, stopped: bool = False) -> CalibrationReport:
         """What it all came to.
@@ -1525,6 +1789,7 @@ class Calibration:
             history=history,
             history_regions=self.history_regions if search is not None else (),
             depths_measured=self._measure_depths,
+            focus_depth=self.focus_depth() if settled else None,
             began=self._began,
             readings=tuple(self._readings),
         )
@@ -1556,15 +1821,22 @@ def _depths(
     """
     if shares.ndim != 2 or len(where) < 3:
         return []
-    order = np.argsort(where, kind="stable")
-    where, shares = where[order], shares[order]
-    # A position read twice -- the reading the walk turned on -- keeps the
-    # later reading, which is the one taken from the direction of the walk.
-    unique = np.concatenate([where[1:] != where[:-1], [True]])
-    where, shares = where[unique], shares[unique]
+    where, shares = _in_order(where, shares)
     if len(where) < 3:
         return []
     return [_peak_of(where, shares[:, column]) for column in range(shares.shape[1])]
+
+
+def _in_order(where: np.ndarray, shares: np.ndarray):
+    """The walk across with its positions in order and each of them read once.
+
+    A position read twice -- the reading the walk turned on -- keeps the later
+    reading, which is the one taken from the direction of the walk.
+    """
+    order = np.argsort(where, kind="stable")
+    where, shares = where[order], shares[order]
+    unique = np.concatenate([where[1:] != where[:-1], [True]])
+    return where[unique], shares[unique]
 
 
 def _peak_of(

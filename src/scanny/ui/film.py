@@ -27,9 +27,10 @@ picture becomes a place on the film to draw. All of that lies under the film,
 so it is drawn faintly wherever the film is in front of it and fully where
 nothing is; at full strength throughout, a line would read as standing in
 front of the film it is really behind. Turned far enough over it is the
-film's underside that is on show, and that is drawn dulled and darkened,
-because two sides alike mean a view from below passes for a view from above
-and every lean read off it is backwards. Drag to turn it round, scroll to come
+film's underside that is on show, and that is drawn dulled and darkened, as
+the sensor's back is drawn darker and plainer than its face: two sides alike
+mean a view from below passes for a view from above, and every lean read off
+it is then backwards. Drag to turn it round, scroll to come
 closer. The height is exaggerated, and has to be: the depths are drive steps,
 which have no length in common with the frame.
 """
@@ -254,8 +255,14 @@ _MESH = (30, 20)
 _RELIEF = 0.35
 _GAP = 0.3
 
+#: The sensor's face, and its back. Being flat it takes no shading to tell its
+#: two sides apart by, and two alike make turning right under the rig look
+#: like turning back over it. Its back is the back of a plate: darker, and
+#: with none of the grid its face is ruled into.
 _SENSOR = QColor(70, 74, 86)
 _SENSOR_EDGE = QColor(150, 155, 170)
+_SENSOR_BACK = QColor(38, 41, 50)
+_SENSOR_BACK_EDGE = QColor(92, 96, 108)
 
 #: Where the light comes from for the film's top, and for its underside: the
 #: same light turned round, so that the far side of the sheet has a shape to
@@ -278,6 +285,19 @@ _FLAT = float(_LIGHT[2])
 _UNDER_HUE = 0.45
 _UNDER_SLATE = (96, 100, 116)
 _UNDER_LIT = 0.62
+
+#: The one focus position the compromise settled at, drawn as the plane it
+#: brings into focus: flat, level with the sensor, and see-through, because
+#: what is asked of it is which parts of the film sit in front of it and which
+#: behind, and both have to show through.
+_FOCUS = QColor(226, 232, 244, 96)
+_FOCUS_EDGE = QColor(96, 108, 134)
+
+#: The plane is cut on the same grid as the film. Flat, it needs no mesh of
+#: its own to have a shape; it is cut up so that where the film crosses it,
+#: which of the two is in front is settled cell by cell against the film's own
+#: faces rather than across a coarser face that straddles the crossing.
+_FOCUS_MESH = _MESH
 
 #: What a region is drawn in: its rectangle on the sensor, the post up to the
 #: film, and the mark on the film at the top of it.
@@ -337,10 +357,13 @@ class FilmView(QWidget):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self._surface: "FilmSurface | None" = None
         self._marks: "list[Mark]" = []
+        self._focus: "float | None" = None
         self._orientation = Orientation()
         self._aspect = 1.5
         self._turn, self._tilt, self._zoom = _TURN, _TILT, 1.0
         self._dragging: "QPointF | None" = None
+        self._looked: "tuple[float, float] | None" = None
+        self._trig = (1.0, 0.0, 1.0, 0.0)
 
     # -- content -----------------------------------------------------------
 
@@ -350,10 +373,16 @@ class FilmView(QWidget):
         marks: "list[Mark]",
         orientation: "Orientation | None" = None,
         aspect: float = 1.5,
+        focus: "float | None" = None,
     ) -> None:
-        """What to draw. *aspect* is the frame's width over its height."""
+        """What to draw. *aspect* is the frame's width over its height.
+
+        *focus* is where the compromise was placed, in the depths' own steps,
+        and is drawn as the plane it brings into focus.
+        """
         self._surface = surface
         self._marks = list(marks)
+        self._focus = None if focus is None else float(focus)
         self._orientation = orientation or Orientation()
         self._aspect = float(aspect) if aspect > 0 else 1.5
         self.update()
@@ -381,6 +410,8 @@ class FilmView(QWidget):
         and how far above the sensor the shallowest is drawn."""
         long_side = max(self._size())
         depths = [mark.depth for mark in self._marks] or [0.0]
+        if self._focus is not None:
+            depths.append(self._focus)
         if self._surface is not None:
             grid = np.linspace(0.0, 1.0, 12)
             x, y = np.meshgrid(grid, grid)
@@ -400,6 +431,25 @@ class FilmView(QWidget):
         depth = float(self._surface.at(x, y)) if self._surface is not None else low
         return self._world(u, v, gap + (depth - low) * scale)
 
+    def _look(self) -> "tuple[float, float, float, float]":
+        """The turn and the tilt as their cosines and sines.
+
+        Worked out once for as long as the view is not turned, rather than
+        four times over for each of the thousands of corners a drawing of it
+        goes through, which is most of the work of drawing one.
+        """
+        angles = (self._turn, self._tilt)
+        if self._looked != angles:
+            turn, tilt = math.radians(self._turn), math.radians(self._tilt)
+            self._looked = angles
+            self._trig = (
+                math.cos(turn),
+                math.sin(turn),
+                math.cos(tilt),
+                math.sin(tilt),
+            )
+        return self._trig
+
     def _towards(self):
         """The way to the eye, the same for every point: the view is square-on.
 
@@ -407,26 +457,20 @@ class FilmView(QWidget):
         both the side of a face being looked at and what is in front of a mark
         are worked out along.
         """
-        turn, tilt = math.radians(self._turn), math.radians(self._tilt)
-        return np.array(
-            [
-                math.cos(tilt) * math.sin(turn),
-                math.cos(tilt) * math.cos(turn),
-                math.sin(tilt),
-            ]
-        )
+        turned, turning, tilted, tilting = self._look()
+        return np.array([tilted * turning, tilted * turned, tilting])
 
     def _project(self, point) -> "tuple[float, float, float]":
         """Screen x and y before scaling, and how far from the eye."""
         x, y, z = point
-        turn, tilt = math.radians(self._turn), math.radians(self._tilt)
-        across = x * math.cos(turn) - y * math.sin(turn)
-        away = x * math.sin(turn) + y * math.cos(turn)
-        screen_y = away * math.sin(tilt) - z * math.cos(tilt)
+        turned, turning, tilted, tilting = self._look()
+        across = x * turned - y * turning
+        away = x * turning + y * turned
+        screen_y = away * tilting - z * tilted
         # Square to the screen: what is drawn lower is nearer, as is what is
         # higher, when looking down. Otherwise the sensor behind the film's
         # near edge sorts in front of it and shows through.
-        distance = -away * math.cos(tilt) - z * math.sin(tilt)
+        distance = -away * tilted - z * tilting
         return across, screen_y, distance
 
     # -- painting ----------------------------------------------------------
@@ -455,7 +499,11 @@ class FilmView(QWidget):
         # outline and the film's edges -- what the holder grips -- go with the
         # faces along them, so they are hidden by what is in front as well.
         faces: "list[tuple[float, list, QColor, list, QPen]]" = []
-        sensor_rim = QPen(_SENSOR_EDGE, 1.2)
+        # The sensor lies flat, so which of its sides is on show is the way
+        # the eye is: over it or under it.
+        from_above = self._towards()[2] >= 0.0
+        sensor = _SENSOR if from_above else _SENSOR_BACK
+        sensor_rim = QPen(_SENSOR_EDGE if from_above else _SENSOR_BACK_EDGE, 1.2)
         film_rim = QPen(text, 1.6)
         sensor_step = 6
         for i in range(sensor_step):
@@ -470,7 +518,26 @@ class FilmView(QWidget):
                     )
                 ]
                 rim = _rim(i, j, sensor_step, sensor_step)
-                faces.append((0.0, corners, _SENSOR, rim, sensor_rim))
+                faces.append((0.0, corners, sensor, rim, sensor_rim))
+        if self._focus is not None:
+            # Sorted and drawn with the rest, so that the film shows through
+            # it where the film is behind it and over it where it is in front.
+            level = gap + (self._focus - low) * scale
+            across, down = _FOCUS_MESH
+            focus_rim = QPen(_FOCUS_EDGE, 1.4, Qt.PenStyle.DashLine)
+            for i in range(across):
+                for j in range(down):
+                    corners = [
+                        self._world(u, v, level)
+                        for u, v in (
+                            (i / across, j / down),
+                            ((i + 1) / across, j / down),
+                            ((i + 1) / across, (j + 1) / down),
+                            (i / across, (j + 1) / down),
+                        )
+                    ]
+                    rim = _rim(i, j, across, down)
+                    faces.append((level, corners, _FOCUS, rim, focus_rim))
         for i in range(columns):
             for j in range(rows):
                 corners = [
@@ -496,11 +563,18 @@ class FilmView(QWidget):
             )
             for _h, corners, colour, rim, pen in faces
         ]
-        # Fit everything to the widget, then come closer by the zoom.
+        # Fit everything to the widget, then come closer by the zoom. To what
+        # it spreads across and down separately, not to the larger of the two
+        # against the shorter side of the widget: a drawing of two sheets seen
+        # from the side is far wider than it is tall, and fitting its width to
+        # the height left it small in the middle of a wide page.
         xs = [p[0] for _d, points, *_rest in projected for p in points]
         ys = [p[1] for _d, points, *_rest in projected for p in points]
-        span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
-        size = min(self.width(), self.height()) * 0.86 * self._zoom / span
+        across = max(max(xs) - min(xs), 1e-9)
+        down = max(max(ys) - min(ys), 1e-9)
+        size = (
+            min(self.width() / across, self.height() / down) * 0.86 * self._zoom
+        )
         middle = QPointF(self.width() / 2, self.height() / 2 + 10)
         centre = ((max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2)
 
@@ -514,7 +588,11 @@ class FilmView(QWidget):
         for _distance, points, colour, rim, pen in sorted(projected, key=lambda f: -f[0]):
             screen = [to_screen(p) for p in points]
             painter.setBrush(colour)
-            painter.setPen(QPen(colour.darker(115), 0.6))
+            # A see-through face is seamed in its own colour: darkened, the
+            # seams would rule a grid across glass meant to be looked through.
+            painter.setPen(
+                QPen(colour if colour.alpha() < 255 else colour.darker(115), 0.6)
+            )
             painter.drawPolygon(QPolygonF(screen))
             painter.setPen(pen)
             for start, end in rim:
@@ -572,11 +650,19 @@ class FilmView(QWidget):
         small.setBold(False)
         small.setPointSizeF(max(7.0, small.pointSizeF() - 1))
         painter.setFont(small)
-        painter.drawText(
-            QRectF(8, 6, self.width() - 16, 18),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        said = (
             "Film above, sensor below; higher is further from the camera. "
-            "Height exaggerated: drive steps, not to scale.",
+            "Height exaggerated: drive steps, not to scale."
+        )
+        if self._focus is not None:
+            said += (
+                "\nThe clear sheet is where the compromise put focus: film "
+                "above it is further away than focus, film below it nearer."
+            )
+        painter.drawText(
+            QRectF(8, 6, self.width() - 16, 34),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            said,
         )
         painter.drawText(
             QRectF(8, self.height() - 22, self.width() - 16, 18),
