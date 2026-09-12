@@ -329,10 +329,51 @@ answer was not steadier readings or a better search.
 
 Two consecutive frames of a scene holding still, on the other hand, differ by
 nothing but their noise, and no amount of detail in the subject changes that.
-So the variance is measured from a pair of frames, and the smallest lately
-seen is the one used: when the picture is moving, frames differ by more than
-noise, and the smallest measurement is the one with no movement in it. Nothing
-is subtracted before anything has been measured.
+So the variance is measured from a pair of frames of a picture holding still.
+**From the frames of the very stack the reading is taken off**, wherever
+there are any: the grain belongs to that picture and to no other. It is the
+smallest of the few pairs a stack holds, because a pair that caught something
+moving reads high and never low, and there are always the same few, so what
+taking the least of them costs is the same for every reading.
+
+Measuring it on anything else is a trap, and it took three calibrations to
+see the bottom of it. **Grain is not a property of the camera.** It grows
+with the light: a region a third as bright as its neighbours has under half
+their grain. It changes with magnification: a region read at 18.8x had half
+the grain of a brighter one read at 9.4x. And -- the one that is easy to miss
+-- **it changes with focus**, because the body sends JPEG and a smooth picture
+compresses smoother: the encoder quantises the noise away where there is no
+detail to hide it in, so a region's frames differ by a quarter less while it
+is soft than at its best, measured on a real calibration (the correlation
+between a region's reading and its measured grain came out at +0.45 across a
+whole walk).
+
+Every one of those showed up as the same symptom -- a region reading higher in
+the search for a compromise than it ever did while fine tuned on its own,
+which is a region whose *best* is then wrong -- and each had to be taken out
+in turn:
+
+| What was shared | What it cost |
+| --- | --- |
+| One estimate for every view: the quietest pair from whatever was on screen | The darkest of four regions set the grain for all of them; the bright ones read up to **10%** high |
+| One estimate per view, as the smallest of a rolling window | The compromise gathers pairs faster than a fine tune does, and the smallest of many tries is smaller than the smallest of a few: **1-2%** |
+| One estimate per view, pooled across a whole walk | The walk crosses defocus, where the JPEG has less grain in it, so too little came off at the sharp end -- which is the peak: **2-3%** |
+
+What is left is the pairs of one stack of one picture, and a region now reads
+within a few tenths of a per cent of its own fine tune. Pooled estimates are
+still kept per view and area (a calibration keeps one per region) for the
+cases with no stack to measure: integration switched off, or the first
+picture of a view. Nothing is subtracted before anything has been measured.
+
+**And it is measured over the area being read**, not over the whole frame,
+since that is the picture the reading is of. Two traces from the shared-
+estimate days are worth keeping for what they look like. A region whose two
+pictures had the same detail in them -- 42.8 of gradient energy against 41.9
+-- read 3.62 at the compromise against 3.26 at its own best, the whole
+difference being the grain subtracted. And a fine tune that began with the
+last region's grain still in hand read eight per cent lower at the same focus
+a few seconds later, when its own took over: a fall that is not a fall, in
+the middle of a walk that judges everything by falls.
 
 The same simulated focus sweep, on a subject with detail down at the pixel:
 
@@ -899,6 +940,37 @@ What the camera leaves behind is not required to be any good. If it reads zero
 the walk still goes and looks -- see *A reading of nothing is a reason to look*
 above.
 
+**It is read later than anything else is, though, and by a different test.**
+After a focus move the picture is watched until it holds still, six frames at
+least; after the camera's own autofocus, thirty-five, and until **the picture
+is as bright as it was before**.
+
+Three real calibrations read every region at a twentieth or less of what it
+read an increment either side of where the autofocus had left it -- in frames
+taken a quarter to two thirds of a second after the autofocus returned, and
+agreeing with each other, so that the usual test for a picture that has
+settled passed on them. What the level says is what it was: those frames are
+a fifth darker, with a seventeenth of the gradient energy. The body is still
+putting live view's exposure back after focusing, and it holds the picture
+still while it does. So the level is what is waited for, since focus does not
+change how much light there is -- blur spreads it about, it does not take any
+away -- and a level that has moved means the body is still adjusting. Waiting
+a set number of frames is the bound around that, not the test: how long the
+body takes is its own business.
+
+The exposure is not all of it, either. With the level back to within a per
+cent, frames a second after the autofocus still read a third to a half under
+what the increments either side of them read, on two regions of four -- and
+the probe half a second later was right. Something else about focusing takes
+about that long again, most likely the lens still creeping to where it
+decided on, and there is nothing in the picture that says so: only waiting
+covers it.
+
+Nothing was walking anywhere wrong because of this, since the walk judges by
+the readings it takes afterwards, but the floor -- *end no worse than the
+camera managed* -- was being compared against a number that was not the
+camera's answer at all.
+
 ### What stops it
 
 Taking the focus by hand, magnifying, moving the measured area, changing the
@@ -963,9 +1035,13 @@ region at its best and at the compromise as it was cut out of the live view,
 `activity.log` everything said while the calibration ran, and `readings.csv`
 **every reading of every region it took**, one to a row -- which region, which
 part of the calibration (`tune`, or the search's `out`, `across`, `home`,
-`climb`), the step count, the reading, the seconds since the calibration began
-and the seconds since the lens last moved -- for a spreadsheet, when a number
-in the report wants explaining. Opened again, it is the same report, pages and
+`climb`), the step count, the reading, the seconds since the calibration began,
+the seconds since the lens last moved, and the grain taken off it with the mean
+level it was read at, which together give back the picture's gradient energy
+(`value * level² / 1000 + 4 * grain`) and so what the reading would have been
+with any other grain taken off -- for a spreadsheet, when a number in the
+report wants explaining. That is how the grain being shared between regions was
+found. Opened again, it is the same report, pages and
 3D film included, shown the way the view is set now. **Save page as
 picture...** keeps the page on show as a PNG.
 
@@ -1080,8 +1156,14 @@ again from the readings with the new peak; only the way home keeps the peaks
 it set out with, since it matches readings against a profile and a profile has
 to hold still. The report measures everything against the peaks as they
 finally stood, and where one was raised it says by how much, next to what the
-fine tune alone found -- a fine tune that keeps reading a region lower than the
-search is worth looking into, and `readings.csv` is where to look.
+fine tune alone found.
+
+With each region's readings taken with its own grain off, raising a peak
+should now be a matter of the grain on a reading -- a per cent or so. A region
+the search reads several per cent above its fine tune is saying that something
+about the two measurements still differs, and `readings.csv` is where to look:
+the grain and the level are on every row, so the readings can be worked out
+again with the same grain taken off both.
 
 ### Why the compromise is not a fine tune on the average
 

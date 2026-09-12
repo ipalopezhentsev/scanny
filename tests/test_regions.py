@@ -1288,6 +1288,62 @@ def test_each_region_s_best_is_the_best_its_fine_tune_saw(worker, slack):
     assert "this one" in said, "each probe of a fine tune says what it read"
 
 
+class _Shaded(_Rig):
+    """The rig with each place as bright as *shade* says, and grain to match.
+
+    A darker picture is a quieter one: grain's variance goes with how much
+    light there is. Which is what made a calibration's regions incomparable
+    with themselves, when one grain was subtracted from all of them.
+    """
+
+    def __init__(self, places, shade, **kwargs) -> None:
+        super().__init__(places, **kwargs)
+        self.shade = list(shade)
+
+    def _shade(self, crop) -> float:
+        return self.shade[self.places.index(self._place(crop))]
+
+    def live_view_frame(self) -> LiveViewFrame:
+        if self.ended:
+            raise CameraError("live view has ended")
+        self._history.append(self.optics)
+        shown = self._history[-(self.lag + 1)]
+        crop = self._crop()
+        shade = self._shade(crop)
+        pixels = self.picture(crop, shown) * shade + self._rng.normal(
+            0, self.noise * np.sqrt(shade), (TALL, WIDE)
+        )
+        return _frame(pixels, crop, self.af)
+
+
+def test_each_region_is_read_with_its_own_grain_taken_off(worker):
+    """What two real calibrations showed. Panning between four regions for the
+    compromise, the quietest pair of frames lately -- the grain every reading
+    had taken off it -- came from the darkest region, a third as bright as the
+    others. So the bright ones had too little grain taken off, and read up to
+    a tenth higher than they had while fine tuned on their own: the same detail
+    in the picture, 42.8 of gradient energy against 41.9, read 3.62 against
+    3.26. Each region's grain is its own now, measured on its own frames, the
+    same in its fine tune and in the compromise."""
+    rig = _Shaded(PLACES, shade=(1.0, 0.3, 1.0), noise=7.0)
+    report = _calibrated(worker, rig, _regions_round(PLACES))
+    assert report.outcome == "found", report.describe()
+    grain = {}
+    for result in report.results:
+        mine = [one for one in report.readings if one.region == result.number]
+        tuned = np.median([one.grain for one in mine if one.stage == "tune"][2:])
+        sought = np.median([one.grain for one in mine if one.stage != "tune"])
+        assert sought == pytest.approx(tuned, rel=0.15), result.number
+        grain[result.number] = sought
+        # Nothing the compromise read of it is above its fine tune's best by
+        # more than the grain on a reading.
+        assert result.bettered is None or result.bettered < 0.02, (
+            result.number,
+            result.bettered,
+        )
+    assert grain[2] < 0.5 * grain[1] and grain[2] < 0.5 * grain[3]
+
+
 @pytest.mark.parametrize("slack", [0, 40])
 def test_the_rig_s_regions_come_back_at_their_depths(worker, slack):
     """Three places across the frame, sixty steps apart in focus each, read
@@ -1807,6 +1863,92 @@ def test_the_film_is_drawn_over_the_sensor_and_can_be_turned_round(app):
     assert after != before, "turning it round redraws it from the new side"
 
 
+def test_what_the_film_covers_of_a_region_is_drawn_faintly_and_not_in_full(app):
+    """A post runs from the sensor up to the film, so wherever the film is
+    between it and the eye it has to give way to it. Drawn at full strength
+    all the way up it reads as standing in front of the film it is really
+    behind, and turning the view round does not say otherwise. Faintly is
+    still enough to follow it down to the region it belongs to."""
+    from scanny.ui.film import _MARK, FilmView, Mark
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
+    report = _levelled_report(lambda x, y: 40 * x + (25 if x == 0.5 else 0), corners)
+    view = FilmView()
+    view.resize(500, 380)
+    view.set_scene(
+        report.surface(),
+        [Mark(one.number, one.region.rect, one.depth) for one in report.placed],
+    )
+    view.show()
+
+    def in_full() -> int:
+        """How much of the marks is drawn in their colour and nothing else."""
+        view.update()
+        QApplication.processEvents()
+        shown = view.grab().toImage()
+        return sum(
+            shown.pixelColor(x, y) == _MARK
+            for x in range(shown.width())
+            for y in range(shown.height())
+        )
+
+    low, high, scale, gap = view._heights()
+    heights = (low, scale, gap, gap + (high - low) * scale)
+    one = report.placed[0]
+    x, y, w, h = one.region.rect
+    up_to = gap + (one.depth - low) * scale
+    halfway = view._world(x + w / 2, y + h / 2, up_to / 2)
+    on_the_film = view._world(x + w / 2, y + h / 2, up_to)
+
+    view._turn, view._tilt = 0.0, 80.0
+    from_above = in_full()
+    assert view._covered([halfway], *heights)[0], "the film is over the post"
+    assert not view._covered([on_the_film], *heights)[0], (
+        "but not over the mark at the top of it, which lies on the film: a "
+        "way out that rises off the film has not gone through it"
+    )
+    view._tilt = 5.0
+    assert in_full() > from_above, (
+        "and from the side, what is under the film's edge is in the open"
+    )
+
+
+def test_the_film_is_vivid_from_above_and_dull_from_underneath(app):
+    """Both sides of the sheet are the same shape at the same heights, so with
+    nothing to tell them apart a view from below passes for a view from above
+    -- and every lean read off it is backwards. The underside is dulled and
+    darkened instead, so which side is being looked at needs no working out."""
+    from scanny.ui.film import FilmView, Mark
+
+    corners = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
+    report = _levelled_report(lambda x, y: 40 * x + (25 if x == 0.5 else 0), corners)
+    view = FilmView()
+    view.resize(500, 380)
+    view.set_scene(
+        report.surface(),
+        [Mark(one.number, one.region.rect, one.depth) for one in report.placed],
+    )
+    view.show()
+
+    def vivid() -> int:
+        """How much of the drawing is in the strong colours of the depth ramp."""
+        view.update()
+        QApplication.processEvents()
+        shown = view.grab().toImage()
+        looked = [
+            shown.pixelColor(x, y)
+            for x in range(0, shown.width(), 3)
+            for y in range(0, shown.height(), 3)
+        ]
+        return sum(one.saturation() > 120 and one.value() > 140 for one in looked)
+
+    view._tilt = 28.0
+    from_above = vivid()
+    view._tilt = -28.0
+    from_below = vivid()
+    assert from_above > 10 * from_below, "the far side of the film is not its face"
+
+
 def test_the_report_has_the_film_and_the_search_on_pages_of_their_own(window):
     from scanny.ui.report import CalibrationReportDialog
 
@@ -1920,9 +2062,9 @@ def _documented_report() -> CalibrationReport:
         began=1_789_000_000.0,
         log=("14:03:01  Calibration started", "14:03:02  !! the camera refused: busy"),
         readings=(
-            Reading(1, "tune", 0, 120.5, 1.25, 0.5),
-            Reading(1, "tune", 12, 148.0, 2.5, 0.75),
-            Reading(2, "out", -6, 90.0, 5.0, 1.5),
+            Reading(1, "tune", 0, 120.5, 1.25, 0.5, 1.25, 110.5),
+            Reading(1, "tune", 12, 148.0, 2.5, 0.75, 1.25, 111.0),
+            Reading(2, "out", -6, 90.0, 5.0, 1.5, 0.375, 48.25),
         ),
     )
 
@@ -1962,12 +2104,13 @@ def test_every_reading_goes_into_the_file_as_a_table_too(app, tmp_path):
     save_report(path, report, aspect=1.5)
     with zipfile.ZipFile(path) as archive:
         table = archive.read("readings.csv").decode("utf-8").splitlines()
-    assert table[0] == "region,stage,position,value,at,after"
-    assert table[1] == "1,tune,0,120.5,1.250,0.500"
-    assert table[-1] == "3,home,6,80.25,9.500,"
+    assert table[0] == "region,stage,position,value,at,after,grain,level"
+    assert table[1] == "1,tune,0,120.5,1.250,0.500,1.25,110.5"
+    assert table[-1] == "3,home,6,80.25,9.500,,,"
     back = load_report(path).report.readings
     assert back[:3] == report.readings[:3]
     assert np.isnan(back[3].after) and back[3].value == 80.25
+    assert np.isnan(back[3].grain) and np.isnan(back[3].level)
 
 
 def test_a_report_saved_before_readings_were_kept_still_opens(app, tmp_path):

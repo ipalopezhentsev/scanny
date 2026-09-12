@@ -30,10 +30,13 @@ from .pixels import green
 from .regions import OBJECTIVES, Calibration, Look, Region, View, cut_out
 from .sharpness import (
     QUANTISATION,
+    GrainMemory,
     SharpnessMeter,
     format_reading,
     grain_reading,
+    level_of,
     measure,
+    pixels_of,
     variance_between,
 )
 
@@ -99,6 +102,33 @@ _VIEW_BACK_PATIENCE = 4.0
 _SETTLE_FRAMES = 6  # never believe stillness before this many frames
 _SETTLE_LIMIT = 30  # nor wait longer than this for it
 _STILL = 0.05  # frames this close to each other are the same picture
+
+#: How many frames to watch, at the least, after the camera's own autofocus
+#: before believing the picture, and how long to go on waiting for it -- both
+#: a good deal longer than after a drive.
+#:
+#: Three real calibrations read every region at a twentieth or less of its
+#: reading one increment either side of where the autofocus had left it, in
+#: frames a quarter to two thirds of a second after it returned, and agreeing
+#: with each other: the body is still putting live view's exposure back, and
+#: it holds still while it does. What catches that is the level rather than
+#: these -- see :meth:`CameraWorker._bright_again`.
+#:
+#: These are the bound around it, and they are generous because the exposure
+#: is not all of it: with the level back to within a per cent, frames a
+#: second after the autofocus still read a third to a half under what the
+#: increment either side of them read, on two regions of four, and the probe
+#: half a second later was right. So something else about it -- the lens still
+#: creeping to where it decided on, most likely -- takes about that long
+#: again, and only waiting covers it. Thirty-five frames is between one and
+#: two seconds at the sixteen to thirty a second the body draws.
+_AF_SETTLE_FRAMES = 35
+_AF_SETTLE_LIMIT = 75
+
+#: How near the level it had before an autofocus the picture has to be back
+#: to. The exposure comes back within a per cent or two of where it was;
+#: while the body is still adjusting it is a fifth out.
+_LEVEL_BACK = 0.05
 
 #: The deepest pipeline that will be believed. Live view runs a handful of
 #: frames behind the lens; a picture that only changes half a second after the
@@ -241,6 +271,10 @@ class CameraWorker(QObject):
         # frames, not by a loop of its own, so the grab keeps running.
         self._hunt: "FineTune | None" = None
         self._settling = False
+        self._settle_least = 0
+        self._settle_limit = _SETTLE_LIMIT
+        self._settle_level: "float | None" = None
+        self._settle_level_before: "float | None" = None
         self._settle_seen = 0
         self._settle_last: "float | None" = None
         self._settle_before: "float | None" = None
@@ -276,6 +310,17 @@ class CameraWorker(QObject):
         # rather than guessed at from within one. See sharpness.measure.
         self._noise_seen: "deque[float]" = deque(maxlen=_NOISE_MEMORY)
         self._last_pixels: "np.ndarray | None" = None
+        # And the grain of what is being read -- the measured area, in the view
+        # it is read through, or a calibration's region -- each from its own
+        # frames. Readings subtract this, not the one above; see
+        # sharpness.GrainMemory. The last frame's area and what it belongs to,
+        # to pair the next one with.
+        self._grain = GrainMemory(_NOISE_MEMORY)
+        self._area_pixels: "np.ndarray | None" = None
+        self._area_of: "tuple | None" = None
+        # What the frames of the stack being read differed by, which is the
+        # grain of the picture that reading is taken off. See _grain_of_stack.
+        self._stack_pairs: "list[float]" = []
         # What a picture of nothing but grain would read, which is the scale
         # small readings are judged against.
         self._grain_scale = 0.0
@@ -630,22 +675,142 @@ class CameraWorker(QObject):
         """
         if not self._sharpness.enabled:
             self._last_pixels = None
+            self._area_pixels = None
             return
         frame_image = self._integrator.last_frame
         if frame_image is None:
             return
-        pixels = green(frame_image)[::2, ::2]  # every other one is plenty
+        whole = green(frame_image)
+        pixels = whole[::2, ::2]  # every other one is plenty
         variance = variance_between(self._last_pixels, pixels) if (
             self._last_pixels is not None
         ) else None
         self._last_pixels = pixels
         if variance is not None:
             self._noise_seen.append(variance)
+        # Only frames of a picture holding still tell the area's grain: while
+        # the lens is moving the frames differ by the move as well, and a
+        # reading is taken of a still picture, so that is what its grain has
+        # to be measured on. The whole-frame one above keeps the moving ones,
+        # because it is what tells moving from still in the first place.
+        frame = self._last_frame
+        if self._integrator.pending == 1:
+            # The first frame of a stack: what the last one's frames differed
+            # by belongs to the picture that was read off it, not to this one.
+            self._stack_pairs = []
+        if frame is not None and not self._settling:
+            self._note_area_grain(frame, whole, variance)
+        elif self._settling:
+            self._area_pixels, self._area_of = None, None
+            self._stack_pairs = []
 
     @property
     def _noise_variance(self) -> float:
-        """The quietest pair of frames lately: the one with no movement in it."""
+        """The quietest pair of whole frames lately, whatever they showed.
+
+        What the picture holding still is judged against. Not what readings
+        subtract, which is the grain of the area being read: see
+        :meth:`_area_grain`.
+        """
         return min(self._noise_seen) if self._noise_seen else 0.0
+
+    def _grain_key(self, frame: LiveViewFrame) -> "tuple":
+        """What the grain of the area being read on *frame* is kept under.
+
+        The view and the area, ordinarily. While a calibration fine tunes a
+        region, that region -- at the size of view it is read at -- because the
+        compromise reads it again later through the same view and has to
+        subtract the same grain from it, or its readings are not comparable
+        with the ones its fine tune took.
+        """
+        run = self._calibration
+        if run is not None and run.phase == "peaks":
+            # Sized as a View records it, which is what the compromise has.
+            return _region_grain_key(
+                run.index,
+                frame.crop_width or frame.image_width,
+                frame.crop_height or frame.image_height,
+            )
+        return ("view", _view_of(frame), self._sharpness.area)
+
+    def _note_area_grain(
+        self,
+        frame: LiveViewFrame,
+        image: "QImage | np.ndarray",
+        whole: "float | None" = None,
+    ) -> None:
+        """Pair this frame's area with the last one's, if they are the same thing.
+
+        Only a pair of frames of the same view, with the whole of the area on
+        it: a frame from before a pan or a magnification is of something else,
+        and a region only half on screen is partly something else too.
+
+        *whole* is what the pair of whole frames measured, which is this
+        measurement already when there is no area marked out.
+        """
+        area = self._sharpness.area
+        of = (self._grain_key(frame), _view_of(frame))
+        earlier, earlier_of = self._area_pixels, self._area_of
+        self._area_pixels, self._area_of = None, of
+        if area is None:
+            if earlier_of == of and whole is not None:
+                self._grain.note(of[0], whole)
+                self._stack_pairs.append(whole)
+            return
+        shown = frame.area_normalised(area)
+        if shown is None or not _inside(area, frame.crop_normalised):
+            self._area_of = None
+            return
+        pixels = pixels_of(image, shown)
+        self._area_pixels = pixels
+        if earlier is None or earlier_of != of:
+            return
+        variance = variance_between(earlier, pixels)
+        if variance is not None:
+            self._grain.note(of[0], variance)
+            self._stack_pairs.append(variance)
+
+    def _grain_of_stack(self, pairs: "list[float] | None" = None) -> "float | None":
+        """What the frames of the picture just stacked differed by, or None.
+
+        **The grain of the picture read, measured on the frames it was made
+        of**, which is the only estimate that belongs to it. How much grain a
+        live-view frame has is not a property of the camera alone: the body
+        sends JPEG, and a smooth picture compresses smoother -- the encoder
+        quantises the noise away where there is no detail to hide it in. So a
+        region reads a quarter less grain between its frames while it is out
+        of focus than it does at its best, measured on a real calibration, and
+        an estimate pooled over a walk is a mixture of focus positions. Pooled
+        over a walk that crosses the peak, it is dragged down by the soft
+        stretches either side and takes too little off at the top -- where the
+        peak is read, and a peak read too high is what every share of that
+        region is then measured against.
+
+        None when there is nothing to measure it on: the first stack of a view,
+        or integration switched off, which leaves :class:`GrainMemory`.
+        """
+        pairs = self._stack_pairs if pairs is None else pairs
+        if not pairs:
+            return None
+        # The smallest of the few pairs a stack holds, for the reason
+        # GrainMemory gives -- movement reads high, never low -- and there are
+        # always the same few, whatever is being read, so what that costs is
+        # the same everywhere.
+        return min(pairs)
+
+    def _area_grain(self, frame: LiveViewFrame) -> float:
+        """The grain of the area being read on *frame*, per single frame.
+
+        The grain of the picture itself where it can be had; failing that, the
+        quietest quarter of this view's recent frames, and failing that the
+        quietest of anything lately, as it always used to be.
+        """
+        if self._integrator.enabled:
+            stacked = self._grain_of_stack()
+            if stacked is not None:
+                return stacked
+        own = self._grain.variance(self._grain_key(frame))
+        return own if own is not None else self._noise_variance
 
     def _note_sharpness(
         self, frame: LiveViewFrame, image: QImage
@@ -656,7 +821,7 @@ class CameraWorker(QObject):
         # reach here, so that is always the full count.
         frames = self._integrator.frames if self._integrator.enabled else 1
         reading = self._sharpness.measure(
-            frame, image, self._noise_variance / frames
+            frame, image, self._area_grain(frame) / frames
         )
         if reading is None:
             return None
@@ -1061,6 +1226,9 @@ class CameraWorker(QObject):
         side of a change of aperture are measuring different pictures.
         """
         self._cancel_hunt("Focus hunt stopped - the picture changed under it")
+        # And the grain it had: exposure is what sets it.
+        self._grain.forget()
+        self._area_pixels = None
         if self._sharpness.enabled:
             self._sharpness.reset()
             self.sharpnessChanged.emit(0.0, 0.0)
@@ -1182,14 +1350,27 @@ class CameraWorker(QObject):
         if why:
             self.status.emit(why)
 
-    def _settle(self, before: "float | None" = None) -> None:
+    def _settle(
+        self,
+        before: "float | None" = None,
+        least: int = 0,
+        limit: int = _SETTLE_LIMIT,
+        level: "float | None" = None,
+    ) -> None:
         """Watch frames until the picture has moved and stopped, then stack.
 
         *before* is what the picture read at the moment of the move, which is
         how the first settle of a hunt can tell that the move has come through
-        the pipeline at all.
+        the pipeline at all. *least* is how many frames to watch at the very
+        least, whatever they look like, and *limit* how many to wait for
+        stillness before taking whatever is there. *level* is a brightness the
+        picture has to be back to as well; see :meth:`_bright_again`.
         """
         self._settling = True
+        self._settle_least = int(least)
+        self._settle_limit = max(int(limit), int(least) + 1)
+        self._settle_level_before = level
+        self._settle_level = None
         self._settle_seen = 0
         self._settle_last = None
         self._settle_before = before
@@ -1274,7 +1455,17 @@ class CameraWorker(QObject):
             if self._moved_at is not None
             else float("nan")
         )
-        run.noted(run.index, "tune", position, reading, since)
+        frames = self._integrator.frames if self._integrator.enabled else 1
+        shown = self._sharpness.shown_in(frame)
+        run.noted(
+            run.index,
+            "tune",
+            position,
+            reading,
+            since,
+            grain=self._area_grain(frame) / frames,
+            level=level_of(image, shown) if image is not None else float("nan"),
+        )
         if image is None or hunt.best != reading or hunt.best_position != position:
             return
         region = run.regions[run.index]
@@ -1298,6 +1489,16 @@ class CameraWorker(QObject):
         the picture to *change*, and how many frames that took is the depth of
         the pipeline; every move after it waits at least that long before
         stillness is allowed to mean anything.
+
+        **And after the camera's own autofocus, for the picture to be as
+        bright as it was.** The body spends about a second afterwards putting
+        live view's exposure back, and the frames while it does are dimmer and
+        far softer -- a fifth darker and a seventeenth of the gradient energy,
+        on a real calibration -- while holding perfectly still, so every other
+        test here passes on them. The level is what says so: focus does not
+        change how bright the picture is, only how sharp, so a level that has
+        moved means the body is still adjusting and the reading would be of
+        something else.
         """
         self._settle_seen += 1
         previous, self._settle_last = self._settle_last, self._frame_reading(frame)
@@ -1321,7 +1522,7 @@ class CameraWorker(QObject):
 
         # Two frames after the move has shown up, so there are two frames of
         # the new focus position to compare with each other.
-        floor = max(_SETTLE_FRAMES, (self._pipeline_lag or 0) + 2)
+        floor = max(_SETTLE_FRAMES, (self._pipeline_lag or 0) + 2, self._settle_least)
         # With nothing to compare against there is no move to wait for: that
         # is the settle at the start of a hunt, where the lens has not been
         # sent anywhere and only stillness is wanted.
@@ -1334,11 +1535,24 @@ class CameraWorker(QObject):
             self._settle_seen >= floor
             and arrived
             and not self._differs_by(previous, _STILL)
+            and self._bright_again()
         )
-        if settled or self._settle_seen >= _SETTLE_LIMIT:
+        if settled or self._settle_seen >= self._settle_limit:
             # Everything from here belongs to this focus position.
             self._settling = False
             self._integrator.reset()
+
+    def _bright_again(self) -> bool:
+        """Whether the picture is as bright as it was before what is settling.
+
+        True unless a level to go back to was given -- which only the settle
+        after an autofocus does -- since focus itself barely moves the level:
+        blur spreads the light about, it does not take any away.
+        """
+        want, now = self._settle_level_before, self._settle_level
+        if want is None or now is None or want <= 0.0:
+            return True
+        return abs(now - want) <= _LEVEL_BACK * want
 
     def _differs_by(self, against: "float | None", fraction: float) -> bool:
         """Whether the newest frame reads meaningfully differently from *against*.
@@ -1359,7 +1573,12 @@ class CameraWorker(QObject):
         return abs(now - against) > fraction * scale
 
     def _frame_reading(self, frame: LiveViewFrame) -> "float | None":
-        """One frame's sharpness on its own, for judging whether it has moved."""
+        """One frame's sharpness on its own, for judging whether it has moved.
+
+        How bright it was goes with it, which is the other half of judging
+        that: see :meth:`_bright_again`.
+        """
+        self._settle_level = None
         image = QImage.fromData(frame.jpeg, "JPG")
         if image.isNull():
             return None
@@ -1368,8 +1587,10 @@ class CameraWorker(QObject):
         area = self._sharpness.shown_in(frame)
         if area is None and self._sharpness.area is not None:
             return None
-        self._grain_scale = grain_reading(image, area, self._noise_variance)
-        return measure(image, area, self._noise_variance)
+        grain = self._area_grain(frame)
+        self._settle_level = level_of(image, area)
+        self._grain_scale = grain_reading(image, area, grain)
+        return measure(image, area, grain)
 
     def _autofocus_on_measured_area(
         self, camera: NikonCamera, frame: LiveViewFrame
@@ -1394,7 +1615,10 @@ class CameraWorker(QObject):
         # What the picture read as the camera was let loose on it, so the
         # settling below waits for the move to come through the pipeline
         # rather than believing the frames that still show where focus was.
+        # And how bright it was, which the body puts back in its own time
+        # afterwards and which nothing about focusing should change.
         before = self._frame_reading(frame)
+        was = self._settle_level
         if self._calibration is not None:
             self._calibration.autofocused()
         try:
@@ -1415,7 +1639,12 @@ class CameraWorker(QObject):
                 return
         self._moved_at = time.monotonic()
         self.focusStateChanged.emit("focused" if focused else "idle")
-        self._settle(before)
+        self._settle(
+            before,
+            least=_AF_SETTLE_FRAMES,
+            limit=_AF_SETTLE_LIMIT,
+            level=was,
+        )
 
     def _aim_at_measured_area(self, camera: NikonCamera) -> None:
         """Move the focus box to the middle of the measured area, if there is one."""
@@ -1547,6 +1776,9 @@ class CameraWorker(QObject):
             depths=depths,
         )
         self._view_restore = (self._zoom_level, frame.af_x, frame.af_y)
+        # Regions are kept by number, and these are not the last calibration's.
+        self._grain.forget()
+        self._area_pixels = None
         # A meter of its own, pointed at each region in turn. The user's is
         # put aside rather than repointed, so that nothing about it -- on or
         # off, where its area is -- has to be remembered and put back.
@@ -1814,13 +2046,15 @@ class CameraWorker(QObject):
                 self._hold_still(camera)
             looks: "dict[int, Look]" = {}
             after: "dict[int, float]" = {}
+            grains: "dict[int, float]" = {}
+            levels: "dict[int, float]" = {}
             for index in run.order():
-                look = self._read_region(camera, index)
-                if look is None:
+                read = self._read_region(camera, index)
+                if read is None:
                     raise CameraError(
                         f"no picture of region {index + 1} the way it was measured"
                     )
-                looks[index] = look
+                looks[index], grains[index], levels[index] = read
                 if self._moved_at is not None:
                     after[index] = time.monotonic() - self._moved_at
         except (CameraError, MtpError, WpdCommandError) as exc:
@@ -1831,7 +2065,7 @@ class CameraWorker(QObject):
             return
         doing = run.searching
         tuned = {index: run.best_of(index) for index in looks}
-        move = run.take(looks, after)
+        move = run.take(looks, after, grains, levels)
         for index in run.bettered:
             self._log(
                 f"Region {index + 1} read {format_reading(looks[index].reading)} "
@@ -1873,33 +2107,46 @@ class CameraWorker(QObject):
         if run.score is not None:
             self.sharpnessChanged.emit(100.0 * run.score, 100.0 * run.best)
 
-    def _read_region(self, camera: NikonCamera, index: int) -> "Look | None":
+    def _read_region(
+        self, camera: NikonCamera, index: int
+    ) -> "tuple[Look, float, float] | None":
         """Pan to a region's view, stack its picture, and read the region.
 
         Read exactly as its peak was: through the same crop, off a stack of
-        as many frames as the integration is set to, with the grain taken off
-        in the same proportion. Otherwise its fraction of that peak would be
-        comparing two different measurements.
+        as many frames as the integration is set to, with **the grain of that
+        stack's own frames** taken off in the same proportion -- measured the
+        way its fine tune measured its own, on the frames each picture was
+        made of. Otherwise its fraction of that peak would be comparing two
+        different measurements. With the look, the grain taken off and the
+        level, for the record.
         """
         run = self._calibration
         view = run.view(index) if run is not None else None
         if run is None or view is None:
             return None
         frames = self._integrator.frames if self._integrator.enabled else 1
-        frame, image = self._show_view(camera, view, frames)
+        region = run.regions[index]
+        key = _region_grain_key(index, view.crop[2], view.crop[3])
+        frame, image = self._show_view(camera, view, frames, (key, region.rect))
         if frame is None or image is None:
             return None
-        region = run.regions[index]
         shown = frame.area_normalised(region.rect)
-        reading = (
-            measure(image, shown, self._noise_variance / frames)
-            if shown is not None
-            else 0.0
-        )
-        return _look_at(region, frame, image, reading)
+        stacked = self._grain_of_stack() if frames > 1 else None
+        if stacked is None:
+            own = self._grain.variance(key)
+            stacked = own if own is not None else self._noise_variance
+        grain = stacked / frames
+        if shown is None:
+            return _look_at(region, frame, image, 0.0), grain, float("nan")
+        reading = measure(image, shown, grain)
+        return _look_at(region, frame, image, reading), grain, level_of(image, shown)
 
     def _show_view(
-        self, camera: NikonCamera, view: View, frames: int
+        self,
+        camera: NikonCamera,
+        view: View,
+        frames: int,
+        grain: "tuple[tuple, tuple[float, float, float, float]] | None" = None,
     ) -> "tuple[LiveViewFrame | None, QImage | None]":
         """Point the camera the way *view* says, and hand back a stack from there.
 
@@ -1918,10 +2165,17 @@ class CameraWorker(QObject):
         if frame is None or (frame.af_x, frame.af_y) != view.af:
             camera.set_af_area(*view.af)
             moved = True
-        return self._stack_through(camera, view, frames, _AIM_FRESH if moved else 0)
+        return self._stack_through(
+            camera, view, frames, _AIM_FRESH if moved else 0, grain
+        )
 
     def _stack_through(
-        self, camera: NikonCamera, view: View, frames: int, skip: int
+        self,
+        camera: NikonCamera,
+        view: View,
+        frames: int,
+        skip: int,
+        grain: "tuple[tuple, tuple[float, float, float, float]] | None" = None,
     ) -> "tuple[LiveViewFrame | None, QImage | None]":
         """Gather *frames* redrawn frames showing *view*, and average them.
 
@@ -1935,12 +2189,17 @@ class CameraWorker(QObject):
         the same arithmetic the peaks were read off. And the grain is
         measured on the way, from each frame against the one before it: the
         lens has stopped and so has the view, so what is between them is
-        noise.
+        noise. Of the whole picture, for telling when it holds still; and,
+        given *grain* -- a key and an area on the sensor -- of that area, kept
+        under that key, which is what a reading of it subtracts.
         """
         stacker = FrameIntegrator(frames > 1, max(frames, 2))
         deadline = time.monotonic() + _VIEW_PATIENCE + _FRAME_TIME * (skip + frames)
         skipped = 0
         previous: "np.ndarray | None" = None
+        previous_area: "np.ndarray | None" = None
+        if grain is not None:
+            self._stack_pairs = []
         while time.monotonic() < deadline:
             try:
                 latest = camera.live_view_frame()
@@ -1959,12 +2218,23 @@ class CameraWorker(QObject):
             image = stacker.add(latest)
             single = stacker.last_frame
             if single is not None:
-                pixels = green(single)[::2, ::2]
+                whole = green(single)
+                pixels = whole[::2, ::2]
                 if previous is not None:
                     variance = variance_between(previous, pixels)
                     if variance is not None:
                         self._noise_seen.append(variance)
                 previous = pixels
+                if grain is not None:
+                    key, area = grain
+                    shown = latest.area_normalised(area)
+                    here = pixels_of(whole, shown) if shown is not None else None
+                    if here is not None and previous_area is not None:
+                        variance = variance_between(previous_area, here)
+                        if variance is not None:
+                            self._grain.note(key, variance)
+                            self._stack_pairs.append(variance)
+                    previous_area = here
             if image is not None and stacker.last_image_was_whole:
                 self._note_magnification(latest)
                 self.frameReady.emit(latest, image)
@@ -2281,6 +2551,26 @@ def _look_at(
     shown = frame.area_normalised(region.rect)
     picture = cut_out(image, shown) if shown is not None else None
     return Look(float(reading), picture)
+
+
+def _view_of(frame: LiveViewFrame) -> "tuple[int, int, int, int]":
+    """Which crop of the sensor *frame* shows: what a view is, to the grain."""
+    return (
+        frame.crop_center_x,
+        frame.crop_center_y,
+        frame.crop_width,
+        frame.crop_height,
+    )
+
+
+def _region_grain_key(index: int, width: int, height: int) -> tuple:
+    """What a calibration keeps region *index*'s grain under, at a view's size.
+
+    The size and not the whole crop: the compromise puts a region's view back
+    to within a pixel or so, not always to it, and its grain is the same
+    either way -- but a different magnification is a different grain.
+    """
+    return ("region", int(index), int(width), int(height))
 
 
 def _inside(

@@ -571,3 +571,133 @@ def test_a_setting_change_says_nothing_while_the_meter_is_off(worker):
     worker.sharpnessChanged.connect(lambda value, peak: told.append((value, peak)))
     worker.set_setting("Aperture", 8)
     assert told == []
+
+
+# -- whose grain it is ---------------------------------------------------------
+
+
+def test_each_thing_read_has_its_own_grain():
+    """Grain is not one number for the camera: a darker picture has less, a
+    different magnification a different amount. The smallest of everything
+    lately seen is the grain of the quietest thing on screen, and taking
+    that off a bright one leaves some of its grain in its reading."""
+    from scanny.ui.sharpness import GrainMemory
+
+    grain = GrainMemory(memory=4)
+    for variance in (9.0, 8.5, 9.5):
+        grain.note("bright", variance)
+    for variance in (2.1, 2.0):
+        grain.note("dark", variance)
+    assert 8.5 <= grain.variance("bright") <= 9.0
+    assert 2.0 <= grain.variance("dark") <= 2.1
+    assert grain.variance("never seen") is None
+    assert grain.pairs("bright") == 3
+
+
+def test_a_thing_s_grain_is_read_off_the_quietest_of_its_recent_frames():
+    """Low down because a pair of frames that differ by movement as well reads
+    high, never low; and recent, because the light can change."""
+    from scanny.ui.sharpness import GrainMemory
+
+    grain = GrainMemory(memory=3)
+    for variance in (1.0, 5.0, 6.0, 7.0):
+        grain.note("view", variance)
+    assert grain.variance("view") >= 5.0, "the oldest has gone"
+    grain = GrainMemory()
+    for variance in (2.0, 2.1, 2.2, 9.0, 12.0):  # two pairs caught it moving
+        grain.note("view", variance)
+    assert grain.variance("view") < 2.5, "movement does not count"
+
+
+def test_the_grain_is_the_same_however_many_frames_it_was_read_off():
+    """The quietest *quarter* and not the quietest one, because the smallest
+    of many tries is smaller than the smallest of a few -- and a calibration's
+    compromise gathers pairs several times faster than its fine tunes do. Its
+    estimates came out a sixth under theirs for that alone, which is a region
+    reading higher in the compromise than in its own fine tune for no reason
+    but arithmetic."""
+    from scanny.ui.sharpness import GrainMemory
+
+    drawn = np.random.default_rng(5).normal(4.0, 0.3, 200)
+    few, many = GrainMemory(), GrainMemory()
+    for variance in drawn[:8]:
+        few.note("thing", variance)
+    for variance in drawn:
+        many.note("thing", variance)
+    assert many.variance("thing") == pytest.approx(few.variance("thing"), rel=0.1)
+
+
+def test_only_so_many_things_are_remembered_and_all_can_be_forgotten():
+    from scanny.ui.sharpness import GrainMemory
+
+    grain = GrainMemory(keys=2)
+    grain.note("first", 1.0)
+    grain.note("second", 2.0)
+    grain.note("first", 1.5)  # used again, so it is the second that goes
+    grain.note("third", 3.0)
+    assert grain.variance("second") is None
+    assert 1.0 <= grain.variance("first") <= 1.5
+    assert grain.variance("third") == 3.0
+    grain.forget()
+    assert grain.variance("first") is None
+
+
+def test_changing_the_exposure_forgets_the_grain_it_had(worker):
+    """Exposure is what sets the grain, so what was measured before a change
+    is not the grain of the picture after it."""
+    worker.set_sharpness(True)
+    _readings(worker, 4)
+    frame = worker._last_frame
+    assert worker._grain.pairs(worker._grain_key(frame)) > 0
+    worker.set_setting("Aperture", 8)
+    assert worker._grain.pairs(worker._grain_key(frame)) == 0
+
+
+class _Changing(_FakeCamera):
+    """A camera whose frames get grainier part way through.
+
+    Which is what a picture going out of focus does in a live view sent as
+    JPEG: the encoder quantises the noise away where there is no detail to
+    hide it in, so a region's frames differ by a quarter less while it is
+    soft than they do at its best. A calibration walks every region through
+    both, so an estimate pooled over the walk belongs to neither.
+    """
+
+    def __init__(self, pixels: np.ndarray, noise: float = 1.0) -> None:
+        super().__init__(pixels)
+        self.noise = noise
+
+    def live_view_frame(self) -> LiveViewFrame:
+        self._grabs += 1
+        return _jpeg_frame(_noisy(self.pixels, self.noise, self._grabs))
+
+
+def test_a_reading_takes_off_the_grain_of_the_frames_it_was_read_from(worker):
+    """Not the grain of frames of the same thing at some other time. What is
+    subtracted has to belong to the picture the reading is of, or a reading
+    taken where the grain is higher comes out too high -- which, on a walk
+    whose peak is the sharpest and so the grainiest part of it, is the peak."""
+    camera = _Changing(_subject(), noise=1.0)
+    worker._camera = camera
+    worker.set_integration(True, 4)
+    worker.set_sharpness(True)
+    for _ in range(40):
+        worker._grab()
+    quiet = worker._area_grain(worker._last_frame)
+    camera.noise = 4.0
+    for _ in range(40):
+        worker._grab()
+    grainy = worker._area_grain(worker._last_frame)
+    assert quiet == pytest.approx(1.0, abs=0.4), quiet
+    # Four times the noise is sixteen times the variance, and what is read off
+    # this stack has to say so rather than remembering the quiet ones.
+    assert grainy == pytest.approx(16.0, rel=0.35), grainy
+
+
+def test_the_grain_of_a_stack_is_the_least_its_frames_differed_by(worker):
+    """The same few pairs every time, whatever is being read, so that what
+    taking the least of them costs is the same everywhere -- and a pair that
+    caught something moving reads high, never low."""
+    assert worker._grain_of_stack([4.0, 4.4, 9.0]) == 4.0
+    assert worker._grain_of_stack([]) is None
+    assert worker._grain_of_stack(None) is None, "nothing stacked yet"

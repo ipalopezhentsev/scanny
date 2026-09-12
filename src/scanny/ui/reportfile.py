@@ -55,7 +55,7 @@ _LOG = "activity.log"
 _READINGS = "readings.csv"
 
 #: The columns of ``readings.csv``, which are the fields of a reading.
-_COLUMNS = ("region", "stage", "position", "value", "at", "after")
+_COLUMNS = ("region", "stage", "position", "value", "at", "after", "grain", "level")
 
 
 class ReportFileError(Exception):
@@ -135,8 +135,10 @@ def save_report(path: "str | Path", report: CalibrationReport, aspect: float) ->
                     one.position,
                     one.value,
                     one.at,
-                    # Nor a not-a-number: a time not known is none as well.
-                    one.after if math.isfinite(one.after) else None,
+                    # Nor a not-a-number: anything not known is none as well.
+                    _known(one.after),
+                    _known(one.grain),
+                    _known(one.level),
                 ]
                 for one in report.readings
             ],
@@ -219,16 +221,23 @@ def _report_from(
         )
         for one in saved["results"]
     )
+    def unknown(value: object) -> float:
+        return float("nan") if value is None else float(value)
+
     readings = tuple(
         Reading(
-            region=int(region),
-            stage=str(stage),
-            position=int(position),
-            value=float(value),
-            at=float(at),
-            after=float("nan") if after is None else float(after),
+            region=int(row[0]),
+            stage=str(row[1]),
+            position=int(row[2]),
+            value=float(row[3]),
+            at=float(row[4]),
+            # Later columns were added as they were needed; a file from before
+            # one of them has none of it.
+            after=unknown(row[5] if len(row) > 5 else None),
+            grain=unknown(row[6] if len(row) > 6 else None),
+            level=unknown(row[7] if len(row) > 7 else None),
         )
-        for region, stage, position, value, at, after in saved.get("readings", [])
+        for row in saved.get("readings", [])
     )
     return CalibrationReport(
         results=results,
@@ -267,9 +276,15 @@ def _table(readings: "tuple[Reading, ...]") -> str:
                 f"{one.value:.6g}",
                 f"{one.at:.3f}",
                 f"{one.after:.3f}" if math.isfinite(one.after) else "",
+                f"{one.grain:.6g}" if math.isfinite(one.grain) else "",
+                f"{one.level:.6g}" if math.isfinite(one.level) else "",
             ]
         )
     return text.getvalue()
+
+
+def _known(value: float) -> "float | None":
+    return value if math.isfinite(value) else None
 
 
 def _png(picture: QImage) -> bytes:

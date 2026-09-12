@@ -38,12 +38,27 @@ way, and the smallest recently seen is the one used -- when the picture is
 moving the frames differ by more than noise, and the smallest is the estimate
 that has no movement in it. Nothing is subtracted when nobody has measured it.
 
+**And it has to be the grain of what is being read** -- the measured area, in
+the view it is read through -- which :class:`GrainMemory` keeps, one estimate
+for each. Grain is not one number for the camera: it grows with how bright
+the picture is, and it differs between magnifications. One estimate shared by
+everything, the quietest pair of frames from whatever had been on screen,
+was what calibrations used to subtract, and it made regions incomparable with
+themselves: panning between four regions, the quietest pair came from the
+darkest one, so the grain of a region under a third as bright was subtracted
+from all four, and the bright ones read up to a tenth higher than they had
+while fine tuned on their own -- with exactly the same detail in the picture.
+
+
 It is still measured on the picture being *displayed*, because integrating
 removes the noise for real rather than estimating it, and less noise left in
 the picture is less that has to be reasoned about.
 """
 
 from __future__ import annotations
+
+from collections import OrderedDict, deque
+from typing import Hashable
 
 import numpy as np
 from PySide6.QtGui import QImage
@@ -52,9 +67,12 @@ from ..camera.nikon import LiveViewFrame
 from .pixels import green
 
 __all__ = [
+    "GrainMemory",
     "SharpnessMeter",
     "measure",
     "grain_reading",
+    "level_of",
+    "pixels_of",
     "variance_between",
     "Area",
     "ABOVE_THE_GRAIN",
@@ -119,9 +137,7 @@ def measure(
     of magnification. *noise_variance* is how much grain the picture has, from
     :func:`variance_between`; without it nothing is taken off.
     """
-    pixels = green(image)
-    if area is not None:
-        pixels = _crop(pixels, area)
+    pixels = pixels_of(image, area)
     if pixels.size < 4:
         return 0.0
     level = float(pixels.mean())
@@ -163,6 +179,24 @@ def grain_reading(
     return SCALE * 4.0 * noise_variance / (level * level)
 
 
+def pixels_of(
+    image: "QImage | np.ndarray", area: "Area | None" = None
+) -> np.ndarray:
+    """The pixels :func:`measure` reads: the green of the part the area covers.
+
+    *image* may be the green already got out of a picture, to save doing it
+    twice.
+    """
+    pixels = image if isinstance(image, np.ndarray) else green(image)
+    return _crop(pixels, area) if area is not None else pixels
+
+
+def level_of(image: QImage, area: "Area | None" = None) -> float:
+    """The mean level :func:`measure` divides by, for the record of a reading."""
+    pixels = pixels_of(image, area)
+    return float(pixels.mean()) if pixels.size else 0.0
+
+
 def variance_between(earlier: np.ndarray, later: np.ndarray) -> "float | None":
     """The noise variance implied by two frames of a scene holding still.
 
@@ -175,6 +209,78 @@ def variance_between(earlier: np.ndarray, later: np.ndarray) -> "float | None":
         return None
     difference = later - earlier
     return 0.5 * float(np.mean(difference * difference))
+
+
+#: Where in the pairs of frames of one thing its grain is read off: a quarter
+#: of the way up the sorted ones. See :meth:`GrainMemory.variance`.
+_QUIETEST = 0.25
+
+
+class GrainMemory:
+    """How much grain each thing that is read has, each from its own frames.
+
+    One estimate per *key* -- whatever the caller says makes two readings the
+    same measurement: a view and the area read in it, or a calibration's
+    region -- from the variances lately seen between consecutive frames of it,
+    for the reason the module gives. Kept apart because grain is not one
+    number: a darker picture has less of it, a different magnification a
+    different amount, and the smallest pair of frames from everything that has
+    been on screen is the grain of the quietest of them, not of the one being
+    read.
+
+    **Only pairs of frames that were both of a picture holding still** should
+    be given to it: while the lens is moving, frames differ by the move as
+    well, and see :meth:`variance` for why the estimate cannot simply be the
+    smallest of whatever it is given.
+
+    How many keys are kept is bounded: the oldest used is forgotten first.
+    """
+
+    def __init__(self, memory: int = 60, keys: int = 32) -> None:
+        self._memory = max(1, int(memory))
+        self._keys = max(1, int(keys))
+        self._seen: "OrderedDict[Hashable, deque[float]]" = OrderedDict()
+
+    def note(self, key: Hashable, variance: float) -> None:
+        """One pair of consecutive frames of *key* differed by *variance*."""
+        seen = self._seen.get(key)
+        if seen is None:
+            seen = self._seen[key] = deque(maxlen=self._memory)
+            while len(self._seen) > self._keys:
+                self._seen.popitem(last=False)
+        else:
+            self._seen.move_to_end(key)
+        seen.append(float(variance))
+
+    def variance(self, key: Hashable) -> "float | None":
+        """The grain of *key*, or None if no pair of its frames has been seen.
+
+        The quietest quarter of the pairs, not the quietest one. Both are
+        ways of ignoring the pairs that have movement in them as well as
+        noise, which read high and never low -- but the smallest of them
+        depends on *how many* there are, since more tries find a lower one,
+        and that is a difference between measurements that have nothing else
+        between them. A calibration's compromise gathers three still pairs a
+        probe where its fine tunes gather a handful per region, and its
+        estimates came out a sixth lower for it: every region read a per cent
+        or two higher in the compromise than in its own fine tune, which is
+        exactly the thing kept apart here. A quarter of the way up the sorted
+        pairs is as blind to movement and says the same thing however many
+        there are.
+        """
+        seen = self._seen.get(key)
+        if not seen:
+            return None
+        return float(np.quantile(np.fromiter(seen, float, len(seen)), _QUIETEST))
+
+    def pairs(self, key: Hashable) -> int:
+        """How many pairs of *key*'s frames the estimate is the smallest of."""
+        seen = self._seen.get(key)
+        return len(seen) if seen else 0
+
+    def forget(self) -> None:
+        """Forget everything, as when the exposure changed under it."""
+        self._seen.clear()
 
 
 def _crop(pixels: np.ndarray, area: "Area") -> np.ndarray:

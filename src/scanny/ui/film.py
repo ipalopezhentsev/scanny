@@ -23,9 +23,15 @@ does not, the bulge is being measured against the wrong edges.
 :class:`FilmView` draws it: the sensor flat underneath, the film above it
 bent through the depths, each region's rectangle on the sensor joined by a
 line to where that region is on the film -- which is how a place on the
-picture becomes a place on the film to draw. Drag to turn it round, scroll to
-come closer. The height is exaggerated, and has to be: the depths are drive
-steps, which have no length in common with the frame.
+picture becomes a place on the film to draw. All of that lies under the film,
+so it is drawn faintly wherever the film is in front of it and fully where
+nothing is; at full strength throughout, a line would read as standing in
+front of the film it is really behind. Turned far enough over it is the
+film's underside that is on show, and that is drawn dulled and darkened,
+because two sides alike mean a view from below passes for a view from above
+and every lean read off it is backwards. Drag to turn it round, scroll to come
+closer. The height is exaggerated, and has to be: the depths are drive steps,
+which have no length in common with the frame.
 """
 
 from __future__ import annotations
@@ -179,6 +185,30 @@ class FilmSurface:
         return across, down, across_doubt, down_doubt
 
 
+def _faded(colour: QColor) -> QColor:
+    """*colour* as it is drawn where something stands in front of it."""
+    out = QColor(colour)
+    out.setAlpha(_COVERED)
+    return out
+
+
+def _subdivided(corners, pieces: int):
+    """The way round *corners*, cut into *pieces* along each side.
+
+    Whether the film covers a mark changes along it and not only at its
+    corners, so it is drawn as many short pieces rather than a few long ones.
+    """
+    out = []
+    for start, end in zip(corners, corners[1:]):
+        out += [
+            tuple(a + (b - a) * k / pieces for a, b in zip(start, end))
+            for k in range(pieces)
+        ]
+    if corners:
+        out.append(tuple(corners[-1]))
+    return out
+
+
 def _shape(m: int, n: int, x, y):
     return np.sin(m * math.pi * np.asarray(x)) * np.sin(n * math.pi * np.asarray(y))
 
@@ -227,6 +257,44 @@ _GAP = 0.3
 _SENSOR = QColor(70, 74, 86)
 _SENSOR_EDGE = QColor(150, 155, 170)
 
+#: Where the light comes from for the film's top, and for its underside: the
+#: same light turned round, so that the far side of the sheet has a shape to
+#: it too rather than going flat.
+_LIGHT = np.array([-0.4, -0.5, 0.77])
+_UNDER_LIGHT = np.array([0.4, 0.5, -0.77])
+
+#: What a face lying flat takes of that light. Shading is reckoned against it
+#: rather than against a face turned square to the light, which the film never
+#: is: so film lying flat is drawn in the ramp's own colour at full strength,
+#: and only what slopes away from the light falls short of it. The colours are
+#: the one thing the drawing is read by, and a light that dims all of them
+#: costs more than the little relief it adds.
+_FLAT = float(_LIGHT[2])
+
+#: How the underside is drawn against the top: this much of the height's own
+#: colour and the rest this slate, then darkened by this much. The heights are
+#: still to be read off it, but at a glance it is plainly the back of the
+#: sheet and not the face of it.
+_UNDER_HUE = 0.45
+_UNDER_SLATE = (96, 100, 116)
+_UNDER_LIT = 0.62
+
+#: What a region is drawn in: its rectangle on the sensor, the post up to the
+#: film, and the mark on the film at the top of it.
+_MARK = QColor(255, 200, 80)
+
+#: How much of itself any of that keeps where the film or the sensor is in
+#: front of it. Faint enough to read as behind, plain enough to follow.
+_COVERED = 80
+
+#: How finely a mark is cut up to be drawn part covered and part not, along a
+#: post and along each side of a rectangle.
+_PIECES = 24
+
+#: How many steps the way out towards the eye is tried in, looking for the
+#: film or the sensor in front of a point.
+_RAYS = 40
+
 #: How the film is coloured by height: Turbo, at seven stops. A scale where
 #: neighbouring heights are obviously different colours, because the
 #: question asked of the drawing is "is that nearer than this".
@@ -254,7 +322,12 @@ def ramp_colour(fraction: float) -> "tuple[int, int, int]":
 
 class FilmView(QWidget):
     """The sensor, the film above it bent through the regions' depths, and a
-    line from each region's place on the sensor to its place on the film."""
+    line from each region's place on the sensor to its place on the film.
+
+    The faces are sorted and drawn back to front, which is enough for two
+    sheets that do not cut through each other. The marks are drawn over all
+    of them afterwards, and so are shown faintly wherever the film or the
+    sensor stands between them and the eye (:meth:`_covered`)."""
 
     def __init__(self, parent: "QWidget | None" = None) -> None:
         super().__init__(parent)
@@ -326,6 +399,22 @@ class FilmView(QWidget):
         x, y = self._orientation.from_view(u, v)
         depth = float(self._surface.at(x, y)) if self._surface is not None else low
         return self._world(u, v, gap + (depth - low) * scale)
+
+    def _towards(self):
+        """The way to the eye, the same for every point: the view is square-on.
+
+        Going this way takes a point straight towards the eye, which is what
+        both the side of a face being looked at and what is in front of a mark
+        are worked out along.
+        """
+        turn, tilt = math.radians(self._turn), math.radians(self._tilt)
+        return np.array(
+            [
+                math.cos(tilt) * math.sin(turn),
+                math.cos(tilt) * math.cos(turn),
+                math.sin(tilt),
+            ]
+        )
 
     def _project(self, point) -> "tuple[float, float, float]":
         """Screen x and y before scaling, and how far from the eye."""
@@ -433,31 +522,43 @@ class FilmView(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
         # Each region: its rectangle on the sensor, a line up to the film, and
-        # a mark on the film where it was measured.
+        # a mark on the film where it was measured. All of it is under the
+        # film, so it is drawn faintly wherever the film is in front of it and
+        # fully where nothing is. Drawn at full strength throughout, a post
+        # reads as standing in front of the film it is really behind, and
+        # turning the view round does not say otherwise.
         font = QFont(painter.font())
         font.setBold(True)
         painter.setFont(font)
+        heights = (low, scale, gap, top)
         for mark in self._marks:
             x, y, w, h = self._orientation.rect_to_view(mark.rect)
             corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
-            painter.setPen(QPen(QColor(255, 200, 80), 1.6))
-            painter.drawPolyline(
-                QPolygonF(
-                    [to_screen(self._project(self._world(u, v, 0.0))) for u, v in corners]
-                )
+            self._trace(
+                painter,
+                _subdivided([self._world(u, v, 0.0) for u, v in corners], _PIECES),
+                to_screen,
+                heights,
+                QPen(_MARK, 1.6),
             )
             u, v = x + w / 2, y + h / 2
-            below = to_screen(self._project(self._world(u, v, 0.0)))
-            above = to_screen(
-                self._project(self._world(u, v, gap + (mark.depth - low) * scale))
+            reaches = gap + (mark.depth - low) * scale
+            post = [
+                self._world(u, v, reaches * k / _PIECES) for k in range(_PIECES + 1)
+            ]
+            self._trace(
+                painter, post, to_screen, heights,
+                QPen(_MARK, 1.2, Qt.PenStyle.DashLine),
             )
-            painter.setPen(QPen(QColor(255, 200, 80), 1.2, Qt.PenStyle.DashLine))
-            painter.drawLine(below, above)
+            above = to_screen(self._project(post[-1]))
+            # The mark itself sits on the film, so it is behind it only when
+            # the film is being looked at from underneath.
+            hidden = bool(self._covered(post[-1:], *heights)[0])
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(255, 200, 80))
+            painter.setBrush(_faded(_MARK) if hidden else _MARK)
             painter.drawEllipse(above, 4.0, 4.0)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(text)
+            painter.setPen(_faded(text) if hidden else text)
             further = mark.depth - low
             label = f"{mark.number}  +{further:.0f}" if further >= 0.5 else f"{mark.number}"
             painter.drawText(
@@ -483,15 +584,115 @@ class FilmView(QWidget):
             "Drag to turn it, scroll to come closer, double-click to start again",
         )
 
+    def _covered(self, points, low: float, scale: float, gap: float, top: float):
+        """Which of the world *points* the film or the sensor is in front of.
+
+        The view is square-on, so every point is looked at along the same
+        direction: the way to the eye is followed from each of them, and what
+        it goes through on the way is what is in front of that point. It is
+        followed only as far as the frame's sides, because past them there is
+        neither film nor sensor to go through, which is what looking in under
+        the film's edge is.
+
+        The film is gone through where the way crosses it, which is not the
+        same as ending up above it: a mark lying on the film starts out on it
+        and rises off it, and that is the film being looked at rather than the
+        film being in the way. It counts only once the way has been under the
+        film and come out over it -- or straight away, for a mark lying on the
+        film whose way out goes under it, because then what is being looked at
+        there is the film's underside and the mark is on the other face of it.
+        The sensor is flat, so under it is under it.
+        """
+        count = len(points)
+        if self._surface is None or count == 0:
+            return np.zeros(count, dtype=bool)
+        wide, tall = self._size()
+        reach = wide + tall + top
+        # From the points themselves, so that which side of the film each one
+        # starts on is read off the same way as the rest.
+        steps = np.linspace(0.0, reach, _RAYS + 1)
+        way = np.asarray(points, dtype=float)[:, None, :] + steps[:, None] * self._towards()
+        u = way[..., 0] / wide + 0.5
+        v = way[..., 1] / tall + 0.5
+        inside = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+        # Once out past the frame's side it is out for good, so nothing met
+        # after that is between the point and the eye.
+        before = np.cumprod(inside, axis=1).astype(bool)
+        x, y = self._orientation.from_view(u, v)
+        film = gap + (self._surface.at(x, y) - low) * scale
+        # A hair of room, so that lying on the film counts as neither side.
+        skin = 1e-3 * max(wide, tall)
+        under = way[..., 2] < film - skin
+        over = way[..., 2] > film + skin
+        was_under = np.zeros_like(under)
+        was_under[:, 1:] = np.maximum.accumulate(under, axis=1)[:, :-1]
+        crosses = over & was_under
+        # On the film and going under it: its underside is what faces the eye
+        # there, and the mark is on the face turned away.
+        turned = (np.abs(way[:, 0, 2] - film[:, 0]) <= skin) & under[:, 1]
+        return turned | np.any(before & (crosses | (way[..., 2] < -skin)), axis=1)
+
+    def _trace(self, painter, points, to_screen, heights, pen: QPen) -> None:
+        """Draw the way through the world *points*, faint where it is covered.
+
+        Faintly the whole way first, then fully over the stretches nothing is
+        in front of, each carrying on the dashes of the faint line under it so
+        that a dashed line does not come out doubled where the two meet.
+        """
+        screen = [to_screen(self._project(point)) for point in points]
+        covered = self._covered(points, *heights)
+        faint = QPen(pen)
+        faint.setColor(_faded(pen.color()))
+        painter.setPen(faint)
+        painter.drawPolyline(QPolygonF(screen))
+        gone, start, clear = 0.0, 0.0, []
+        for i, point in enumerate(screen):
+            if i:
+                was = screen[i - 1]
+                gone += math.hypot(point.x() - was.x(), point.y() - was.y())
+            if covered[i]:
+                self._stroke(painter, pen, clear, start)
+                clear = []
+                continue
+            if not clear:
+                start = gone
+            clear.append(point)
+        self._stroke(painter, pen, clear, start)
+
+    @staticmethod
+    def _stroke(painter, pen: QPen, run, start: float) -> None:
+        """One unhidden stretch, its dashes taken up *start* along the way."""
+        if len(run) < 2:
+            return
+        full = QPen(pen)
+        full.setDashOffset(start / max(pen.widthF(), 0.1))
+        painter.setPen(full)
+        painter.drawPolyline(QPolygonF(run))
+
     def _shade(self, corners, height: float, gap: float, top: float) -> QColor:
-        """A face's colour: its height on the depth ramp, lit from above-left."""
+        """A face's colour: its height on the depth ramp, lit from above-left.
+
+        Dulled and darkened when it is its underside that is being looked at.
+        The two sides of the sheet are the same shape and the same heights, so
+        with nothing to tell them apart a view from below passes for a view
+        from above and every lean in it is read backwards.
+        """
         fraction = 0.0 if top <= gap + 1e-9 else (height - gap) / (top - gap)
         red, green, blue = ramp_colour(min(max(fraction, 0.0), 1.0))
         (x0, y0, z0), (x1, y1, z1), _c, (x3, y3, z3) = corners
         normal = np.cross([x1 - x0, y1 - y0, z1 - z0], [x3 - x0, y3 - y0, z3 - z0])
         length = float(np.linalg.norm(normal)) or 1.0
-        light = np.array([-0.4, -0.5, 0.77])
-        lit = 0.55 + 0.45 * abs(float(normal @ light)) / length
+        # The corners go round so that the normal is the way the top faces.
+        underside = float(normal @ self._towards()) < 0.0
+        seen = -normal if underside else normal
+        light = _UNDER_LIGHT if underside else _LIGHT
+        lit = min(0.55 + 0.45 * max(float(seen @ light), 0.0) / (length * _FLAT), 1.0)
+        if underside:
+            red, green, blue = (
+                _UNDER_HUE * own + (1 - _UNDER_HUE) * slate
+                for own, slate in zip((red, green, blue), _UNDER_SLATE)
+            )
+            lit *= _UNDER_LIT
         return QColor(int(red * lit), int(green * lit), int(blue * lit))
 
     # -- turning it --------------------------------------------------------

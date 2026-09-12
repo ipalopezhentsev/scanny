@@ -301,6 +301,15 @@ class Reading:
     #: Seconds since the lens was last driven or autofocused, or not a number
     #: when that is not known.
     after: float = float("nan")
+    #: The grain taken off it: the noise variance of one pixel of the picture
+    #: read, of which four times came off the gradient energy. Not a number
+    #: when not known.
+    grain: float = float("nan")
+    #: The mean level of the region in the picture read, which the energy was
+    #: divided by the square of. With the reading and the grain, what the
+    #: picture's gradient energy was, and so what the reading would have been
+    #: with other grain taken off: ``value * level**2 / 1000 + 4 * grain``.
+    level: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -1307,6 +1316,9 @@ class Calibration:
         position: int,
         value: float,
         after: float = float("nan"),
+        *,
+        grain: float = float("nan"),
+        level: float = float("nan"),
     ) -> None:
         """One reading of region *index*, for the report's record of them all.
 
@@ -1321,6 +1333,8 @@ class Calibration:
                 value=float(value),
                 at=self.elapsed,
                 after=float(after),
+                grain=float(grain),
+                level=float(level),
             )
         )
 
@@ -1384,12 +1398,15 @@ class Calibration:
         self,
         looks: "dict[int, Look]",
         after: "dict[int, float] | None" = None,
+        grain: "dict[int, float] | None" = None,
+        level: "dict[int, float] | None" = None,
     ) -> "Move | None":
         """Every usable region read at one focus position; answer the next move.
 
         None means it is standing on the compromise, and *looks* are what
         every region reads there. *after* is how long after the lens last
-        moved each was read, for the record; see :class:`Reading`.
+        moved each was read, *grain* the grain taken off it and *level* its
+        mean level, for the record; see :class:`Reading`.
 
         A region read higher than its best has that for its best from here
         on, picture and all -- see :class:`_Search` for why -- and is listed
@@ -1411,13 +1428,16 @@ class Calibration:
                 self._best[index] = look
                 bettered.append(index)
         self.bettered = tuple(bettered)
+        unknown = float("nan")
         for index, reading in zip(usable, readings):
             self.noted(
                 index,
                 search.state,
                 search.position,
                 reading,
-                (after or {}).get(index, float("nan")),
+                (after or {}).get(index, unknown),
+                grain=(grain or {}).get(index, unknown),
+                level=(level or {}).get(index, unknown),
             )
         self._latest = dict(looks)
         self._history.append((search.state, readings))

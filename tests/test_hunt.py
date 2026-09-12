@@ -661,6 +661,61 @@ def test_it_does_not_walk_on_once_the_picture_has_fallen_apart(worker):
             assert collapsed <= 1, f"kept walking at {reading:.0f} of {best:.0f}"
 
 
+class _Dazed(_Lens):
+    """A body still putting live view's exposure back after it autofocuses.
+
+    What three real calibrations read: a twentieth or less of the reading an
+    increment either side of where the autofocus left the lens, a fifth
+    darker, and agreeing with each other frame after frame -- so that they
+    looked exactly like a picture holding still.
+    """
+
+    def __init__(self, *args, dazed: int = 12, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.dazed = dazed
+        self._left = 0
+
+    def autofocus(self) -> bool:
+        self._left = self.dazed
+        return super().autofocus()
+
+    def live_view_frame(self) -> LiveViewFrame:
+        if self._left <= 0:
+            return super().live_view_frame()
+        self._left -= 1
+        self._history.append(self.optics)
+        pixels = 0.8 * _defocused(11.0 * self.depth, self.depth)
+        pixels = pixels + self._rng.normal(0, self.noise, pixels.shape)
+        return _frame(np.clip(pixels, 0, 255), self.magnification, self.centre)
+
+
+@pytest.mark.parametrize("dazed", [12, 50])
+def test_what_the_autofocus_left_is_read_once_the_body_shows_it(worker, dazed):
+    """The reading after the camera's own autofocus is the floor the search
+    may not end below, so it has to be of where the autofocus left the lens,
+    not of whatever the body shows while it gets over focusing.
+
+    Waiting a set number of frames is not enough on its own -- how long the
+    body takes is its own business -- so what is waited for is the picture
+    being as bright as it was before: focus does not change how much light
+    there is.
+    """
+    baselines = []
+    for dazed in (0, dazed):
+        lens = _Dazed(start=60, af_error=6, dazed=dazed)
+        _ready(worker, lens)
+        worker.fine_tune(STEP)
+        tune = worker._hunt
+        for _ in range(9000):
+            if worker._hunt is None:
+                break
+            worker._grab()
+        assert lens.error <= 12
+        baselines.append(tune.baseline)
+    clear, dazed = baselines
+    assert dazed == pytest.approx(clear, rel=0.05), "it read the daze, not the focus"
+
+
 def test_it_betters_what_the_camera_managed_on_its_own(worker):
     """The point of the button. The camera's own autofocus is the starting
     point and the floor, and what is measured at the end has to clear it."""
