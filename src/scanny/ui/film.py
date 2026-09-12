@@ -315,6 +315,12 @@ _PIECES = 24
 #: film or the sensor in front of a point.
 _RAYS = 40
 
+#: How much of the widget the drawing is fitted into, leaving the rest to the
+#: captions and to the labels that hang off the marks. Against the bound the
+#: fit uses rather than against the drawing itself, so it is the same room at
+#: every angle.
+_FILL = 0.9
+
 #: How the film is coloured by height: Turbo, at seven stops. A scale where
 #: neighbouring heights are obviously different colours, because the
 #: question asked of the drawing is "is that nearer than this".
@@ -460,6 +466,38 @@ class FilmView(QWidget):
         turned, turning, tilted, tilting = self._look()
         return np.array([tilted * turning, tilted * turned, tilting])
 
+    def _fit(self, top: float) -> "tuple[float, QPointF, tuple[float, float]]":
+        """How many pixels a length in the drawing is drawn as, where on the
+        widget its middle goes, and which projected point that middle is.
+
+        Fitted to how far the drawing could ever reach, not to how far it
+        happens to reach at the angle it is turned to. Fitted to what was on
+        screen it grew and shrank as it turned, which reads as the eye coming
+        closer and going away when all that was asked for was a turn. So
+        nothing here is worked out from the angles: turning the view turns the
+        drawing and does nothing else to it.
+
+        Across and down are fitted separately, not the larger of the two
+        against the shorter side of the widget: a drawing of two sheets is
+        wider than it is tall, and fitting its width to the height left it
+        small on a wide page.
+
+        Across, the frame swings about the upright and never reaches further
+        from the middle than its own half-diagonal, whatever the tilt. Down,
+        the tilt trades the frame's reach for the height's, and the two
+        together never pass the half-diagonal of the box they stand in.
+        Neither is slack: at some angle each is reached exactly.
+        """
+        wide, tall = self._size()
+        reach = math.hypot(wide, tall) / 2
+        across = 2 * reach
+        down = 2 * math.hypot(reach, top / 2)
+        size = min(self.width() / across, self.height() / down) * _FILL * self._zoom
+        middle = QPointF(self.width() / 2, self.height() / 2 + 10)
+        # The middle of that box: the one place the turning is about, and so
+        # the one place that stays put while everything turns around it.
+        return size, middle, self._project((0.0, 0.0, top / 2))[:2]
+
     def _project(self, point) -> "tuple[float, float, float]":
         """Screen x and y before scaling, and how far from the eye."""
         x, y, z = point
@@ -563,20 +601,7 @@ class FilmView(QWidget):
             )
             for _h, corners, colour, rim, pen in faces
         ]
-        # Fit everything to the widget, then come closer by the zoom. To what
-        # it spreads across and down separately, not to the larger of the two
-        # against the shorter side of the widget: a drawing of two sheets seen
-        # from the side is far wider than it is tall, and fitting its width to
-        # the height left it small in the middle of a wide page.
-        xs = [p[0] for _d, points, *_rest in projected for p in points]
-        ys = [p[1] for _d, points, *_rest in projected for p in points]
-        across = max(max(xs) - min(xs), 1e-9)
-        down = max(max(ys) - min(ys), 1e-9)
-        size = (
-            min(self.width() / across, self.height() / down) * 0.86 * self._zoom
-        )
-        middle = QPointF(self.width() / 2, self.height() / 2 + 10)
-        centre = ((max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2)
+        size, middle, centre = self._fit(top)
 
         def to_screen(p) -> QPointF:
             return QPointF(
