@@ -409,7 +409,14 @@ class NikonCamera:
                 )
             device = found[0]
         camera = cls(WpdMtpTransport(device.pnp_id).open())
-        camera._on_open()
+        try:
+            camera._on_open()
+        except Exception:
+            # A body that opened but refused the opening handshake -- one
+            # still waking up after the switch, say -- would otherwise leave
+            # the device held open, and the next attempt would find it busy.
+            camera.close()
+            raise
         return camera
 
     def _on_open(self) -> None:

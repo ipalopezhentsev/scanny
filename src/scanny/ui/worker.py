@@ -72,6 +72,15 @@ _FRAME_INTERVAL_MS = 15
 #: Consecutive grab failures tolerated before concluding live view has ended.
 _MAX_GRAB_ERRORS = 15
 
+#: How often to look for a camera while there is none. Someone who starts the
+#: program before switching the body on should not have to restart it, and
+#: nothing else tells us the camera arrived: WPD hands out device-arrival
+#: notifications only to a window pumping messages, which this thread is not.
+#: Two seconds is under the time it takes to reach for the switch, and the
+#: poll itself is a device enumeration -- cheap, and only done while
+#: disconnected.
+_WATCH_INTERVAL_MS = 2000
+
 #: How many times live view may be started again by itself within how many
 #: seconds, when the body ends it. The body does end it: a D750 turns live
 #: view off after its own monitor-off delay for live view -- custom setting
@@ -194,6 +203,8 @@ class CameraWorker(QObject):
 
     connected = Signal(str)
     disconnected = Signal()
+    #: There is no camera, and one is being looked for. See _watch_tick.
+    waiting = Signal()
     #: A live-view frame, and the picture to show with it. The picture is a
     #: null QImage when this frame only moves the overlay -- which is what the
     #: frames in the middle of an integration stack do, since their pixels are
@@ -243,6 +254,8 @@ class CameraWorker(QObject):
         super().__init__()
         self._camera: "NikonCamera | None" = None
         self._timer: "QTimer | None" = None
+        # Polls for a camera to appear while there is none. See _watch_tick.
+        self._watch: "QTimer | None" = None
         self._grab_errors = 0
         # When live view was last started again after the body ended it.
         self._restarts: "deque[float]" = deque()
@@ -379,36 +392,108 @@ class CameraWorker(QObject):
 
     @Slot()
     def connect_camera(self) -> None:
+        """Open the camera, and keep looking for one if there is none yet.
+
+        Said out loud, because this is the attempt someone asked for: at
+        startup, or from Reconnect.
+        """
         if self._camera is not None:
             return
+        if not self._open_camera(complain=True):
+            self._start_watch()
+
+    def _start_watch(self) -> None:
+        """Begin looking for a camera that is not there yet."""
+        if self._watch is None:
+            self._watch = QTimer(self)
+            self._watch.timeout.connect(self._watch_tick)
+        if not self._watch.isActive():
+            self._watch.start(_WATCH_INTERVAL_MS)
+            self.waiting.emit()
+            self.status.emit(
+                "Waiting for a camera -- it will connect as soon as one is "
+                "switched on"
+            )
+
+    def _stop_watch(self) -> None:
+        if self._watch is not None:
+            self._watch.stop()
+
+    @Slot()
+    def _watch_tick(self) -> None:
+        """Connect as soon as a camera turns up, and say nothing until it does.
+
+        Quiet on purpose: a body that is still switched off is not a failure
+        to report every two seconds. Enumeration comes first so that the poll
+        costs nothing while there is nothing to open, and a body that Windows
+        has enumerated but that is not answering PTP yet -- the second or two
+        after the switch -- simply fails this tick and is opened on the next.
+        """
+        if self._camera is not None:
+            self._stop_watch()
+            return
+        try:
+            found = NikonCamera.discover()
+        except Exception:  # pragma: no cover - driver-level failures
+            return
+        if not found:
+            return
+        if self._open_camera(complain=False):
+            self._stop_watch()
+
+    def _open_camera(self, *, complain: bool) -> bool:
+        """Open the camera and tell everyone about it. True if it opened."""
         try:
             camera = NikonCamera.open()
         except CameraError as exc:
-            self.failed.emit(str(exc))
-            return
+            if complain:
+                self.failed.emit(str(exc))
+            return False
         except Exception as exc:  # pragma: no cover - driver-level failures
-            self.failed.emit(f"Could not open the camera: {exc}")
-            return
+            if complain:
+                self.failed.emit(f"Could not open the camera: {exc}")
+            return False
         self._camera = camera
-        camera.set_save_to_card(self._save_to_card)
-        # The camera has the last word: one that will not be told where to
-        # record keeps using its card.
-        self._save_to_card = camera.save_to_card
-        self.saveToCardChanged.emit(self._save_to_card)
-        camera.set_shutter_delay(self._shutter_delay)
-        self.shutterDelaysAvailable.emit(
-            camera.shutter_delay_choices(), camera.shutter_delay_on_body()
-        )
-        battery = camera.battery_level()
-        suffix = f" - battery {battery}%" if battery is not None else ""
-        self.connected.emit(f"{camera.model}  |  firmware {camera.firmware}{suffix}")
+        # Everything below asks the body something, and a body that has only
+        # just been switched on can answer the first of those with an error
+        # even though it opened. Half a connection is worse than none -- it
+        # would stop the watch below and leave nothing that works -- so let
+        # go of it and let the next attempt have it.
+        try:
+            camera.set_save_to_card(self._save_to_card)
+            # The camera has the last word: one that will not be told where to
+            # record keeps using its card.
+            self._save_to_card = camera.save_to_card
+            self.saveToCardChanged.emit(self._save_to_card)
+            camera.set_shutter_delay(self._shutter_delay)
+            self.shutterDelaysAvailable.emit(
+                camera.shutter_delay_choices(), camera.shutter_delay_on_body()
+            )
+            battery = camera.battery_level()
+            suffix = f" - battery {battery}%" if battery is not None else ""
+            description = f"{camera.model}  |  firmware {camera.firmware}{suffix}"
+        except Exception as exc:  # pragma: no cover - driver-level failures
+            self._camera = None
+            try:
+                camera.close()
+            except Exception:
+                pass
+            if complain:
+                self.failed.emit(f"The camera opened but would not answer: {exc}")
+            return False
+        self.connected.emit(description)
         self.status.emit("Connected")
         self.refresh_settings()
+        return True
 
     @Slot()
     def disconnect_camera(self) -> None:
         self._cancel_hunt("")
         self._stop_timer()
+        # A disconnect is always asked for -- by Reconnect, or by shutdown --
+        # so stop hunting for a camera; Reconnect's own connect starts it
+        # again if the body is still not there.
+        self._stop_watch()
         if self._camera is not None:
             try:
                 self._camera.close()

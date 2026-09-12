@@ -2085,6 +2085,7 @@ class MainWindow(QMainWindow):
 
         self.worker.connected.connect(self._on_connected)
         self.worker.disconnected.connect(self._on_disconnected)
+        self.worker.waiting.connect(self._on_waiting)
         self.worker.frameReady.connect(self._on_frame)
         self.worker.settingsReady.connect(self._on_settings)
         self.worker.liveViewChanged.connect(self._on_live_view_changed)
@@ -2151,6 +2152,17 @@ class MainWindow(QMainWindow):
         self.camera_label.setText("No camera connected")
         self.camera_label.setStyleSheet("color: #888;")
         self._clear_view("Not connected")
+
+    @Slot()
+    def _on_waiting(self) -> None:
+        """No camera yet, and the worker is watching for one to turn up.
+
+        Worth saying rather than leaving "No camera connected" up: it is the
+        difference between something to do and nothing to do.
+        """
+        self.camera_label.setText("Waiting for a camera to be switched on...")
+        self.camera_label.setStyleSheet("color: #888;")
+        self._clear_view("Waiting for a camera")
 
     @Slot(bool)
     def _on_live_view_changed(self, active: bool) -> None:
