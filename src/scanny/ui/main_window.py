@@ -178,6 +178,13 @@ class WrappedLabel(QLabel):
         super().resizeEvent(event)
         self._fit()
 
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # A style sheet that changes the font (bold, say) changes how the text
+        # wraps, and so the height it needs.
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
+            self._fit()
+
     def _fit(self) -> None:
         if self.width() > 0:
             self.setFixedHeight(self.heightForWidth(self.width()))
